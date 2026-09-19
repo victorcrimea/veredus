@@ -497,14 +497,12 @@ equals the client's value at the same position (positional; order matters). The 
 `flags` is 0, except in lobby mode where bit 0, the lobby-auth bit, is set. A set
 flag puts the session in `await-lobby-auth`; a clear flag puts it in `await-auth`.
 
-**UUID format:** two independent random 32-bit values, each formatted as 8 uppercase
-hex digits and concatenated, e.g. `"1F0A33C49B7E0012"`. A UUID must not collide with any
+**UUID format:** 64bit in 16 uppercase HEX format, e.g. `"1F0A33C49B7E0012"`. A UUID must not collide with any
 session's UUID. A server MAY disconnect with code 11 if no unique UUID can be issued.
 
 When the client sees a disconnect with reason 17 (simulation or mod mismatch), it compares
 its own handshake with the stored SYN to show which
-component differs. The server's handshake must therefore be accurate. **Send 17, not 16**
-(see Sec. 22.14).
+component differs. The server's handshake must therefore be accurate. 
 
 ### 8.3 What the client does next
 
