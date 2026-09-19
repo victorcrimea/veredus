@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use rusty_enet::PeerID;
@@ -25,9 +26,14 @@ use crate::relay::messages::PreGameStatus;
 use crate::relay::messages::StartSavegameSettings;
 use crate::relay::messages::StartSettings;
 use crate::relay::messages::StateHash;
+use crate::relay::messages::Syn;
 use crate::relay::messages::SynAck;
 use crate::relay::messages::TurnSealed;
 use crate::relay::messages::WireMessage;
+
+const SYN_CHALLENGE: u32 = 0x5073013F;
+const GAME_VERSION: u32 = 0x01010019;
+const SIMULATION_VERSION: &str = "0.28.0";
 
 #[derive(Debug)]
 pub enum Input {
@@ -81,7 +87,13 @@ pub struct Config {
     pub turn_length_ms: u32,
 }
 
-pub struct Session;
+pub struct Session {
+    #[expect(dead_code, reason = "read once kick bans by IP")]
+    addr: Ipv4Addr,
+    // None until SYN_ACK is accepted, so it doubles as the handshake-pending marker.
+    #[expect(dead_code, reason = "read once the handlers are implemented")]
+    uuid: Option<String>,
+}
 
 pub struct FrozenSettings {
     // Kept verbatim because JOIN must carry the same text to late joiners.
@@ -91,10 +103,9 @@ pub struct FrozenSettings {
 }
 
 struct Context {
-    #[expect(dead_code, reason = "read once the handlers are implemented")]
     config: Config,
-    #[expect(dead_code, reason = "read once the handlers are implemented")]
     sessions: HashMap<PeerID, Session>,
+    banned_ips: HashSet<Ipv4Addr>,
     effects: Vec<Effect>,
 }
 
@@ -257,8 +268,27 @@ impl<S> Server<S> {
         }
     }
 
-    fn on_connected(&mut self, _peer: PeerID, _addr: Ipv4Addr) {
-        todo!("create session, disconnect banned IPs with Banned, else send SYN")
+    fn on_connected(&mut self, peer: PeerID, addr: Ipv4Addr) {
+        self.ctx.sessions.insert(peer, Session { addr, uuid: None });
+        if self.ctx.banned_ips.contains(&addr) {
+            self.ctx.effects.push(Effect::Disconnect {
+                peer,
+                reason: DisconnectReason::Banned,
+            });
+            return;
+        }
+        // The client compares its mismatch report against this SYN, so it must
+        // list exactly the mods the clients run, in load order.
+        let syn = Syn {
+            magic: SYN_CHALLENGE,
+            protocol_version: GAME_VERSION,
+            engine_version: SIMULATION_VERSION.into(),
+            enabled_mods: self.ctx.config.enabled_mods.clone(),
+        };
+        self.ctx.effects.push(Effect::Send {
+            peer,
+            msg: WireMessage::Syn(syn),
+        });
     }
 
     fn on_disconnected(&mut self, _peer: PeerID) {
@@ -363,6 +393,7 @@ impl Server<Idle> {
             ctx: Context {
                 config,
                 sessions: HashMap::new(),
+                banned_ips: HashSet::new(),
                 effects: Vec::new(),
             },
             st: Idle,
