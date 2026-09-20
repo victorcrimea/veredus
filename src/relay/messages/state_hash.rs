@@ -3,7 +3,7 @@
 
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StateHash {
     pub turn: u32,
     pub hash: Vec<u8>,

@@ -3,7 +3,7 @@
 
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StartSettings {
     pub init_attributes: Vec<u8>,
 }

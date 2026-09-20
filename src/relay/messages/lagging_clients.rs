@@ -4,7 +4,7 @@
 use super::performance_entry::PerformanceEntry;
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LaggingClients {
     pub clients: Vec<PerformanceEntry>,
 }

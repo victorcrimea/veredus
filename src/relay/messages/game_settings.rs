@@ -3,7 +3,7 @@
 
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GameSettings {
     pub data: Vec<u8>,
 }

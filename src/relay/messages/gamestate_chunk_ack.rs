@@ -3,7 +3,7 @@
 
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GamestateChunkAck {
     pub request_id: u32,
     pub num_packets: u32,

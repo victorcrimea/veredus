@@ -7,7 +7,7 @@ use crate::utils::write_wide_string;
 
 use super::guid::Guid;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chat {
     pub sender_guid: Guid,
     pub message: String,

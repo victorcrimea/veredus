@@ -4,7 +4,7 @@
 use super::guid::Guid;
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LastSeen {
     pub guid: Guid,
     pub last_received_time: u32,

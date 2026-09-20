@@ -4,7 +4,7 @@
 use super::guid::Guid;
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PreGameStatus {
     pub guid: Guid,
     pub status: u8,

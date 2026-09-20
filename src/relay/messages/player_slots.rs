@@ -4,7 +4,7 @@
 use super::host::Host;
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlayerSlots {
     pub hosts: Vec<Host>,
 }

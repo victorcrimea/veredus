@@ -3,7 +3,7 @@
 
 use uuid::Uuid;
 
-#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Guid(pub String);
 
 impl Default for Guid {

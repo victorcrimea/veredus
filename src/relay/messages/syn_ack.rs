@@ -4,7 +4,7 @@
 use super::enabled_mod::EnabledMod;
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SynAck {
     pub magic_response: u32,
     pub protocol_version: u32,

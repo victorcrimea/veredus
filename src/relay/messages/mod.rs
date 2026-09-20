@@ -16,7 +16,7 @@ mod gamestate_chunk;
 mod gamestate_chunk_ack;
 mod gamestate_request;
 mod gamestate_response;
-mod guid;
+pub mod guid;
 mod host;
 mod join;
 mod joined;
@@ -51,6 +51,8 @@ pub use gamestate_chunk::GamestateChunk;
 pub use gamestate_chunk_ack::GamestateChunkAck;
 pub use gamestate_request::GamestateRequest;
 pub use gamestate_response::GamestateResponse;
+pub use guid::Guid;
+pub use host::Host;
 pub use join::Join;
 pub use joined::Joined;
 pub use kicked::Kicked;
@@ -58,6 +60,7 @@ pub use lagging_clients::LaggingClients;
 pub use last_seen::LastSeen;
 pub use loaded_game::LoadedGame;
 pub use map_player_id_to_slot::MapPlayerIdToSlot;
+pub use performance_entry::PerformanceEntry;
 pub use player_command::PlayerCommand;
 pub use player_pause::PlayerPause;
 pub use player_slots::PlayerSlots;
@@ -71,7 +74,7 @@ pub use syn_ack::SynAck;
 pub use turn_sealed::TurnSealed;
 pub use wrong_hash_players::WrongHashPlayers;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WireMessage {
     Syn(Syn),
     SynAck(SynAck),

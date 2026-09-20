@@ -6,7 +6,7 @@ use crate::relay::fault::ParseError;
 use crate::utils::read_wide_string;
 use crate::utils::write_wide_string;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Host {
     pub guid: Guid,
     pub name: String,

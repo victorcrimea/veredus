@@ -4,7 +4,7 @@
 use crate::relay::fault::ParseError;
 use crate::utils::{read_wide_string, write_wide_string};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Authenticate {
     pub name: String,
     pub password: String,

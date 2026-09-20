@@ -4,7 +4,7 @@
 use super::guid::Guid;
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlayerPause {
     pub guid: Guid,
     pub pause: bool,

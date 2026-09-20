@@ -4,7 +4,7 @@
 use super::guid::Guid;
 use crate::relay::fault::ParseError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Ack {
     pub use_protocol_version: u32,
     pub flags: u32,

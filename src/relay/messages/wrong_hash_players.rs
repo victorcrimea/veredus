@@ -5,7 +5,7 @@ use crate::relay::fault::ParseError;
 use crate::utils::read_wide_string;
 use crate::utils::write_wide_string;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WrongHashPlayers {
     pub turn: u32,
     pub hash_expected: Vec<u8>,
