@@ -6,6 +6,7 @@ pub mod enet_task;
 pub mod fault;
 pub mod game_server;
 pub mod messages;
+pub mod monitor;
 pub mod password;
 pub mod server_fsm;
 pub mod session;
