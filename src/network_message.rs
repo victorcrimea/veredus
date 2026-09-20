@@ -18,4 +18,6 @@ pub enum InboundNetworkMessage {
 pub enum OutboundNetworkMessage {
     Message { peer: PeerID, data: Vec<u8> },
     Disconnect { peer: PeerID, reason: u32 },
+    // Shutdown cannot wait for queued reliable traffic to drain.
+    DisconnectNow { peer: PeerID, reason: u32 },
 }

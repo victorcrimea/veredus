@@ -128,8 +128,20 @@ pub fn run_enet_host(
                 },
                 OutboundNetworkMessage::Disconnect { peer, reason } => {
                     match host.get_peer_mut(peer) {
-                        Some(handle) => handle.disconnect(reason),
+                        // disconnect() resets the peer's outgoing queue on the
+                        // spot, dropping anything queued earlier this same
+                        // tick (such as the departing client's own final
+                        // PLAYER_SLOTS). disconnect_later() waits for queued
+                        // commands to flush first, falling back to an
+                        // immediate disconnect when nothing is queued.
+                        Some(handle) => handle.disconnect_later(reason),
                         None => tracing::debug!(?peer, "disconnect for unknown peer"),
+                    }
+                }
+                OutboundNetworkMessage::DisconnectNow { peer, reason } => {
+                    match host.get_peer_mut(peer) {
+                        Some(handle) => handle.disconnect_now(reason),
+                        None => tracing::debug!(?peer, "immediate disconnect for unknown peer"),
                     }
                 }
             }
