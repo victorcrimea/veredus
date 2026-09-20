@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::authenticate_result_code::AuthenticateResultCode;
+use crate::relay::fault::ParseError;
 use crate::utils::read_wide_string;
 use crate::utils::write_wide_string;
 
@@ -27,11 +28,11 @@ impl AuthenticateResult {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for code".into());
+            return Err(ParseError::Truncated { field: "code" });
         }
         let code = u32::from_be_bytes([
             buffer[pos],
@@ -42,13 +43,15 @@ impl AuthenticateResult {
         pos += 4;
 
         if buffer.len() < pos + 2 {
-            return Err("Buffer too short for host_id".into());
+            return Err(ParseError::Truncated { field: "host_id" });
         }
         let host_id = u16::from_be_bytes([buffer[pos], buffer[pos + 1]]);
         pos += 2;
 
         if buffer.len() < pos + 1 {
-            return Err("Buffer too short for is_controller".into());
+            return Err(ParseError::Truncated {
+                field: "is_controller",
+            });
         }
         let is_controller = buffer[pos] != 0;
         pos += 1;

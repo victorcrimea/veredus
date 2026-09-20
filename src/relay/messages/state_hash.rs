@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 #[derive(Debug, PartialEq)]
 pub struct StateHash {
     pub turn: u32,
@@ -20,11 +22,11 @@ impl StateHash {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for turn".into());
+            return Err(ParseError::Truncated { field: "turn" });
         }
         let turn = u32::from_be_bytes([
             buffer[pos],
@@ -35,7 +37,9 @@ impl StateHash {
         pos += 4;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for hash length".into());
+            return Err(ParseError::Truncated {
+                field: "hash length",
+            });
         }
         let hash_len = u32::from_be_bytes([
             buffer[pos],
@@ -46,7 +50,7 @@ impl StateHash {
         pos += 4;
 
         if buffer.len() < pos + hash_len {
-            return Err("Buffer too short for hash data".into());
+            return Err(ParseError::Truncated { field: "hash data" });
         }
         let hash = buffer[pos..pos + hash_len].to_vec();
 

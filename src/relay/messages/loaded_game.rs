@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 #[derive(Debug, PartialEq)]
 pub struct LoadedGame {
     pub current_turn: u32,
@@ -15,11 +17,13 @@ impl LoadedGame {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for current_turn".into());
+            return Err(ParseError::Truncated {
+                field: "current_turn",
+            });
         }
         let current_turn = u32::from_be_bytes([
             buffer[pos],

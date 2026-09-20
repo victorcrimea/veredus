@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 #[derive(Debug, PartialEq)]
 pub struct GamestateChunkAck {
     pub request_id: u32,
@@ -17,11 +19,13 @@ impl GamestateChunkAck {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for request_id".into());
+            return Err(ParseError::Truncated {
+                field: "request_id",
+            });
         }
         let request_id = u32::from_be_bytes([
             buffer[pos],
@@ -32,7 +36,9 @@ impl GamestateChunkAck {
         pos += 4;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for num_packets".into());
+            return Err(ParseError::Truncated {
+                field: "num_packets",
+            });
         }
         let num_packets = u32::from_be_bytes([
             buffer[pos],

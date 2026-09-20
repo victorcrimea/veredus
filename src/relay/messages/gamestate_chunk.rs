@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 #[derive(Debug, PartialEq)]
 pub struct GamestateChunk {
     pub request_id: u32,
@@ -18,11 +20,13 @@ impl GamestateChunk {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for request_id".into());
+            return Err(ParseError::Truncated {
+                field: "request_id",
+            });
         }
         let request_id = u32::from_be_bytes([
             buffer[pos],
@@ -33,7 +37,9 @@ impl GamestateChunk {
         pos += 4;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for data length".into());
+            return Err(ParseError::Truncated {
+                field: "data length",
+            });
         }
         let data_len = u32::from_be_bytes([
             buffer[pos],
@@ -44,7 +50,7 @@ impl GamestateChunk {
         pos += 4;
 
         if buffer.len() < pos + data_len {
-            return Err("Buffer too short for data".into());
+            return Err(ParseError::Truncated { field: "data" });
         }
         let data = buffer[pos..pos + data_len].to_vec();
 

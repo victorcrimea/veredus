@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod enet_task;
+pub mod fault;
 pub mod game_server;
 pub mod messages;
 pub mod server_fsm;

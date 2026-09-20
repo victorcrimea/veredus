@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
 use crate::utils::read_wide_string;
 use crate::utils::write_wide_string;
 
@@ -28,11 +29,11 @@ impl WrongHashPlayers {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for turn".into());
+            return Err(ParseError::Truncated { field: "turn" });
         }
         let turn = u32::from_be_bytes([
             buffer[pos],
@@ -43,7 +44,9 @@ impl WrongHashPlayers {
         pos += 4;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for hash_expected length".into());
+            return Err(ParseError::Truncated {
+                field: "hash_expected length",
+            });
         }
         let hash_len = u32::from_be_bytes([
             buffer[pos],
@@ -54,7 +57,9 @@ impl WrongHashPlayers {
         pos += 4;
 
         if buffer.len() < pos + hash_len {
-            return Err("Buffer too short for hash_expected data".into());
+            return Err(ParseError::Truncated {
+                field: "hash_expected data",
+            });
         }
         let hash_expected = buffer[pos..pos + hash_len].to_vec();
         pos += hash_len;

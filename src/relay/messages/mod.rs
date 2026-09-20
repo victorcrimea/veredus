@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
 use crate::utils::hex_dump;
 
 mod ack;
@@ -259,21 +260,22 @@ impl WireMessage {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         if buffer.len() < 3 {
-            return Err("Buffer too short for header".into());
+            return Err(ParseError::Truncated { field: "header" });
         }
 
         let msg_type = buffer[0];
 
         let size = u16::from_be_bytes([buffer[1], buffer[2]]) as usize;
 
+        // One application message per packet, so a declared size that is not
+        // the packet length means the packet is not one whole message.
         if buffer.len() != size {
-            return Err(format!(
-                "Buffer size mismatch: declared {}, actual {}",
-                size,
-                buffer.len()
-            ));
+            return Err(ParseError::SizeMismatch {
+                declared: size,
+                actual: buffer.len(),
+            });
         }
 
         let body = &buffer[3..];
@@ -319,7 +321,7 @@ impl WireMessage {
             28 => Ok(Self::WrongHashPlayers(WrongHashPlayers::from_bytes(body)?)),
             29 => Ok(Self::PlayerCommand(PlayerCommand::from_bytes(body)?)),
             30 => Ok(Self::Flare(Flare::from_bytes(body)?)),
-            _ => Err(format!("Invalid message type: {}", msg_type)),
+            _ => Err(ParseError::UnknownType(msg_type)),
         }
     }
 }

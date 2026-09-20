@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 #[derive(Debug, PartialEq)]
 pub struct GamestateResponse {
     pub request_id: u32,
@@ -17,11 +19,13 @@ impl GamestateResponse {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for request_id".into());
+            return Err(ParseError::Truncated {
+                field: "request_id",
+            });
         }
         let request_id = u32::from_be_bytes([
             buffer[pos],
@@ -32,7 +36,7 @@ impl GamestateResponse {
         pos += 4;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for length".into());
+            return Err(ParseError::Truncated { field: "length" });
         }
         let length = u32::from_be_bytes([
             buffer[pos],

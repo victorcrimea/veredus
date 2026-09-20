@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
 use crate::utils::{read_wide_string, write_wide_string};
 
 #[derive(Debug)]
@@ -27,13 +28,15 @@ impl Authenticate {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let pos = 0;
 
         let (name, mut pos) = read_wide_string(buffer, pos)?;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for password length".into());
+            return Err(ParseError::Truncated {
+                field: "password length",
+            });
         }
         let password_len = u32::from_be_bytes([
             buffer[pos],
@@ -44,14 +47,18 @@ impl Authenticate {
         pos += 4;
 
         if buffer.len() < pos + password_len {
-            return Err("Buffer too short for password data".into());
+            return Err(ParseError::Truncated {
+                field: "password data",
+            });
         }
         let password = String::from_utf8(buffer[pos..pos + password_len].to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in password: {}", e))?;
+            .map_err(|_| ParseError::BadUtf8 { field: "password" })?;
         pos += password_len;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for controller_secret length".into());
+            return Err(ParseError::Truncated {
+                field: "controller_secret length",
+            });
         }
         let secret_len = u32::from_be_bytes([
             buffer[pos],
@@ -62,10 +69,16 @@ impl Authenticate {
         pos += 4;
 
         if buffer.len() < pos + secret_len {
-            return Err("Buffer too short for controller_secret data".into());
+            return Err(ParseError::Truncated {
+                field: "controller_secret data",
+            });
         }
-        let controller_secret = String::from_utf8(buffer[pos..pos + secret_len].to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in controller_secret: {}", e))?;
+        let controller_secret =
+            String::from_utf8(buffer[pos..pos + secret_len].to_vec()).map_err(|_| {
+                ParseError::BadUtf8 {
+                    field: "controller_secret",
+                }
+            })?;
 
         Ok(Self {
             name,

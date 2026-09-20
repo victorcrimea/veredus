@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 #[derive(Debug, PartialEq)]
 pub struct GameSettings {
     pub data: Vec<u8>,
@@ -11,7 +13,7 @@ impl GameSettings {
         self.data.clone()
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         Ok(Self {
             data: buffer.to_vec(),
         })

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::enabled_mod::EnabledMod;
+use crate::relay::fault::ParseError;
 
 #[derive(Debug, PartialEq)]
 pub struct Syn {
@@ -30,11 +31,11 @@ impl Syn {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for magic".into());
+            return Err(ParseError::Truncated { field: "magic" });
         }
         let magic = u32::from_be_bytes([
             buffer[pos],
@@ -45,7 +46,9 @@ impl Syn {
         pos += 4;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for protocol version".into());
+            return Err(ParseError::Truncated {
+                field: "protocol version",
+            });
         }
         let protocol_version = u32::from_be_bytes([
             buffer[pos],
@@ -56,7 +59,9 @@ impl Syn {
         pos += 4;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for engine version length".into());
+            return Err(ParseError::Truncated {
+                field: "engine version length",
+            });
         }
         let engine_version_len = u32::from_be_bytes([
             buffer[pos],
@@ -67,16 +72,19 @@ impl Syn {
         pos += 4;
 
         if buffer.len() < pos + engine_version_len {
-            return Err("Buffer too short for engine version data".into());
+            return Err(ParseError::Truncated {
+                field: "engine version data",
+            });
         }
         let engine_version = String::from_utf8(buffer[pos..pos + engine_version_len].to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in engine version: {}", e))?;
+            .map_err(|_| ParseError::BadUtf8 {
+                field: "engine version",
+            })?;
         pos += engine_version_len;
 
         let mut enabled_mods = Vec::new();
         while pos < buffer.len() {
-            let (mod_item, bytes_read) = EnabledMod::from_bytes(&buffer[pos..])
-                .map_err(|e| format!("Failed to read mod: {}", e))?;
+            let (mod_item, bytes_read) = EnabledMod::from_bytes(&buffer[pos..])?;
             enabled_mods.push(mod_item);
             pos += bytes_read;
         }

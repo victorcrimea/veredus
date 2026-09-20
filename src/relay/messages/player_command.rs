@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerCommand {
     pub client: u32,
@@ -23,11 +25,11 @@ impl PlayerCommand {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for client".into());
+            return Err(ParseError::Truncated { field: "client" });
         }
         let client = u32::from_le_bytes([
             buffer[pos],
@@ -38,7 +40,7 @@ impl PlayerCommand {
         pos += 4;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for player".into());
+            return Err(ParseError::Truncated { field: "player" });
         }
         let player = i32::from_le_bytes([
             buffer[pos],
@@ -49,7 +51,7 @@ impl PlayerCommand {
         pos += 4;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for turn".into());
+            return Err(ParseError::Truncated { field: "turn" });
         }
         let turn = u32::from_le_bytes([
             buffer[pos],

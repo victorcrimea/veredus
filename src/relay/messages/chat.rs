@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
 use crate::utils::read_wide_string;
 use crate::utils::write_wide_string;
 
@@ -35,11 +36,13 @@ impl Chat {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for sender_guid length".into());
+            return Err(ParseError::Truncated {
+                field: "sender_guid length",
+            });
         }
         let sender_guid_len = u32::from_be_bytes([
             buffer[pos],
@@ -50,20 +53,27 @@ impl Chat {
         pos += 4;
 
         if buffer.len() < pos + sender_guid_len {
-            return Err("Buffer too short for sender_guid data".into());
+            return Err(ParseError::Truncated {
+                field: "sender_guid data",
+            });
         }
         let sender_guid = Guid(
-            String::from_utf8(buffer[pos..pos + sender_guid_len].to_vec())
-                .map_err(|e| format!("Invalid UTF-8 in sender_guid: {}", e))?,
+            String::from_utf8(buffer[pos..pos + sender_guid_len].to_vec()).map_err(|_| {
+                ParseError::BadUtf8 {
+                    field: "sender_guid",
+                }
+            })?,
         );
         pos += sender_guid_len;
 
-        let (message, mut pos) = read_wide_string(buffer, pos).unwrap();
+        let (message, mut pos) = read_wide_string(buffer, pos)?;
 
         let mut receivers = Vec::new();
         while pos < buffer.len() {
             if buffer.len() < pos + 4 {
-                return Err("Buffer too short for receiver guid length".into());
+                return Err(ParseError::Truncated {
+                    field: "receiver guid length",
+                });
             }
             let receiver_guid_len = u32::from_be_bytes([
                 buffer[pos],
@@ -74,11 +84,16 @@ impl Chat {
             pos += 4;
 
             if buffer.len() < pos + receiver_guid_len {
-                return Err("Buffer too short for receiver guid data".into());
+                return Err(ParseError::Truncated {
+                    field: "receiver guid data",
+                });
             }
             receivers.push(Guid(
-                String::from_utf8(buffer[pos..pos + receiver_guid_len].to_vec())
-                    .map_err(|e| format!("Invalid UTF-8 in receiver guid: {}", e))?,
+                String::from_utf8(buffer[pos..pos + receiver_guid_len].to_vec()).map_err(|_| {
+                    ParseError::BadUtf8 {
+                        field: "receiver guid",
+                    }
+                })?,
             ));
             pos += receiver_guid_len;
         }

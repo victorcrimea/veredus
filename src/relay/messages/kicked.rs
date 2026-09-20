@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 #[derive(Debug, PartialEq)]
 pub struct Kicked {
     pub name: String,
@@ -18,14 +20,14 @@ impl Kicked {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         let (name, new_pos) = crate::utils::read_wide_string(buffer, pos)?;
         pos = new_pos;
 
         if buffer.len() < pos + 1 {
-            return Err("Buffer too short for ban".into());
+            return Err(ParseError::Truncated { field: "ban" });
         }
         let ban = buffer[pos] != 0;
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::guid::Guid;
+use crate::relay::fault::ParseError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Flare {
@@ -35,11 +36,13 @@ impl Flare {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for guid length".into());
+            return Err(ParseError::Truncated {
+                field: "guid length",
+            });
         }
         let guid_len = u32::from_be_bytes([
             buffer[pos],
@@ -50,16 +53,18 @@ impl Flare {
         pos += 4;
 
         if buffer.len() < pos + guid_len {
-            return Err("Buffer too short for guid data".into());
+            return Err(ParseError::Truncated { field: "guid data" });
         }
         let guid = Guid(
             String::from_utf8(buffer[pos..pos + guid_len].to_vec())
-                .map_err(|e| format!("Invalid UTF-8 in guid: {}", e))?,
+                .map_err(|_| ParseError::BadUtf8 { field: "guid" })?,
         );
         pos += guid_len;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for position_x length".into());
+            return Err(ParseError::Truncated {
+                field: "position_x length",
+            });
         }
         let x_len = u32::from_be_bytes([
             buffer[pos],
@@ -70,14 +75,21 @@ impl Flare {
         pos += 4;
 
         if buffer.len() < pos + x_len {
-            return Err("Buffer too short for position_x data".into());
+            return Err(ParseError::Truncated {
+                field: "position_x data",
+            });
         }
-        let position_x = String::from_utf8(buffer[pos..pos + x_len].to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in position_x: {}", e))?;
+        let position_x = String::from_utf8(buffer[pos..pos + x_len].to_vec()).map_err(|_| {
+            ParseError::BadUtf8 {
+                field: "position_x",
+            }
+        })?;
         pos += x_len;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for position_y length".into());
+            return Err(ParseError::Truncated {
+                field: "position_y length",
+            });
         }
         let y_len = u32::from_be_bytes([
             buffer[pos],
@@ -88,14 +100,21 @@ impl Flare {
         pos += 4;
 
         if buffer.len() < pos + y_len {
-            return Err("Buffer too short for position_y data".into());
+            return Err(ParseError::Truncated {
+                field: "position_y data",
+            });
         }
-        let position_y = String::from_utf8(buffer[pos..pos + y_len].to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in position_y: {}", e))?;
+        let position_y = String::from_utf8(buffer[pos..pos + y_len].to_vec()).map_err(|_| {
+            ParseError::BadUtf8 {
+                field: "position_y",
+            }
+        })?;
         pos += y_len;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for position_z length".into());
+            return Err(ParseError::Truncated {
+                field: "position_z length",
+            });
         }
         let z_len = u32::from_be_bytes([
             buffer[pos],
@@ -106,10 +125,15 @@ impl Flare {
         pos += 4;
 
         if buffer.len() < pos + z_len {
-            return Err("Buffer too short for position_z data".into());
+            return Err(ParseError::Truncated {
+                field: "position_z data",
+            });
         }
-        let position_z = String::from_utf8(buffer[pos..pos + z_len].to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in position_z: {}", e))?;
+        let position_z = String::from_utf8(buffer[pos..pos + z_len].to_vec()).map_err(|_| {
+            ParseError::BadUtf8 {
+                field: "position_z",
+            }
+        })?;
 
         Ok(Self {
             guid,

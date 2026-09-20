@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::guid::Guid;
+use crate::relay::fault::ParseError;
 
 #[derive(Debug, PartialEq)]
 pub struct Joined {
@@ -20,11 +21,13 @@ impl Joined {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for guid length".into());
+            return Err(ParseError::Truncated {
+                field: "guid length",
+            });
         }
         let guid_len = u32::from_be_bytes([
             buffer[pos],
@@ -35,11 +38,11 @@ impl Joined {
         pos += 4;
 
         if buffer.len() < pos + guid_len {
-            return Err("Buffer too short for guid data".into());
+            return Err(ParseError::Truncated { field: "guid data" });
         }
         let guid = Guid(
             String::from_utf8(buffer[pos..pos + guid_len].to_vec())
-                .map_err(|e| format!("Invalid UTF-8 in guid: {}", e))?,
+                .map_err(|_| ParseError::BadUtf8 { field: "guid" })?,
         );
 
         Ok(Self { guid })

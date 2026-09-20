@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::performance_entry::PerformanceEntry;
+use crate::relay::fault::ParseError;
 
 #[derive(Debug, PartialEq)]
 pub struct LaggingClients {
@@ -19,7 +20,7 @@ impl LaggingClients {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
         let mut clients = Vec::new();
 

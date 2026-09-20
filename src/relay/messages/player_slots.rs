@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::host::Host;
+use crate::relay::fault::ParseError;
 
 #[derive(Debug, PartialEq)]
 pub struct PlayerSlots {
@@ -19,13 +20,12 @@ impl PlayerSlots {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         let mut hosts = Vec::new();
         while pos < buffer.len() {
-            let (host_item, bytes_read) = Host::from_bytes(&buffer[pos..])
-                .map_err(|e| format!("Failed to read mod: {}", e))?;
+            let (host_item, bytes_read) = Host::from_bytes(&buffer[pos..])?;
             hosts.push(host_item);
             pos += bytes_read;
         }

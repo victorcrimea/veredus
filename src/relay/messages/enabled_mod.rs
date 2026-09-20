@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnabledMod {
     pub name: String,
@@ -22,11 +24,13 @@ impl EnabledMod {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<(Self, usize), String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<(Self, usize), ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for name length".into());
+            return Err(ParseError::Truncated {
+                field: "name length",
+            });
         }
         let name_len = u32::from_be_bytes([
             buffer[pos],
@@ -37,14 +41,16 @@ impl EnabledMod {
         pos += 4;
 
         if buffer.len() < pos + name_len {
-            return Err("Buffer too short for name data".into());
+            return Err(ParseError::Truncated { field: "name data" });
         }
         let name = String::from_utf8(buffer[pos..pos + name_len].to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in name: {}", e))?;
+            .map_err(|_| ParseError::BadUtf8 { field: "name" })?;
         pos += name_len;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for version length".into());
+            return Err(ParseError::Truncated {
+                field: "version length",
+            });
         }
         let version_len = u32::from_be_bytes([
             buffer[pos],
@@ -55,10 +61,12 @@ impl EnabledMod {
         pos += 4;
 
         if buffer.len() < pos + version_len {
-            return Err("Buffer too short for version data".into());
+            return Err(ParseError::Truncated {
+                field: "version data",
+            });
         }
         let version = String::from_utf8(buffer[pos..pos + version_len].to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in version: {}", e))?;
+            .map_err(|_| ParseError::BadUtf8 { field: "version" })?;
         pos += version_len;
 
         Ok((Self { name, version }, pos))

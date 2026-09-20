@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 #[derive(Debug, PartialEq)]
 pub struct StartSavegameSettings {
     pub init_attributes: String,
@@ -17,11 +19,13 @@ impl StartSavegameSettings {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<Self, ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for init_attributes length".into());
+            return Err(ParseError::Truncated {
+                field: "init_attributes length",
+            });
         }
         let attr_len = u32::from_be_bytes([
             buffer[pos],
@@ -32,10 +36,16 @@ impl StartSavegameSettings {
         pos += 4;
 
         if buffer.len() < pos + attr_len {
-            return Err("Buffer too short for init_attributes data".into());
+            return Err(ParseError::Truncated {
+                field: "init_attributes data",
+            });
         }
-        let init_attributes = String::from_utf8(buffer[pos..pos + attr_len].to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in init_attributes: {}", e))?;
+        let init_attributes =
+            String::from_utf8(buffer[pos..pos + attr_len].to_vec()).map_err(|_| {
+                ParseError::BadUtf8 {
+                    field: "init_attributes",
+                }
+            })?;
 
         Ok(Self { init_attributes })
     }

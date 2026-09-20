@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::guid::Guid;
+use crate::relay::fault::ParseError;
 use crate::utils::read_wide_string;
 use crate::utils::write_wide_string;
 
@@ -31,11 +32,13 @@ impl Host {
         bytes
     }
 
-    pub fn from_bytes(buffer: &[u8]) -> Result<(Self, usize), String> {
+    pub fn from_bytes(buffer: &[u8]) -> Result<(Self, usize), ParseError> {
         let mut pos = 0;
 
         if buffer.len() < pos + 4 {
-            return Err("Buffer too short for guid length".into());
+            return Err(ParseError::Truncated {
+                field: "guid length",
+            });
         }
         let guid_len = u32::from_be_bytes([
             buffer[pos],
@@ -46,24 +49,24 @@ impl Host {
         pos += 4;
 
         if buffer.len() < pos + guid_len {
-            return Err("Buffer too short for guid data".into());
+            return Err(ParseError::Truncated { field: "guid data" });
         }
         let guid = Guid(
             String::from_utf8(buffer[pos..pos + guid_len].to_vec())
-                .map_err(|e| format!("Invalid UTF-8 in guid: {}", e))?,
+                .map_err(|_| ParseError::BadUtf8 { field: "guid" })?,
         );
         pos += guid_len;
 
         let (name, mut pos) = read_wide_string(buffer, pos)?;
 
         if buffer.len() < pos + 1 {
-            return Err("Buffer too short for player_id".into());
+            return Err(ParseError::Truncated { field: "player_id" });
         }
         let player_id = buffer[pos] as i8;
         pos += 1;
 
         if buffer.len() < pos + 1 {
-            return Err("Buffer too short for status".into());
+            return Err(ParseError::Truncated { field: "status" });
         }
         let status = buffer[pos];
         pos += 1;

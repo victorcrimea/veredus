@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::relay::fault::ParseError;
+
 pub fn hex_dump(data: &[u8]) -> String {
     const BYTES_PER_LINE: usize = 8;
 
@@ -40,13 +42,15 @@ pub fn hex_dump(data: &[u8]) -> String {
 
     out
 }
-pub fn read_wide_string(buffer: &[u8], start_pos: usize) -> Result<(String, usize), String> {
+pub fn read_wide_string(buffer: &[u8], start_pos: usize) -> Result<(String, usize), ParseError> {
     let mut pos = start_pos;
     let mut out = String::new();
 
     loop {
         if buffer.len() < pos + 2 {
-            return Err("Buffer too short while reading wide string".into());
+            return Err(ParseError::Truncated {
+                field: "wide string",
+            });
         }
 
         let unit = u16::from_be_bytes([buffer[pos], buffer[pos + 1]]);
