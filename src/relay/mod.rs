@@ -9,6 +9,7 @@ pub mod gamestate_transfer;
 pub mod messages;
 pub mod monitor;
 pub mod password;
+pub mod pause_budget;
 pub mod server_fsm;
 pub mod session;
 pub mod slots;

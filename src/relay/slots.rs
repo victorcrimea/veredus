@@ -29,13 +29,17 @@ pub struct Slots {
 
 impl Slots {
     // `recover` is set once the match has started: only then may an arriving
-    // client take over a slot left behind by a departed one.
-    pub fn add(&mut self, uuid: Guid, name: String, recover: bool) {
+    // client take over a slot left behind by a departed one. The UUID of the
+    // entry that was displaced is returned, so a caller that keys per-match
+    // state off the UUID can carry it over to the one now holding the slot.
+    pub fn add(&mut self, uuid: Guid, name: String, recover: bool) -> Option<Guid> {
         let mut slot = UNASSIGNED;
+        let mut displaced = None;
 
         if recover && let Some(index) = self.recoverable(&uuid, &name) {
-            slot = self.entries[index].slot;
-            self.entries.remove(index);
+            let previous = self.entries.remove(index);
+            slot = previous.slot;
+            displaced = Some(previous.uuid);
         }
 
         self.entries.push(PlayerSlot {
@@ -45,6 +49,8 @@ impl Slots {
             status: STATUS_NOT_READY,
             connected: true,
         });
+
+        displaced
     }
 
     // By UUID first, then by name, and never a slot a connected player holds.

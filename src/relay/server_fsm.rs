@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use chrono::DateTime;
+use chrono::TimeDelta;
 use chrono::Utc;
 use rusty_enet::PeerID;
 
@@ -55,6 +56,9 @@ use crate::relay::monitor::Monitor;
 use crate::relay::monitor::PeerStats;
 use crate::relay::monitor::Warning;
 use crate::relay::password;
+use crate::relay::pause_budget;
+use crate::relay::pause_budget::BudgetEvent;
+use crate::relay::pause_budget::PauseBudget;
 use crate::relay::session::Admitted;
 use crate::relay::session::Role;
 use crate::relay::session::Session;
@@ -179,6 +183,10 @@ pub struct Config {
     pub server_name: String,
     // Empty greets an arriving client with nothing at all.
     pub welcome_message: String,
+    // How long a player may hold the match paused across the whole game. A
+    // value longer than any match anyone would play is how the policy is
+    // turned off, so there is no second switch to keep in step with this one.
+    pub pause_budget: TimeDelta,
 }
 
 impl Default for Config {
@@ -201,6 +209,7 @@ impl Default for Config {
             release_controller_on_leave: true,
             server_name: "SERVER".to_string(),
             welcome_message: String::new(),
+            pause_budget: pause_budget::DEFAULT_BUDGET,
         }
     }
 }
@@ -234,6 +243,7 @@ pub(crate) struct Context {
     banned_names: HashSet<String>,
     transfers: Transfers,
     monitor: Monitor,
+    pause_budget: PauseBudget,
     turns: TurnManager,
     log: MatchLog,
     // Served to every joiner that asks, so it is shared rather than copied.
@@ -372,6 +382,16 @@ impl Context {
             .iter()
             .find(|(_, s)| s.uuid.as_ref() == Some(uuid))
             .map(|(p, _)| *p)
+    }
+
+    // The name a client would show for this UUID, which is what a line the
+    // relay speaks about someone has to use. None once they have left.
+    fn name_of(&self, uuid: &Guid) -> Option<String> {
+        self.sessions
+            .values()
+            .find(|s| s.uuid.as_ref() == Some(uuid))
+            .and_then(|s| s.admitted.as_ref())
+            .map(|a| a.name.clone())
     }
 
     // A message from anyone but the controller is silently ignored: no
@@ -639,7 +659,7 @@ impl<S: PhaseMarker> Server<S> {
         self.ctx.turns.forget(peer);
 
         if let Some(uuid) = session.uuid.as_ref() {
-            self.ctx.monitor.forget(uuid);
+            self.ctx.pause_budget.clear_pausing(uuid);
             if self.ctx.controller.as_ref() == Some(uuid)
                 && self.ctx.config.release_controller_on_leave
             {
@@ -691,6 +711,17 @@ impl<S: PhaseMarker> Server<S> {
                 session.since_last_received = sample.since_last_received;
             }
         }
+        // Before the warning gate, on its own anchor: the budget is charged
+        // from the elapsed it works out itself, so it neither depends on nor
+        // disturbs the once-a-second warning cadence.
+        if S::PHASE == Phase::InGame {
+            let players = self.ctx.slots.connected_players();
+            let events = self.ctx.pause_budget.check(now, players);
+            for event in events {
+                self.on_budget_event(event);
+            }
+        }
+
         if !self.ctx.monitor.due(now) {
             return;
         }
@@ -727,6 +758,42 @@ impl<S: PhaseMarker> Server<S> {
             self.ctx.broadcast_except(reported, &msg, |s| {
                 s.is_in_game() || (in_setup && s.is_setup())
             });
+        }
+    }
+
+    fn on_budget_event(&mut self, event: BudgetEvent) {
+        match event {
+            BudgetEvent::Expired { uuid } => {
+                tracing::info!(%uuid, "pause budget exhausted, resuming");
+                // Broadcast rather than broadcast_except: the one client that
+                // must hear this is the pauser, whose overlay is still up.
+                let relayed = WireMessage::PlayerPause(PlayerPause {
+                    guid: uuid.clone(),
+                    pause: false,
+                });
+                self.ctx.broadcast(&relayed, |s| s.is_in_game());
+                if let Some(name) = self.ctx.name_of(&uuid) {
+                    let text = format!("{} is out of pause budget.", name);
+                    self.ctx.server_chat(None, &text);
+                }
+            }
+            BudgetEvent::Status { uuid, remaining } => {
+                if let Some(name) = self.ctx.name_of(&uuid) {
+                    let text = format!(
+                        "{} is paused. {}s of pause budget left.",
+                        name,
+                        remaining.num_seconds()
+                    );
+                    self.ctx.server_chat(None, &text);
+                }
+            }
+            BudgetEvent::CoordinatedStarted => self.ctx.server_chat(
+                None,
+                "Everyone is paused, so nobody's pause budget is draining.",
+            ),
+            BudgetEvent::CoordinatedEnded => self
+                .ctx
+                .server_chat(None, "Pause budgets are draining again."),
         }
     }
 
@@ -976,8 +1043,16 @@ impl<S: PhaseMarker> Server<S> {
             });
         }
 
-        // A slot is only reclaimed once the match itself is running.
-        self.ctx.slots.add(uuid, name, S::PHASE == Phase::InGame);
+        // A slot is only reclaimed once the match itself is running. The
+        // returning client authenticates under a fresh UUID, so its pause
+        // quota has to follow the slot or a reconnect would refill it.
+        let displaced = self
+            .ctx
+            .slots
+            .add(uuid.clone(), name, S::PHASE == Phase::InGame);
+        if let Some(old) = displaced {
+            self.ctx.pause_budget.inherit(&old, &uuid);
+        }
         self.ctx.broadcast_player_slots();
 
         // After the slot broadcast, so the name behind the sender UUID is
@@ -1252,6 +1327,7 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
 
 impl Server<Idle> {
     pub fn new(config: Config) -> Self {
+        let pause_budget = PauseBudget::new(config.pause_budget);
         Server {
             ctx: Context {
                 config,
@@ -1265,6 +1341,7 @@ impl Server<Idle> {
                 banned_names: HashSet::new(),
                 transfers: Transfers::default(),
                 monitor: Monitor::default(),
+                pause_budget,
                 turns: TurnManager::default(),
                 log: MatchLog::default(),
                 join_snapshot: None,
@@ -1586,7 +1663,7 @@ impl Server<InGame> {
         self.ctx.broadcast(&relayed, |s| s.is_in_game());
 
         // The joiner missed every pause that happened before it arrived.
-        let paused: Vec<Guid> = self.ctx.monitor.paused().cloned().collect();
+        let paused: Vec<Guid> = self.ctx.pause_budget.pausing().cloned().collect();
         for guid in paused {
             self.ctx.send(
                 peer,
@@ -1598,12 +1675,68 @@ impl Server<InGame> {
 
     fn on_player_pause(&mut self, peer: PeerID, msg: PlayerPause) -> Result<(), PeerFault> {
         let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
-        self.ctx.monitor.set_paused(&uuid, msg.pause);
+
+        if msg.pause {
+            // An observer owns no player, so its pause costs it nothing and
+            // would freeze everyone else's screen for the whole match. This
+            // holds only while observers watch the live turn stream: once they
+            // run on a feed that lags the match, pausing that feed stops
+            // nothing anyone else can see and can be allowed back.
+            let slot = self.ctx.slots.slot_of(&uuid).filter(|s| *s != UNASSIGNED);
+            if slot.is_none() {
+                self.ctx
+                    .server_chat(Some(peer), "Only players can pause the game.");
+                self.ctx.send(
+                    peer,
+                    WireMessage::PlayerPause(PlayerPause {
+                        guid: uuid,
+                        pause: false,
+                    }),
+                );
+                return Ok(());
+            }
+
+            let left = self.ctx.pause_budget.remaining(&uuid);
+            if left <= TimeDelta::zero() {
+                // The client pauses itself the moment it asks, so refusing is
+                // not enough: it has to be told to lift its own overlay.
+                self.ctx
+                    .server_chat(Some(peer), "You are out of pause budget.");
+                self.ctx.send(
+                    peer,
+                    WireMessage::PlayerPause(PlayerPause {
+                        guid: uuid,
+                        pause: false,
+                    }),
+                );
+                return Ok(());
+            }
+
+            self.ctx.pause_budget.set_pausing(&uuid, true);
+            let relayed = WireMessage::PlayerPause(PlayerPause {
+                guid: uuid.clone(),
+                pause: true,
+            });
+            // Advisory only, and the client accepts it nowhere but in-game.
+            self.ctx
+                .broadcast_except(peer, &relayed, |s| s.is_in_game());
+
+            if let Some(name) = self.ctx.name_of(&uuid) {
+                let text = format!(
+                    "{} paused. {}s of pause budget left.",
+                    name,
+                    left.num_seconds()
+                );
+                self.ctx.server_chat(None, &text);
+            }
+            return Ok(());
+        }
+
+        self.ctx.pause_budget.set_pausing(&uuid, false);
         let relayed = WireMessage::PlayerPause(PlayerPause {
             guid: uuid,
-            pause: msg.pause,
+            pause: false,
         });
-        // Advisory only, and the client accepts it nowhere but in-game.
         self.ctx
             .broadcast_except(peer, &relayed, |s| s.is_in_game());
         Ok(())

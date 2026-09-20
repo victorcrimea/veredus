@@ -1,14 +1,10 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
-
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
 use rusty_enet::PeerID;
-
-use crate::relay::messages::Guid;
 
 // Warnings are advisory only: real connection loss is ENet's peer timeout, and
 // the server never disconnects anyone over these.
@@ -26,7 +22,6 @@ pub enum Warning {
 #[derive(Default)]
 pub struct Monitor {
     last_pass: Option<DateTime<Utc>>,
-    paused: HashSet<Guid>,
 }
 
 impl Monitor {
@@ -60,26 +55,6 @@ impl Monitor {
         } else {
             None
         }
-    }
-
-    // Returns true when the pause set actually changed, which is what decides
-    // whether the message is worth relaying.
-    pub fn set_paused(&mut self, uuid: &Guid, paused: bool) -> bool {
-        if paused {
-            self.paused.insert(uuid.clone())
-        } else {
-            self.paused.remove(uuid)
-        }
-    }
-
-    // A departing client is dropped from the set without any broadcast, so a
-    // client that pauses and then leaves never gets an unpause on the wire.
-    pub fn forget(&mut self, uuid: &Guid) {
-        self.paused.remove(uuid);
-    }
-
-    pub fn paused(&self) -> impl Iterator<Item = &Guid> {
-        self.paused.iter()
     }
 }
 
