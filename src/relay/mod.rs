@@ -7,3 +7,4 @@ pub mod game_server;
 pub mod messages;
 pub mod password;
 pub mod server_fsm;
+pub mod session;
