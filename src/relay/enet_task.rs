@@ -7,12 +7,15 @@ use std::sync::mpsc::Sender;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
+use chrono::TimeDelta;
+use chrono::Utc;
 use rusty_enet as enet;
 use rusty_enet::Event;
 use rusty_enet::EventNoRef;
 
 use crate::network_message::InboundNetworkMessage;
 use crate::network_message::OutboundNetworkMessage;
+use crate::relay::monitor::PeerStats;
 
 // Deliberately above the stock server's 41-peer cap so more observers fit.
 const PEER_LIMIT: usize = 200;
@@ -22,10 +25,10 @@ const CHANNEL_LIMIT: usize = 1;
 // rejected, and the crate default (1392) does not match.
 const HOST_MTU: u16 = 1372;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
-// service() yields at most one event per call, so without a drain loop the host
-// would handle 100 events/sec. The cap keeps the shutdown check and the
-// outbound flush running every tick even under a packet flood.
 const MAX_EVENTS_PER_TICK: usize = 256;
+// Matches the cadence the connection warnings are emitted at, so sampling any
+// faster would only produce readings nothing looks at.
+const STATS_INTERVAL: TimeDelta = TimeDelta::seconds(1);
 
 pub fn run_enet_host(
     socket: UdpSocket,
@@ -55,6 +58,8 @@ pub fn run_enet_host(
         .expect("Failed to set the MTU stock clients expect");
 
     tracing::info!(bind_addr = %bind_addr, "ENet host started");
+
+    let mut last_stats = Utc::now();
 
     'outer: loop {
         match shutdown_rx.try_recv() {
@@ -144,6 +149,34 @@ pub fn run_enet_host(
                         None => tracing::debug!(?peer, "immediate disconnect for unknown peer"),
                     }
                 }
+            }
+        }
+
+        // A wall clock can step backwards, so a negative delta samples now and
+        // re-anchors rather than stalling until the clock catches up.
+        let now = Utc::now();
+        let elapsed = now.signed_duration_since(last_stats);
+        if elapsed >= STATS_INTERVAL || elapsed < TimeDelta::zero() {
+            last_stats = now;
+            let enet_now = host.enet_time_get();
+            let stats: Vec<PeerStats> = host
+                .connected_peers()
+                .map(|peer| PeerStats {
+                    peer: peer.id(),
+                    mean_rtt: TimeDelta::from_std(peer.round_trip_time())
+                        .unwrap_or_else(|_| TimeDelta::zero()),
+                    // Both sides of this are ENet's own millisecond clock.
+                    since_last_received: TimeDelta::milliseconds(i64::from(
+                        enet_now.wrapping_sub(peer.last_receive_time()),
+                    )),
+                })
+                .collect();
+            if event_tx
+                .send(InboundNetworkMessage::Stats { stats })
+                .is_err()
+            {
+                tracing::error!("failed to forward peer stats to server thread");
+                break 'outer;
             }
         }
 

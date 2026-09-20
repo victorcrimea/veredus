@@ -5,6 +5,8 @@ use std::net::IpAddr;
 
 use rusty_enet::PeerID;
 
+use crate::relay::monitor::PeerStats;
+
 // Raw bytes cross the thread boundary on purpose: only the game-server thread
 // owns the message catalog, so the ENet thread stays a dumb packet pump.
 #[derive(Debug)]
@@ -12,6 +14,9 @@ pub enum InboundNetworkMessage {
     Connect { peer: PeerID, addr: IpAddr },
     Disconnect { peer: PeerID, reason: u32 },
     Message { peer: PeerID, data: Vec<u8> },
+    // Peer timing is only reachable from the thread that owns the host, so it
+    // is sampled there and carried over rather than looked up on demand.
+    Stats { stats: Vec<PeerStats> },
 }
 
 #[derive(Debug)]
