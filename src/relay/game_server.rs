@@ -16,8 +16,6 @@ use crate::relay::server_fsm::Idle;
 use crate::relay::server_fsm::Server;
 use crate::utils::hex_dump;
 
-// The wire protocol pins the turn length, so the FSM must tick on this clock.
-const TURN_LENGTH_MS: u32 = 200;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 // The ENet thread feeds decoded events in over `event_rx` and takes effects out
@@ -28,15 +26,9 @@ pub fn run_game_server(
     _send_tx: Sender<OutboundNetworkMessage>,
     _shutdown_requested: Arc<AtomicBool>,
 ) {
-    let config = Config {
-        enabled_mods: Vec::new(),
-        lobby_mode: false,
-        turn_length_ms: TURN_LENGTH_MS,
-    };
-
     // Parked in the listening state so the handler work starts from a live
     // server; until then events are only logged and never fed to the FSM.
-    let _server: AnyServer = Server::<Idle>::new(config).listen().into();
+    let _server: AnyServer = Server::<Idle>::new(Config::default()).listen().into();
 
     loop {
         loop {

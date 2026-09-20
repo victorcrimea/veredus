@@ -4,10 +4,23 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
+use chrono::DateTime;
+use chrono::Utc;
 use rusty_enet::PeerID;
 
+use crate::relay::auth;
+use crate::relay::auth::LateObserverPolicy;
+use crate::relay::fault::PeerFault;
+use crate::relay::gamestate_transfer::KIND_RUNNING_GAME;
+use crate::relay::gamestate_transfer::KIND_SAVEGAME;
+use crate::relay::gamestate_transfer::Purpose;
+use crate::relay::gamestate_transfer::Transfers;
+use crate::relay::messages::Ack;
 use crate::relay::messages::Authenticate;
+use crate::relay::messages::AuthenticateResult;
+use crate::relay::messages::AuthenticateResultCode;
 use crate::relay::messages::Chat;
 use crate::relay::messages::EnabledMod;
 use crate::relay::messages::Flare;
@@ -16,12 +29,18 @@ use crate::relay::messages::GamestateChunk;
 use crate::relay::messages::GamestateChunkAck;
 use crate::relay::messages::GamestateRequest;
 use crate::relay::messages::GamestateResponse;
+use crate::relay::messages::Guid;
+use crate::relay::messages::Join;
 use crate::relay::messages::Joined;
 use crate::relay::messages::Kicked;
+use crate::relay::messages::LaggingClients;
+use crate::relay::messages::LastSeen;
 use crate::relay::messages::LoadedGame;
 use crate::relay::messages::MapPlayerIdToSlot;
+use crate::relay::messages::PerformanceEntry;
 use crate::relay::messages::PlayerCommand;
 use crate::relay::messages::PlayerPause;
+use crate::relay::messages::PlayersLoading;
 use crate::relay::messages::PreGameStatus;
 use crate::relay::messages::StartSavegameSettings;
 use crate::relay::messages::StartSettings;
@@ -30,21 +49,71 @@ use crate::relay::messages::Syn;
 use crate::relay::messages::SynAck;
 use crate::relay::messages::TurnSealed;
 use crate::relay::messages::WireMessage;
+use crate::relay::messages::WrongHashPlayers;
+use crate::relay::monitor::Monitor;
+use crate::relay::monitor::PeerStats;
+use crate::relay::monitor::Warning;
+use crate::relay::password;
+use crate::relay::session::Admitted;
+use crate::relay::session::Role;
+use crate::relay::session::Session;
+use crate::relay::slots::Slots;
+use crate::relay::slots::UNASSIGNED;
+use crate::relay::turn::INITIAL_READY_TURN;
+use crate::relay::turn::MatchLog;
+use crate::relay::turn::TurnManager;
 
 const SYN_CHALLENGE: u32 = 0x5073013F;
 const GAME_VERSION: u32 = 0x01010019;
 const SIMULATION_VERSION: &str = "0.28.0";
 
-#[derive(Debug)]
-pub enum Input {
-    Connected { peer: PeerID, addr: Ipv4Addr },
-    Received { peer: PeerID, msg: WireMessage },
-    Disconnected { peer: PeerID },
-    LobbyAuth { username: String, token: String },
-    Tick,
-}
+// The one flag bit the ACK carries, telling the client to authenticate over
+// the lobby instead of answering straight away.
+const ACK_FLAG_LOBBY_AUTH: u32 = 0x1;
+
+// Matches the ENet peer limit, so the socket layer rather than this cap is
+// what a client hits first. The last peer stays a spare: admission rejects on
+// reaching the cap, so a client arriving at a full server can still be told
+// that it is full.
+const MAX_SESSIONS: usize = 200;
+
+const LOGIN_MESSAGE: &str = "Logged in";
+
+// A client seals this many turns ahead of the one it is about to simulate.
+const COMMAND_DELAY: u32 = 4;
+
+// Turn 0 is never simulated, so a fresh client owes its first state hash for
+// turn 1 and its simulated-turn counter starts one below that.
+const FIRST_SIMULATED_TURN: u32 = 0;
+
+// How many fresh UUIDs to try before giving up on issuing a unique one.
+const UUID_ATTEMPTS: usize = 8;
 
 #[derive(Debug)]
+pub enum Input {
+    Connected {
+        peer: PeerID,
+        addr: Ipv4Addr,
+    },
+    Received {
+        peer: PeerID,
+        msg: WireMessage,
+    },
+    Disconnected {
+        peer: PeerID,
+    },
+    LobbyAuth {
+        username: String,
+        token: String,
+    },
+    // Time and peer timing both enter here, so the FSM never reads a clock.
+    Tick {
+        now: DateTime<Utc>,
+        stats: Vec<PeerStats>,
+    },
+}
+
+#[derive(Debug, PartialEq)]
 pub enum Effect {
     Send {
         peer: PeerID,
@@ -85,14 +154,44 @@ pub struct Config {
     pub enabled_mods: Vec<EnabledMod>,
     pub lobby_mode: bool,
     pub turn_length_ms: u32,
+    // The stored hash H, not a plaintext password. Empty means an open server,
+    // which is the only thing direct-IP clients can join.
+    pub server_password_hash: String,
+    // Empty means the first client to authenticate becomes controller, because
+    // that is the secret every stock client sends.
+    pub controller_secret: String,
+    pub allow_duplicate_names: bool,
+    pub late_observer_policy: LateObserverPolicy,
+    pub observer_limit: usize,
+    // None means an observer never blocks turn release.
+    pub observer_lag_limit: Option<u32>,
+    pub buddies: HashSet<String>,
+    pub max_sessions: usize,
+    // Losing the controller is permanent in the stock server, which strands
+    // the match with nobody able to start or configure it.
+    pub release_controller_on_leave: bool,
 }
 
-pub struct Session {
-    #[expect(dead_code, reason = "read once kick bans by IP")]
-    addr: Ipv4Addr,
-    // None until SYN_ACK is accepted, so it doubles as the handshake-pending marker.
-    #[expect(dead_code, reason = "read once the handlers are implemented")]
-    uuid: Option<String>,
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            enabled_mods: vec![EnabledMod {
+                name: "0ad".to_string(),
+                version: SIMULATION_VERSION.to_string(),
+            }],
+            lobby_mode: false,
+            turn_length_ms: 200,
+            server_password_hash: String::new(),
+            controller_secret: String::new(),
+            allow_duplicate_names: false,
+            late_observer_policy: LateObserverPolicy::default(),
+            observer_limit: 8,
+            observer_lag_limit: None,
+            buddies: HashSet::new(),
+            max_sessions: MAX_SESSIONS,
+            release_controller_on_leave: true,
+        }
+    }
 }
 
 pub struct FrozenSettings {
@@ -102,11 +201,180 @@ pub struct FrozenSettings {
     pub turn_length_ms: u32,
 }
 
-struct Context {
+// The server-wide phase, as the authentication rules see it. It is derived
+// from the typestate rather than stored, so it cannot drift out of step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Setup,
+    Loading,
+    InGame,
+}
+
+pub(crate) struct Context {
     config: Config,
     sessions: HashMap<PeerID, Session>,
+    slots: Slots,
+    controller: Option<Guid>,
+    next_client_id: u16,
     banned_ips: HashSet<Ipv4Addr>,
+    banned_names: HashSet<String>,
+    transfers: Transfers,
+    monitor: Monitor,
+    turns: TurnManager,
+    log: MatchLog,
+    // Served to every joiner that asks, so it is shared rather than copied.
+    join_snapshot: Option<Arc<Vec<u8>>>,
     effects: Vec<Effect>,
+}
+
+// What a completed inbound transfer was for. The payload of a join snapshot
+// is cached here; only the savegame bytes travel back out, because that is
+// what drives a phase transition.
+pub(crate) enum TransferDone {
+    JoinSnapshot { joiner: PeerID },
+    Savegame(Vec<u8>),
+}
+
+impl Context {
+    fn send(&mut self, peer: PeerID, msg: WireMessage) {
+        self.effects.push(Effect::Send { peer, msg });
+    }
+
+    // Fan-out is expanded here because the transport moves one packet per peer.
+    fn broadcast(&mut self, msg: &WireMessage, accept: impl Fn(&Session) -> bool) {
+        let peers: Vec<PeerID> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| accept(s))
+            .map(|(p, _)| *p)
+            .collect();
+        for peer in peers {
+            self.effects.push(Effect::Send {
+                peer,
+                msg: msg.clone(),
+            });
+        }
+    }
+
+    fn broadcast_except(
+        &mut self,
+        except: PeerID,
+        msg: &WireMessage,
+        accept: impl Fn(&Session) -> bool,
+    ) {
+        let peers: Vec<PeerID> = self
+            .sessions
+            .iter()
+            .filter(|(p, s)| **p != except && accept(s))
+            .map(|(p, _)| *p)
+            .collect();
+        for peer in peers {
+            self.effects.push(Effect::Send {
+                peer,
+                msg: msg.clone(),
+            });
+        }
+    }
+
+    // Everyone taking part in the match, whichever phase they are in.
+    fn broadcast_player_slots(&mut self) {
+        let msg = WireMessage::PlayerSlots(self.slots.to_message());
+        self.broadcast(&msg, |s| s.is_setup() || s.is_syncing() || s.is_in_game());
+    }
+
+    // The updated slot list goes out before the peer is dropped, so the
+    // departing client still sees itself leave.
+    fn disconnect(&mut self, peer: PeerID, reason: DisconnectReason) {
+        let admitted = self
+            .sessions
+            .get(&peer)
+            .is_some_and(|s| s.admitted.is_some());
+        if admitted {
+            if let Some(uuid) = self.uuid_of(peer) {
+                self.slots.mark_disconnected(&uuid);
+            }
+            self.broadcast_player_slots();
+        }
+        self.effects.push(Effect::Disconnect { peer, reason });
+    }
+
+    fn fault(&mut self, peer: PeerID, fault: PeerFault) {
+        match fault.reason() {
+            Some(reason) => {
+                tracing::info!(?peer, %fault, ?reason, "disconnecting peer");
+                self.disconnect(peer, reason);
+            }
+            None => tracing::debug!(?peer, %fault, "message dropped"),
+        }
+    }
+
+    fn uuid_of(&self, peer: PeerID) -> Option<Guid> {
+        self.sessions.get(&peer)?.uuid.clone()
+    }
+
+    // Which messages a session may send depends on the session's own phase,
+    // not the server's. Handing back the UUID from the same call is what keeps
+    // the two together: a handler cannot name its sender without first
+    // establishing that the sender was allowed to speak.
+    fn speaker(&self, peer: PeerID, allowed: impl Fn(&Session) -> bool) -> Result<Guid, PeerFault> {
+        let session = self.sessions.get(&peer).ok_or(PeerFault::NoSession)?;
+        if !allowed(session) {
+            return Err(PeerFault::WrongPhase);
+        }
+        session.uuid.clone().ok_or(PeerFault::NoSession)
+    }
+
+    fn peer_of(&self, uuid: &Guid) -> Option<PeerID> {
+        self.sessions
+            .iter()
+            .find(|(_, s)| s.uuid.as_ref() == Some(uuid))
+            .map(|(p, _)| *p)
+    }
+
+    // A message from anyone but the controller is silently ignored: no
+    // disconnect, and no error back to the sender.
+    fn require_controller(&self, peer: PeerID) -> Result<Guid, PeerFault> {
+        let uuid = self.uuid_of(peer).ok_or(PeerFault::NoSession)?;
+        if self.controller.as_ref() == Some(&uuid) {
+            Ok(uuid)
+        } else {
+            Err(PeerFault::NotController)
+        }
+    }
+
+    // An observer for turn-release purposes only. The controller keeps
+    // blocking even when it holds no slot.
+    fn is_observer(&self, uuid: &Guid) -> bool {
+        self.slots.slot_of(uuid) == Some(UNASSIGNED) && self.controller.as_ref() != Some(uuid)
+    }
+
+    fn release_turns(&mut self, turn_length_ms: u32) {
+        let released = self.turns.release(self.config.observer_lag_limit);
+        let length = turn_length_ms as u16;
+        for turn in released {
+            self.log.record_turn_length(turn, length);
+            let msg = WireMessage::TurnSealed(TurnSealed {
+                turn,
+                turn_length: length,
+            });
+            self.broadcast(&msg, |s| s.is_in_game());
+        }
+    }
+
+    fn report_mismatch(&mut self, mismatch: crate::relay::turn::HashMismatch) {
+        let names: Vec<String> = mismatch
+            .mismatched
+            .iter()
+            .filter_map(|p| self.sessions.get(p))
+            .filter_map(|s| s.name().map(str::to_string))
+            .collect();
+        let msg = WireMessage::WrongHashPlayers(WrongHashPlayers {
+            turn: mismatch.turn,
+            hash_expected: mismatch.reference,
+            player_names: names,
+        });
+        self.broadcast(&msg, |s| s.is_in_game());
+    }
 }
 
 pub struct Server<S> {
@@ -131,13 +399,30 @@ pub struct Loading {
 
 pub struct InGame {
     pub settings: FrozenSettings,
-    pub ready_turn: u32,
 }
 
 // Setup handlers stay available while a savegame is being fetched.
 pub trait SetupPhase {}
 impl SetupPhase for Setup {}
 impl SetupPhase for AwaitSavegame {}
+
+// Lets the shared handlers apply the phase-dependent rules without knowing
+// which typestate they were called from.
+pub trait PhaseMarker {
+    const PHASE: Phase;
+}
+impl PhaseMarker for Setup {
+    const PHASE: Phase = Phase::Setup;
+}
+impl PhaseMarker for AwaitSavegame {
+    const PHASE: Phase = Phase::Setup;
+}
+impl PhaseMarker for Loading {
+    const PHASE: Phase = Phase::Loading;
+}
+impl PhaseMarker for InGame {
+    const PHASE: Phase = Phase::InGame;
+}
 
 pub enum AnyServer {
     Idle(Server<Idle>),
@@ -218,17 +503,26 @@ impl<S> Server<S> {
         std::mem::take(&mut self.ctx.effects)
     }
 
-    pub fn shutdown(self) -> Vec<Effect> {
-        todo!("unreliable DisconnectNow with ServerShuttingDown to every peer")
+    pub fn shutdown(mut self) -> Vec<Effect> {
+        let peers: Vec<PeerID> = self.ctx.sessions.keys().copied().collect();
+        for peer in peers {
+            self.ctx.effects.push(Effect::DisconnectNow {
+                peer,
+                reason: DisconnectReason::ServerShuttingDown,
+            });
+        }
+        self.ctx.effects
     }
+}
 
+impl<S: PhaseMarker> Server<S> {
     fn on_common_input(&mut self, input: Input) {
         match input {
             Input::Connected { peer, addr } => self.on_connected(peer, addr),
             Input::Received { peer, msg } => self.on_common_message(peer, msg),
             Input::Disconnected { peer } => self.on_disconnected(peer),
             Input::LobbyAuth { username, token } => self.on_lobby_auth(username, token),
-            Input::Tick => self.on_tick(),
+            Input::Tick { now, stats } => self.on_tick(now, stats),
         }
     }
 
@@ -236,16 +530,14 @@ impl<S> Server<S> {
     // fallback arm is not accepted in the current phase and is dropped with
     // the connection kept open.
     fn on_common_message(&mut self, peer: PeerID, msg: WireMessage) {
-        match msg {
+        let outcome = match msg {
             WireMessage::SynAck(m) => self.on_syn_ack(peer, m),
             WireMessage::Authenticate(m) => self.on_authenticate(peer, m),
             WireMessage::Chat(m) => self.on_chat(peer, m),
             WireMessage::Kicked(m) => self.on_kicked(peer, m),
             WireMessage::GamestateRequest(m) => self.on_gamestate_request(peer, m),
             WireMessage::GamestateResponse(m) => self.on_gamestate_response(peer, m),
-            WireMessage::GamestateChunk(m) => {
-                self.on_gamestate_chunk(peer, m);
-            }
+            WireMessage::GamestateChunk(m) => self.on_gamestate_chunk(peer, m).map(|_| ()),
             WireMessage::GamestateChunkAck(m) => self.on_gamestate_chunk_ack(peer, m),
             WireMessage::Syn(_)
             | WireMessage::Ack(_)
@@ -257,6 +549,7 @@ impl<S> Server<S> {
             | WireMessage::PlayersLoading(_)
             | WireMessage::WrongHashPlayers(_) => {
                 tracing::trace!(?peer, msg_type = msg.name(), "dropped S->C-only message");
+                Ok(())
             }
             other => {
                 tracing::debug!(
@@ -264,12 +557,17 @@ impl<S> Server<S> {
                     msg_type = other.name(),
                     "message not accepted in this phase"
                 );
+                Ok(())
             }
+        };
+        if let Err(fault) = outcome {
+            self.ctx.fault(peer, fault);
         }
     }
 
     fn on_connected(&mut self, peer: PeerID, addr: Ipv4Addr) {
-        self.ctx.sessions.insert(peer, Session { addr, uuid: None });
+        // The ban is checked before anything else, so a banned address never
+        // gets a session or a handshake.
         if self.ctx.banned_ips.contains(&addr) {
             self.ctx.effects.push(Effect::Disconnect {
                 peer,
@@ -277,6 +575,8 @@ impl<S> Server<S> {
             });
             return;
         }
+        self.ctx.sessions.insert(peer, Session::new(addr));
+
         // The client compares its mismatch report against this SYN, so it must
         // list exactly the mods the clients run, in load order.
         let syn = Syn {
@@ -285,103 +585,605 @@ impl<S> Server<S> {
             engine_version: SIMULATION_VERSION.into(),
             enabled_mods: self.ctx.config.enabled_mods.clone(),
         };
-        self.ctx.effects.push(Effect::Send {
+        self.ctx.send(peer, WireMessage::Syn(syn));
+    }
+
+    fn on_disconnected(&mut self, peer: PeerID) {
+        let Some(session) = self.ctx.sessions.remove(&peer) else {
+            return;
+        };
+        self.ctx.transfers.forget(peer);
+        self.ctx.turns.forget(peer);
+
+        if let Some(uuid) = session.uuid.as_ref() {
+            self.ctx.monitor.forget(uuid);
+            if self.ctx.controller.as_ref() == Some(uuid)
+                && self.ctx.config.release_controller_on_leave
+            {
+                // Without this the match is stranded: nobody else can ever be
+                // promoted, so setup and start stay unreachable.
+                tracing::info!(?peer, "controller left, role released");
+                self.ctx.controller = None;
+            }
+            // Losing a session before admission has no further effect.
+            if session.admitted.is_some() {
+                self.ctx.slots.mark_disconnected(uuid);
+                self.ctx.broadcast_player_slots();
+            }
+        }
+
+        // A departed client no longer blocks release, and hash comparison no
+        // longer waits for it.
+        let turn_length = self.ctx.config.turn_length_ms;
+        self.ctx.release_turns(turn_length);
+        for mismatch in self.ctx.turns.recheck_pending() {
+            self.ctx.report_mismatch(mismatch);
+        }
+    }
+
+    fn on_lobby_auth(&mut self, username: String, token: String) {
+        let Some(peer) = self.ctx.peer_of(&Guid(token.clone())) else {
+            tracing::debug!(%username, "lobby auth token matches no session");
+            return;
+        };
+        if let Some(session) = self.ctx.sessions.get_mut(&peer) {
+            session.lobby_name = Some(username);
+        }
+        // The empty AUTHENTICATE is the prompt the client waits for before it
+        // sends its real credentials.
+        self.ctx.send(
             peer,
-            msg: WireMessage::Syn(syn),
+            WireMessage::Authenticate(Authenticate {
+                name: String::new(),
+                password: String::new(),
+                controller_secret: String::new(),
+            }),
+        );
+    }
+
+    fn on_tick(&mut self, now: DateTime<Utc>, stats: Vec<PeerStats>) {
+        for sample in &stats {
+            if let Some(session) = self.ctx.sessions.get_mut(&sample.peer) {
+                session.mean_rtt = sample.mean_rtt;
+                session.since_last_received = sample.since_last_received;
+            }
+        }
+        if !self.ctx.monitor.due(now) {
+            return;
+        }
+
+        let reports: Vec<(PeerID, WireMessage)> = self
+            .ctx
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.admitted.is_some())
+            .filter_map(|(peer, s)| {
+                let uuid = s.uuid.clone()?;
+                let warning = Monitor::classify(s.mean_rtt, s.since_last_received)?;
+                // The wire carries plain milliseconds, so this is where the
+                // chrono types finally become numbers.
+                let msg = match warning {
+                    Warning::Silent(since) => WireMessage::LastSeen(LastSeen {
+                        guid: uuid,
+                        last_received_time: since.num_milliseconds().max(0) as u32,
+                    }),
+                    Warning::Lagging(rtt) => WireMessage::LaggingClients(LaggingClients {
+                        clients: vec![PerformanceEntry {
+                            guid: uuid,
+                            mean_rtt: rtt.num_milliseconds().max(0) as u32,
+                        }],
+                    }),
+                };
+                Some((*peer, msg))
+            })
+            .collect();
+
+        let in_setup = S::PHASE == Phase::Setup;
+        for (reported, msg) in reports {
+            // The reported client is never told about itself.
+            self.ctx.broadcast_except(reported, &msg, |s| {
+                s.is_in_game() || (in_setup && s.is_setup())
+            });
+        }
+    }
+
+    fn on_syn_ack(&mut self, peer: PeerID, msg: SynAck) -> Result<(), PeerFault> {
+        let session = self.ctx.sessions.get(&peer).ok_or(PeerFault::NoSession)?;
+        // A session that already holds a UUID is past the handshake. Issuing a
+        // second one would strand the slot, the controller record and the
+        // paused set, which all key off the UUID this session no longer claims.
+        if session.uuid.is_some() {
+            return Err(PeerFault::WrongPhase);
+        }
+        if msg.protocol_version != GAME_VERSION {
+            self.ctx
+                .disconnect(peer, DisconnectReason::GameVersionMismatch);
+            return Ok(());
+        }
+        if !auth::compatible(
+            SIMULATION_VERSION,
+            &self.ctx.config.enabled_mods,
+            &msg.engine_version,
+            &msg.enabled_mods,
+        ) {
+            // Code 17 rather than 16: only on 17 does the client attach its
+            // own mismatch details to the message it shows.
+            self.ctx
+                .disconnect(peer, DisconnectReason::SimulationOrModMismatch);
+            return Ok(());
+        }
+
+        let Some(uuid) = self.issue_uuid() else {
+            self.ctx.disconnect(peer, DisconnectReason::NoUuid);
+            return Ok(());
+        };
+        if let Some(session) = self.ctx.sessions.get_mut(&peer) {
+            session.uuid = Some(uuid.clone());
+        }
+
+        let flags = if self.ctx.config.lobby_mode {
+            ACK_FLAG_LOBBY_AUTH
+        } else {
+            0
+        };
+        self.ctx.send(
+            peer,
+            WireMessage::Ack(Ack {
+                use_protocol_version: GAME_VERSION,
+                flags,
+                guid: uuid,
+            }),
+        );
+        Ok(())
+    }
+
+    fn issue_uuid(&self) -> Option<Guid> {
+        (0..UUID_ATTEMPTS).find_map(|_| {
+            let candidate = Guid::new();
+            let taken = self
+                .ctx
+                .sessions
+                .values()
+                .any(|s| s.uuid.as_ref() == Some(&candidate));
+            (!taken).then_some(candidate)
+        })
+    }
+
+    // The checks run in the order below and the first match ends processing.
+    // The order is wire-observable: when two conditions hold at once, the code
+    // that reaches the client says which check ran first.
+    fn on_authenticate(&mut self, peer: PeerID, msg: Authenticate) -> Result<(), PeerFault> {
+        let session = self.ctx.sessions.get(&peer).ok_or(PeerFault::NoSession)?;
+        let Some(uuid) = session.uuid.clone() else {
+            // Still awaiting the handshake, so nothing but SYN_ACK counts.
+            return Err(PeerFault::WrongPhase);
+        };
+        if session.admitted.is_some() {
+            return Err(PeerFault::WrongPhase);
+        }
+        let lobby_name = session.lobby_name.clone();
+        if self.ctx.config.lobby_mode && lobby_name.is_none() {
+            // The client has not been prompted yet, so this cannot be its
+            // real answer.
+            return Err(PeerFault::WrongPhase);
+        }
+
+        let sanitized = auth::sanitize(&msg.name);
+
+        if S::PHASE == Phase::Loading {
+            self.ctx.disconnect(peer, DisconnectReason::ServerLoading);
+            return Ok(());
+        }
+
+        if self.ctx.config.lobby_mode {
+            let expected = lobby_name.unwrap_or_default().to_lowercase();
+            if auth::suffix_stripped(&sanitized).to_lowercase() != expected {
+                self.ctx.disconnect(peer, DisconnectReason::LobbyAuthFailed);
+                return Ok(());
+            }
+        }
+
+        // Salted with the raw name, unlike every other name-based check, and
+        // always run: an empty server password hashes to "", which is exactly
+        // what a client with no password sends.
+        let expected = password::hash(&self.ctx.config.server_password_hash, msg.name.as_bytes());
+        if expected != msg.password {
+            self.ctx.disconnect(peer, DisconnectReason::Refused);
+            return Ok(());
+        }
+
+        let duplicates_allowed =
+            !self.ctx.config.lobby_mode && self.ctx.config.allow_duplicate_names;
+        let name = if duplicates_allowed {
+            let sessions = &self.ctx.sessions;
+            auth::deduplicate(&sanitized, |candidate| {
+                sessions.values().any(|s| s.name() == Some(candidate))
+            })
+        } else {
+            if self
+                .ctx
+                .sessions
+                .values()
+                .any(|s| s.name() == Some(sanitized.as_str()))
+            {
+                self.ctx.disconnect(peer, DisconnectReason::NameInUse);
+                return Ok(());
+            }
+            sanitized
+        };
+
+        let ban_key = if self.ctx.config.lobby_mode {
+            auth::suffix_stripped(&name)
+        } else {
+            name.as_str()
+        };
+        if self.ctx.banned_names.contains(ban_key) {
+            self.ctx.disconnect(peer, DisconnectReason::Banned);
+            return Ok(());
+        }
+
+        let joining = match self.admit(&name) {
+            Ok(joining) => joining,
+            Err(reason) => {
+                self.ctx.disconnect(peer, reason);
+                return Ok(());
+            }
+        };
+
+        self.admit_session(peer, uuid, name, joining, &msg.controller_secret);
+        Ok(())
+    }
+
+    // Ok(true) means the session is admitted via the joining/syncing path:
+    // a recovered slot or a brand-new late observer both count. Ok(false) is
+    // only ever returned by the Setup-phase branch below.
+    fn admit(&self, name: &str) -> Result<bool, DisconnectReason> {
+        let sessions = self.ctx.sessions.len();
+
+        if S::PHASE == Phase::Setup {
+            // The arriving session is already counted, which is what leaves a
+            // spare peer to answer a full server with.
+            if sessions >= self.ctx.config.max_sessions {
+                return Err(DisconnectReason::ServerFull);
+            }
+            return Ok(false);
+        }
+
+        // Join detection is by name, and only against slots someone left.
+        if self.ctx.slots.has_disconnected_named(name) {
+            return Ok(true);
+        }
+
+        match self.ctx.config.late_observer_policy {
+            LateObserverPolicy::Deny => return Err(DisconnectReason::MatchInProgress),
+            LateObserverPolicy::Buddies => {
+                if !self
+                    .ctx
+                    .config
+                    .buddies
+                    .contains(auth::suffix_stripped(name))
+                {
+                    return Err(DisconnectReason::MatchInProgress);
+                }
+            }
+            LateObserverPolicy::Everyone => {}
+        }
+
+        let connected = self.ctx.slots.connected_players();
+        let disconnected = self.ctx.slots.disconnected_players();
+        if sessions.saturating_sub(connected) > self.ctx.config.observer_limit
+            || sessions + disconnected >= self.ctx.config.max_sessions
+        {
+            return Err(DisconnectReason::ServerFull);
+        }
+        Ok(true)
+    }
+
+    fn admit_session(
+        &mut self,
+        peer: PeerID,
+        uuid: Guid,
+        name: String,
+        joining: bool,
+        controller_secret: &str,
+    ) {
+        let client_id = self.ctx.next_client_id;
+        self.ctx.next_client_id = self.ctx.next_client_id.saturating_add(1);
+
+        // The controller flag only ever reaches a client here; there is no
+        // message that promotes an already-connected one.
+        let is_controller =
+            self.ctx.controller.is_none() && controller_secret == self.ctx.config.controller_secret;
+        if is_controller {
+            self.ctx.controller = Some(uuid.clone());
+        }
+
+        let code = if joining {
+            AuthenticateResultCode::OkRejoining
+        } else {
+            AuthenticateResultCode::Ok
+        };
+        self.ctx.send(
+            peer,
+            WireMessage::AuthenticateResult(AuthenticateResult {
+                code,
+                host_id: client_id,
+                is_controller,
+                message: LOGIN_MESSAGE.to_string(),
+            }),
+        );
+
+        let role = if joining { Role::Syncing } else { Role::Setup };
+        if let Some(session) = self.ctx.sessions.get_mut(&peer) {
+            session.admitted = Some(Admitted {
+                client_id,
+                name: name.clone(),
+                role,
+            });
+        }
+
+        // A slot is only reclaimed once the match itself is running.
+        self.ctx.slots.add(uuid, name, S::PHASE == Phase::InGame);
+        self.ctx.broadcast_player_slots();
+
+        if joining {
+            self.start_snapshot_fetch(peer);
+        }
+    }
+
+    // Only an in-game client can serialize a live snapshot; asking anyone else
+    // is undefined behaviour on the client side.
+    fn start_snapshot_fetch(&mut self, joiner: PeerID) {
+        let mut candidates: Vec<(PeerID, bool, chrono::TimeDelta)> = self
+            .ctx
+            .sessions
+            .iter()
+            .filter(|(p, s)| **p != joiner && s.is_in_game())
+            .map(|(p, s)| (*p, self.ctx.turns.is_out_of_sync(*p), s.mean_rtt))
+            .collect();
+        candidates.sort_by_key(|(_, desynced, rtt)| (*desynced, *rtt));
+
+        let Some((source, _, _)) = candidates.first().copied() else {
+            // Nobody can supply the state, so the join cannot succeed.
+            tracing::info!(?joiner, "no in-game session to source a snapshot from");
+            self.ctx
+                .disconnect(joiner, DisconnectReason::MatchInProgress);
+            return;
+        };
+
+        let request_id = self.ctx.transfers.allocate();
+        self.ctx
+            .transfers
+            .expect(source, request_id, Purpose::JoinSnapshot { joiner });
+        self.ctx.send(
+            source,
+            WireMessage::GamestateRequest(GamestateRequest {
+                request_type: KIND_RUNNING_GAME,
+                request_id,
+            }),
+        );
+    }
+
+    fn on_chat(&mut self, peer: PeerID, msg: Chat) -> Result<(), PeerFault> {
+        // A joiner still pulling its snapshot receives chat but cannot send it.
+        let uuid = self.ctx.speaker(peer, |s| s.is_setup() || s.is_in_game())?;
+        let receivers = msg.receivers;
+        // The relayed copy carries an empty receiver list, and the sender's
+        // claimed UUID is replaced so it cannot speak as anyone else.
+        let relayed = WireMessage::Chat(Chat {
+            sender_guid: uuid,
+            message: msg.message,
+            receivers: Vec::new(),
         });
+
+        if receivers.is_empty() {
+            self.ctx
+                .broadcast(&relayed, |s| s.is_setup() || s.is_in_game());
+        } else {
+            self.ctx.broadcast(&relayed, |s| {
+                s.uuid.as_ref().is_some_and(|u| receivers.contains(u))
+            });
+        }
+        Ok(())
     }
 
-    fn on_disconnected(&mut self, _peer: PeerID) {
-        todo!(
-            "mark player slot disconnected, broadcast PLAYER_SLOTS, re-evaluate turn release and hash comparison"
-        )
+    fn on_kicked(&mut self, peer: PeerID, msg: Kicked) -> Result<(), PeerFault> {
+        self.ctx.require_controller(peer)?;
+
+        let target = self
+            .ctx
+            .sessions
+            .iter()
+            .find(|(_, s)| s.name() == Some(msg.name.as_str()))
+            .map(|(p, _)| *p);
+        // The controller can never kick itself, and an unknown name does
+        // nothing at all.
+        let Some(target) = target.filter(|t| *t != peer) else {
+            return Ok(());
+        };
+
+        if msg.ban {
+            let key = if self.ctx.config.lobby_mode {
+                auth::suffix_stripped(&msg.name).to_string()
+            } else {
+                msg.name.clone()
+            };
+            self.ctx.banned_names.insert(key);
+            if let Some(session) = self.ctx.sessions.get(&target) {
+                self.ctx.banned_ips.insert(session.addr);
+            }
+        }
+
+        let reason = if msg.ban {
+            DisconnectReason::Banned
+        } else {
+            DisconnectReason::Kicked
+        };
+        self.ctx.disconnect(target, reason);
+
+        let relayed = WireMessage::Kicked(msg);
+        self.ctx.broadcast(&relayed, |s| {
+            s.is_setup() || s.is_syncing() || s.is_in_game()
+        });
+        Ok(())
     }
 
-    fn on_lobby_auth(&mut self, _username: String, _token: String) {
-        todo!(
-            "find session whose UUID equals token, store lobby user name, send empty AUTHENTICATE"
-        )
+    fn on_gamestate_request(
+        &mut self,
+        peer: PeerID,
+        msg: GamestateRequest,
+    ) -> Result<(), PeerFault> {
+        let data = match msg.request_type {
+            KIND_RUNNING_GAME => self.ctx.join_snapshot.clone(),
+            KIND_SAVEGAME => {
+                // Savegame start is not implemented, so there is never a
+                // cached saved state to answer with.
+                tracing::debug!(?peer, "savegame request ignored: no saved state cached");
+                None
+            }
+            other => {
+                tracing::debug!(?peer, kind = other, "unknown gamestate request kind");
+                None
+            }
+        };
+        let Some(data) = data else {
+            // Answering with length 0 would leave the client stuck, so an
+            // unavailable file is simply not answered.
+            return Ok(());
+        };
+
+        if let Some((length, chunks)) = self.ctx.transfers.begin_send(peer, msg.request_id, data) {
+            self.ctx.send(
+                peer,
+                WireMessage::GamestateResponse(GamestateResponse {
+                    request_id: msg.request_id,
+                    length,
+                }),
+            );
+            for chunk in chunks {
+                self.ctx.send(peer, WireMessage::GamestateChunk(chunk));
+            }
+        }
+        Ok(())
     }
 
-    fn on_tick(&mut self) {
-        todo!(
-            "at most once per second: LAST_SEEN for peers silent > 2000 ms, else LAGGING_CLIENTS for RTT > 400 ms"
-        )
+    fn on_gamestate_response(
+        &mut self,
+        peer: PeerID,
+        msg: GamestateResponse,
+    ) -> Result<(), PeerFault> {
+        self.ctx
+            .transfers
+            .on_response(peer, msg.request_id, msg.length)
     }
 
-    fn on_syn_ack(&mut self, _peer: PeerID, _msg: SynAck) {
-        todo!(
-            "check game version, then sim/mod compatibility, issue unique UUID, send ACK with lobby flag"
-        )
+    // Returns what a completed transfer was for, so the phase that cares can
+    // turn it into a state transition.
+    fn on_gamestate_chunk(
+        &mut self,
+        peer: PeerID,
+        msg: GamestateChunk,
+    ) -> Result<Option<TransferDone>, PeerFault> {
+        // An ack is what frees a slot in the sender's window, so a chunk that
+        // belongs to no transfer has nothing to pace and gets no answer.
+        if !self.ctx.transfers.knows_incoming(peer, msg.request_id) {
+            return Err(PeerFault::WrongPhase);
+        }
+
+        // Otherwise exactly one ack per data message, whatever happens next.
+        self.ctx.send(
+            peer,
+            WireMessage::GamestateChunkAck(GamestateChunkAck {
+                request_id: msg.request_id,
+                num_packets: 1,
+            }),
+        );
+
+        match self
+            .ctx
+            .transfers
+            .on_chunk(peer, msg.request_id, &msg.data)?
+        {
+            Some((Purpose::JoinSnapshot { joiner }, bytes)) => {
+                self.ctx.join_snapshot = Some(Arc::new(bytes));
+                Ok(Some(TransferDone::JoinSnapshot { joiner }))
+            }
+            Some((Purpose::Savegame, bytes)) => Ok(Some(TransferDone::Savegame(bytes))),
+            None => Ok(None),
+        }
     }
 
-    fn on_authenticate(&mut self, _peer: PeerID, _msg: Authenticate) {
-        todo!(
-            "ordered auth checks, admission, AUTHENTICATE_RESULT, PLAYER_SLOTS; a joiner starts the snapshot fetch"
-        )
-    }
-
-    fn on_chat(&mut self, _peer: PeerID, _msg: Chat) {
-        todo!("overwrite sender_uuid, relay with empty receiver list to setup and in-game sessions")
-    }
-
-    fn on_kicked(&mut self, _peer: PeerID, _msg: Kicked) {
-        todo!(
-            "controller only: find session by name, optionally ban name and IP, disconnect, relay KICKED"
-        )
-    }
-
-    fn on_gamestate_request(&mut self, _peer: PeerID, _msg: GamestateRequest) {
-        todo!(
-            "serve cached SAVEGAME or RUNNING_GAME: GAMESTATE_RESPONSE, then chunks of <= 1024 B, window 32"
-        )
-    }
-
-    fn on_gamestate_response(&mut self, _peer: PeerID, _msg: GamestateResponse) {
-        todo!("transfer must exist, length in 1..=8 MiB")
-    }
-
-    // Returns the payload of a transfer this chunk completed, so the savegame
-    // phase can turn it into a state transition.
-    fn on_gamestate_chunk(&mut self, _peer: PeerID, _msg: GamestateChunk) -> Option<Vec<u8>> {
-        todo!(
-            "append to transfer, send one GAMESTATE_CHUNK_ACK, error if total exceeds declared length"
-        )
-    }
-
-    fn on_gamestate_chunk_ack(&mut self, _peer: PeerID, _msg: GamestateChunkAck) {
-        todo!("free window slots, drop ACKs for unknown transfers or beyond what is in flight")
+    fn on_gamestate_chunk_ack(
+        &mut self,
+        peer: PeerID,
+        msg: GamestateChunkAck,
+    ) -> Result<(), PeerFault> {
+        let chunks = self
+            .ctx
+            .transfers
+            .on_ack(peer, msg.request_id, msg.num_packets);
+        for chunk in chunks {
+            self.ctx.send(peer, WireMessage::GamestateChunk(chunk));
+        }
+        Ok(())
     }
 }
 
-impl<S: SetupPhase> Server<S> {
-    fn on_pre_game_status(&mut self, _peer: PeerID, _msg: PreGameStatus) {
-        todo!("overwrite uuid, relay to setup sessions, update slot status without PLAYER_SLOTS")
+impl<S: SetupPhase + PhaseMarker> Server<S> {
+    fn on_pre_game_status(&mut self, peer: PeerID, msg: PreGameStatus) -> Result<(), PeerFault> {
+        let uuid = self.ctx.speaker(peer, Session::is_setup)?;
+        let relayed = WireMessage::PreGameStatus(PreGameStatus {
+            guid: uuid.clone(),
+            status: msg.status,
+        });
+        // Only setup sessions accept this, so relaying wider would be dropped
+        // by the receiver anyway.
+        self.ctx.broadcast(&relayed, |s| s.is_setup());
+        // Deliberately no PLAYER_SLOTS broadcast: the status travels in the
+        // relayed message instead.
+        self.ctx.slots.set_status(&uuid, msg.status);
+        Ok(())
     }
 
-    fn on_reset_pregame_status(&mut self, _peer: PeerID) {
-        todo!("controller only: every status other than 2 becomes 0, broadcast PLAYER_SLOTS")
+    fn on_reset_pregame_status(&mut self, peer: PeerID) -> Result<(), PeerFault> {
+        self.ctx.require_controller(peer)?;
+        self.ctx.slots.reset_pregame();
+        self.ctx.broadcast_player_slots();
+        Ok(())
     }
 
-    fn on_game_settings(&mut self, _peer: PeerID, _msg: GameSettings) {
-        todo!("controller only: relay verbatim to setup sessions, controller included")
+    fn on_game_settings(&mut self, peer: PeerID, msg: GameSettings) -> Result<(), PeerFault> {
+        self.ctx.require_controller(peer)?;
+        // Relayed verbatim, controller included. The bytes are a script value
+        // the server has no reason to decode.
+        let relayed = WireMessage::GameSettings(msg);
+        self.ctx.broadcast(&relayed, |s| s.is_setup());
+        Ok(())
     }
 
-    fn on_map_player_id_to_slot(&mut self, _peer: PeerID, _msg: MapPlayerIdToSlot) {
-        todo!(
-            "controller only: assign slot, clear it from any other holder, broadcast PLAYER_SLOTS"
-        )
+    fn on_map_player_id_to_slot(
+        &mut self,
+        peer: PeerID,
+        msg: MapPlayerIdToSlot,
+    ) -> Result<(), PeerFault> {
+        self.ctx.require_controller(peer)?;
+        self.ctx.slots.assign(msg.player_id, &msg.guid);
+        self.ctx.broadcast_player_slots();
+        Ok(())
     }
 
     // Hands back what it did not consume so each setup-like phase can add its
     // own arms before the common fallback.
     fn on_setup_message(&mut self, peer: PeerID, msg: WireMessage) -> Option<WireMessage> {
-        match msg {
+        let outcome = match msg {
             WireMessage::PreGameStatus(m) => self.on_pre_game_status(peer, m),
             WireMessage::ResetPregameStatus => self.on_reset_pregame_status(peer),
             WireMessage::GameSettings(m) => self.on_game_settings(peer, m),
             WireMessage::MapPlayerIdToSlot(m) => self.on_map_player_id_to_slot(peer, m),
             other => return Some(other),
+        };
+        if let Err(fault) = outcome {
+            self.ctx.fault(peer, fault);
         }
         None
     }
@@ -393,7 +1195,17 @@ impl Server<Idle> {
             ctx: Context {
                 config,
                 sessions: HashMap::new(),
+                slots: Slots::default(),
+                controller: None,
+                // Client ids start at 1 and only ever increase.
+                next_client_id: 1,
                 banned_ips: HashSet::new(),
+                banned_names: HashSet::new(),
+                transfers: Transfers::default(),
+                monitor: Monitor::default(),
+                turns: TurnManager::default(),
+                log: MatchLog::default(),
+                join_snapshot: None,
                 effects: Vec::new(),
             },
             st: Idle,
@@ -454,16 +1266,74 @@ impl Server<Setup> {
     }
 
     // None means the start was rejected or ignored and nothing was sent.
-    fn on_start_settings(&mut self, _peer: PeerID, _msg: StartSettings) -> Option<FrozenSettings> {
-        todo!("controller only, reject if any connected slot has status 0, emit start effects")
+    fn on_start_settings(&mut self, peer: PeerID, msg: StartSettings) -> Option<FrozenSettings> {
+        if self.ctx.require_controller(peer).is_err() {
+            return None;
+        }
+        // Rejecting outright is a deliberate deviation: the stock server
+        // relays the start anyway and then cannot accept the LOADED_GAMEs
+        // that follow, stranding every client on the loading screen.
+        if !self.ctx.slots.all_ready() {
+            tracing::info!(?peer, "start rejected: not every connected player is ready");
+            return None;
+        }
+
+        let settings = FrozenSettings {
+            cheats_enabled: cheats_enabled(&msg.init_attributes),
+            json: msg.init_attributes.clone(),
+            turn_length_ms: self.ctx.config.turn_length_ms,
+        };
+
+        // The clients observe these three in exactly this order.
+        let stale: Vec<PeerID> = self
+            .ctx
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.is_unauthenticated())
+            .map(|(p, _)| *p)
+            .collect();
+        for peer in stale {
+            self.ctx.disconnect(peer, DisconnectReason::ServerLoading);
+        }
+
+        self.ctx.broadcast_player_slots();
+
+        let relayed = WireMessage::StartSettings(msg);
+        self.ctx.broadcast(&relayed, |s| s.is_setup());
+
+        // From here on every session that was in setup counts for turn
+        // release, and owes a seal for turn 4 and a hash for turn 1.
+        let starting: Vec<(PeerID, u16, Guid)> = self
+            .ctx
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.is_setup())
+            .filter_map(|(p, s)| Some((*p, s.client_id()?, s.uuid.clone()?)))
+            .collect();
+        for (peer, client_id, uuid) in starting {
+            let observer = self.ctx.is_observer(&uuid);
+            self.ctx.turns.register(
+                peer,
+                client_id,
+                INITIAL_READY_TURN,
+                FIRST_SIMULATED_TURN,
+                observer,
+            );
+        }
+
+        Some(settings)
     }
 
+    // Not implemented: the saved-game flow would be "controller only, request
+    // SAVEGAME from the controller". Until it is, the start is refused rather
+    // than panicked on, because any client can send this message.
     fn on_start_savegame_settings(
         &mut self,
-        _peer: PeerID,
+        peer: PeerID,
         _msg: StartSavegameSettings,
     ) -> Option<Vec<u8>> {
-        todo!("controller only, request SAVEGAME from the controller")
+        tracing::warn!(?peer, "savegame start is not implemented, ignoring");
+        None
     }
 }
 
@@ -494,12 +1364,14 @@ impl Server<AwaitSavegame> {
             return self.into();
         };
         match msg {
-            WireMessage::GamestateChunk(m) => {
-                if let Some(saved_state) = self.on_gamestate_chunk(peer, m) {
+            WireMessage::GamestateChunk(m) => match self.on_gamestate_chunk(peer, m) {
+                Ok(Some(TransferDone::Savegame(saved_state))) => {
                     let settings = self.on_savegame_complete(peer);
                     return self.savegame_received(saved_state, settings).into();
                 }
-            }
+                Ok(_) => {}
+                Err(fault) => self.ctx.fault(peer, fault),
+            },
             other => self.on_common_message(peer, other),
         }
         self.into()
@@ -515,11 +1387,7 @@ impl Server<Loading> {
         let settings = self.st.settings;
         Server {
             ctx: self.ctx,
-            st: InGame {
-                settings,
-                // One below the 4-turn command delay, so turn 4 is the first release.
-                ready_turn: 3,
-            },
+            st: InGame { settings },
         }
     }
 
@@ -555,15 +1423,55 @@ impl Server<Loading> {
     }
 
     // Returns true when the sender was the last one still loading.
-    fn on_loaded_game(&mut self, _peer: PeerID, _msg: LoadedGame) -> bool {
-        todo!("others still loading: PLAYERS_LOADING; last one: LOADED_GAME turn 0 to all")
+    fn on_loaded_game(&mut self, peer: PeerID, _msg: LoadedGame) -> bool {
+        let Some(session) = self.ctx.sessions.get_mut(&peer) else {
+            return false;
+        };
+        if !session.is_setup() {
+            return false;
+        }
+        session.set_role(Role::InGame);
+
+        self.finish_if_everyone_loaded(true)
     }
 
     // A departure can leave everyone else loaded, which also starts the match.
-    fn on_disconnected_while_loading(&mut self, _peer: PeerID) -> bool {
-        todo!(
-            "completion check: if everyone left is loaded, LOADED_GAME turn 0 to all, no PLAYERS_LOADING"
-        )
+    fn on_disconnected_while_loading(&mut self, peer: PeerID) -> bool {
+        self.on_disconnected(peer);
+        // No PLAYERS_LOADING is ever sent for a departure.
+        self.finish_if_everyone_loaded(false)
+    }
+
+    fn finish_if_everyone_loaded(&mut self, announce_progress: bool) -> bool {
+        // All sessions must load, observers included; a session still in setup
+        // is a session still on the loading screen.
+        let still_loading: Vec<Guid> = self
+            .ctx
+            .sessions
+            .values()
+            .filter(|s| s.is_setup())
+            .filter_map(|s| s.uuid.clone())
+            .collect();
+
+        if !still_loading.is_empty() {
+            if announce_progress {
+                let msg = WireMessage::PlayersLoading(PlayersLoading {
+                    clients: still_loading,
+                });
+                // The sender has just become in-game, so this reaches it too.
+                self.ctx.broadcast(&msg, |s| s.is_in_game());
+            }
+            return false;
+        }
+
+        // Everyone leaving is not everyone loading.
+        if !self.ctx.sessions.values().any(|s| s.is_in_game()) {
+            return false;
+        }
+
+        let msg = WireMessage::LoadedGame(LoadedGame { current_turn: 0 });
+        self.ctx.broadcast(&msg, |s| s.is_in_game());
+        true
     }
 }
 
@@ -577,7 +1485,7 @@ impl Server<InGame> {
     }
 
     fn on_message(&mut self, peer: PeerID, msg: WireMessage) {
-        match msg {
+        let outcome = match msg {
             WireMessage::Joined(m) => self.on_joined(peer, m),
             WireMessage::PlayerPause(m) => self.on_player_pause(peer, m),
             WireMessage::PlayerCommand(m) => self.on_player_command(peer, m),
@@ -585,46 +1493,172 @@ impl Server<InGame> {
             WireMessage::TurnSealed(m) => self.on_turn_sealed(peer, m),
             WireMessage::StateHash(m) => self.on_state_hash(peer, m),
             WireMessage::LoadedGame(m) => self.on_loaded_game(peer, m),
-            other => self.on_common_message(peer, other),
+            WireMessage::GamestateChunk(m) => self.on_snapshot_chunk(peer, m),
+            other => {
+                self.on_common_message(peer, other);
+                Ok(())
+            }
+        };
+        if let Err(fault) = outcome {
+            self.ctx.fault(peer, fault);
         }
     }
 
-    fn on_joined(&mut self, _peer: PeerID, _msg: Joined) {
-        todo!(
-            "overwrite uuid, broadcast to in-game incl. sender, then send current PLAYER_PAUSE states"
-        )
+    // A completed snapshot is what unblocks the joiner that asked for it.
+    fn on_snapshot_chunk(&mut self, peer: PeerID, msg: GamestateChunk) -> Result<(), PeerFault> {
+        if let Some(TransferDone::JoinSnapshot { joiner }) = self.on_gamestate_chunk(peer, msg)? {
+            let json = self.st.settings.json.clone();
+            self.ctx.send(
+                joiner,
+                WireMessage::Join(Join {
+                    init_attributes: json,
+                }),
+            );
+        }
+        Ok(())
     }
 
-    fn on_player_pause(&mut self, _peer: PeerID, _msg: PlayerPause) {
-        todo!("overwrite uuid, update paused set, send to in-game sessions except the sender")
+    fn on_joined(&mut self, peer: PeerID, _msg: Joined) -> Result<(), PeerFault> {
+        let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
+        let relayed = WireMessage::Joined(Joined { guid: uuid });
+        self.ctx.broadcast(&relayed, |s| s.is_in_game());
+
+        // The joiner missed every pause that happened before it arrived.
+        let paused: Vec<Guid> = self.ctx.monitor.paused().cloned().collect();
+        for guid in paused {
+            self.ctx.send(
+                peer,
+                WireMessage::PlayerPause(PlayerPause { guid, pause: true }),
+            );
+        }
+        Ok(())
     }
 
-    fn on_player_command(&mut self, _peer: PeerID, _msg: PlayerCommand) {
-        todo!(
-            "unless cheats are on, drop if slot mismatches; echo to all in-game, keep for join replay"
-        )
+    fn on_player_pause(&mut self, peer: PeerID, msg: PlayerPause) -> Result<(), PeerFault> {
+        let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
+        self.ctx.monitor.set_paused(&uuid, msg.pause);
+        let relayed = WireMessage::PlayerPause(PlayerPause {
+            guid: uuid,
+            pause: msg.pause,
+        });
+        // Advisory only, and the client accepts it nowhere but in-game.
+        self.ctx
+            .broadcast_except(peer, &relayed, |s| s.is_in_game());
+        Ok(())
     }
 
-    fn on_flare(&mut self, _peer: PeerID, _msg: Flare) {
-        todo!("overwrite uuid, broadcast to in-game sessions incl. sender")
+    fn on_player_command(&mut self, peer: PeerID, msg: PlayerCommand) -> Result<(), PeerFault> {
+        let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
+        if !self.st.settings.cheats_enabled {
+            // An observer holds a slot-table entry but owns no player, so a
+            // command claiming player -1 must not be allowed to match it.
+            let slot = self.ctx.slots.slot_of(&uuid).filter(|s| *s != UNASSIGNED);
+            if slot.map(i32::from) != Some(msg.player) {
+                // Silently, because a cheat attempt is not worth a disconnect.
+                tracing::debug!(?peer, slot = ?slot, claimed = msg.player, "command slot mismatch");
+                return Ok(());
+            }
+        }
+
+        // Relayed unchanged, and the echo back to the sender is required: a
+        // client executes its own commands only when the server returns them.
+        let relayed = WireMessage::PlayerCommand(msg.clone());
+        self.ctx.broadcast(&relayed, |s| s.is_in_game());
+        self.ctx.log.record_command(msg);
+        Ok(())
     }
 
-    fn on_turn_sealed(&mut self, _peer: PeerID, _msg: TurnSealed) {
-        todo!(
-            "sequence check (OutOfSequenceTurnSeal), record ready turn, release next turn when unblocked"
-        )
+    fn on_flare(&mut self, peer: PeerID, msg: Flare) -> Result<(), PeerFault> {
+        let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
+        let relayed = WireMessage::Flare(Flare { guid: uuid, ..msg });
+        self.ctx.broadcast(&relayed, |s| s.is_in_game());
+        Ok(())
     }
 
-    fn on_state_hash(&mut self, _peer: PeerID, _msg: StateHash) {
-        todo!(
-            "sequence check (OutOfSequenceStateHash), record hash, compare once all have reported"
-        )
+    fn on_turn_sealed(&mut self, peer: PeerID, msg: TurnSealed) -> Result<(), PeerFault> {
+        self.ctx.turns.on_turn_sealed(peer, msg.turn)?;
+        let turn_length = self.st.settings.turn_length_ms;
+        self.ctx.release_turns(turn_length);
+        Ok(())
+    }
+
+    fn on_state_hash(&mut self, peer: PeerID, msg: StateHash) -> Result<(), PeerFault> {
+        // The server runs no simulation, so it can only compare what the
+        // clients report, never decide which of them is right.
+        if let Some(mismatch) = self.ctx.turns.on_state_hash(peer, msg.turn, msg.hash)? {
+            self.ctx.report_mismatch(mismatch);
+        }
+        Ok(())
     }
 
     // Only a syncing joiner sends this once the match is running.
-    fn on_loaded_game(&mut self, _peer: PeerID, _msg: LoadedGame) {
-        todo!(
-            "replay stored commands and turn seals from t+1, send LOADED_GAME at the ready turn, mark in-game"
-        )
+    fn on_loaded_game(&mut self, peer: PeerID, msg: LoadedGame) -> Result<(), PeerFault> {
+        let session = self.ctx.sessions.get(&peer).ok_or(PeerFault::NoSession)?;
+        if !session.is_syncing() {
+            return Err(PeerFault::WrongPhase);
+        }
+        let uuid = session.uuid.clone().ok_or(PeerFault::NoSession)?;
+        let client_id = session.client_id().ok_or(PeerFault::NoSession)?;
+
+        let ready_turn = self.ctx.turns.ready_turn();
+        // The replay must reach at least R+1 so the joiner's own next turn is
+        // contiguous, and further whenever commands are already stored beyond
+        // it, so nothing already recorded is withheld.
+        let last_stored = self.ctx.log.last_command_turn().unwrap_or(0);
+        let upper = (ready_turn + 1).max(last_stored);
+        let default_length = self.st.settings.turn_length_ms as u16;
+
+        for turn in (msg.current_turn + 1)..=upper {
+            let commands: Vec<PlayerCommand> = self.ctx.log.commands_for(turn).to_vec();
+            for command in commands {
+                self.ctx.send(peer, WireMessage::PlayerCommand(command));
+            }
+            // Seals must be contiguous from the snapshot turn, because the
+            // client asserts that each one is exactly its ready turn plus one.
+            if turn <= ready_turn {
+                let turn_length = self.ctx.log.turn_length(turn).unwrap_or(default_length);
+                self.ctx.send(
+                    peer,
+                    WireMessage::TurnSealed(TurnSealed { turn, turn_length }),
+                );
+            }
+        }
+
+        self.ctx.send(
+            peer,
+            WireMessage::LoadedGame(LoadedGame {
+                current_turn: ready_turn,
+            }),
+        );
+        if let Some(session) = self.ctx.sessions.get_mut(&peer) {
+            session.set_role(Role::InGame);
+        }
+
+        let observer = self.ctx.is_observer(&uuid);
+        self.ctx.turns.register(
+            peer,
+            client_id,
+            ready_turn + COMMAND_DELAY - 1,
+            ready_turn,
+            observer,
+        );
+        Ok(())
     }
+}
+
+// The only thing the server reads out of the settings blob. A full JSON parser
+// would be a dependency and a decode the relay otherwise never needs.
+fn cheats_enabled(json: &[u8]) -> bool {
+    const KEY: &[u8] = b"\"CheatsEnabled\"";
+    let Some(at) = json.windows(KEY.len()).position(|w| w == KEY) else {
+        return false;
+    };
+    let rest = &json[at + KEY.len()..];
+    let value: Vec<u8> = rest
+        .iter()
+        .copied()
+        .skip_while(|c| c.is_ascii_whitespace() || *c == b':')
+        .take(4)
+        .collect();
+    value.starts_with(b"true")
 }
