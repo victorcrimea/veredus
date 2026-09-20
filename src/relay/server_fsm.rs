@@ -30,6 +30,7 @@ use crate::relay::messages::GamestateChunkAck;
 use crate::relay::messages::GamestateRequest;
 use crate::relay::messages::GamestateResponse;
 use crate::relay::messages::Guid;
+use crate::relay::messages::Host;
 use crate::relay::messages::Join;
 use crate::relay::messages::Joined;
 use crate::relay::messages::Kicked;
@@ -57,6 +58,7 @@ use crate::relay::password;
 use crate::relay::session::Admitted;
 use crate::relay::session::Role;
 use crate::relay::session::Session;
+use crate::relay::slots::STATUS_NOT_READY;
 use crate::relay::slots::Slots;
 use crate::relay::slots::UNASSIGNED;
 use crate::relay::turn::INITIAL_READY_TURN;
@@ -170,6 +172,13 @@ pub struct Config {
     // Losing the controller is permanent in the stock server, which strands
     // the match with nobody able to start or configure it.
     pub release_controller_on_leave: bool,
+    // The name the relay speaks under. It occupies an observer row in the slot
+    // list, because that list is where a client looks a chat sender's name up.
+    // Displayed behind a reserved prefix that no client may authenticate with,
+    // so whatever an operator puts here cannot collide with a player.
+    pub server_name: String,
+    // Empty greets an arriving client with nothing at all.
+    pub welcome_message: String,
 }
 
 impl Default for Config {
@@ -190,6 +199,8 @@ impl Default for Config {
             buddies: HashSet::new(),
             max_sessions: MAX_SESSIONS,
             release_controller_on_leave: true,
+            server_name: "SERVER".to_string(),
+            welcome_message: String::new(),
         }
     }
 }
@@ -215,6 +226,9 @@ pub(crate) struct Context {
     sessions: HashMap<PeerID, Session>,
     slots: Slots,
     controller: Option<Guid>,
+    // The relay's own identity as a chat sender. Issued once per game and
+    // never reused for a session, so it names the server and nothing else.
+    server_uuid: Guid,
     next_client_id: u16,
     banned_ips: HashSet<Ipv4Addr>,
     banned_names: HashSet<String>,
@@ -278,8 +292,37 @@ impl Context {
 
     // Everyone taking part in the match, whichever phase they are in.
     fn broadcast_player_slots(&mut self) {
-        let msg = WireMessage::PlayerSlots(self.slots.to_message());
+        let mut slots = self.slots.to_message();
+        // A client resolves a chat sender's name out of this list, and faults
+        // on a sender it cannot find there, so the relay needs a row of its
+        // own before it can say anything. The row is appended rather than
+        // sorted in, and the slot table never holds it: it is not a player,
+        // so readiness, slot recovery and the kick lookup must not see it.
+        slots.hosts.push(Host {
+            guid: self.server_uuid.clone(),
+            name: auth::server_display_name(&self.config.server_name),
+            player_id: UNASSIGNED,
+            status: STATUS_NOT_READY,
+        });
+        let msg = WireMessage::PlayerSlots(slots);
         self.broadcast(&msg, |s| s.is_setup() || s.is_syncing() || s.is_in_game());
+    }
+
+    // A line in the stock chat box, spoken by the relay itself. `to` is None
+    // for everyone admitted, whichever phase they are in, because a client
+    // renders chat from the moment it finishes authenticating. The receiver
+    // list is empty exactly as a relayed copy of player chat is, so a targeted
+    // line is indistinguishable from a broadcast one on the wire.
+    fn server_chat(&mut self, to: Option<PeerID>, text: &str) {
+        let msg = WireMessage::Chat(Chat {
+            sender_guid: self.server_uuid.clone(),
+            message: text.to_string(),
+            receivers: Vec::new(),
+        });
+        match to {
+            Some(peer) => self.send(peer, msg),
+            None => self.broadcast(&msg, |s| s.admitted.is_some()),
+        }
     }
 
     // The updated slot list goes out before the peer is dropped, so the
@@ -740,11 +783,14 @@ impl<S: PhaseMarker> Server<S> {
     fn issue_uuid(&self) -> Option<Guid> {
         (0..UUID_ATTEMPTS).find_map(|_| {
             let candidate = Guid::new();
-            let taken = self
-                .ctx
-                .sessions
-                .values()
-                .any(|s| s.uuid.as_ref() == Some(&candidate));
+            // The relay's own UUID is taken too: a session sharing it would
+            // make every slot row and chat line ambiguous.
+            let taken = candidate == self.ctx.server_uuid
+                || self
+                    .ctx
+                    .sessions
+                    .values()
+                    .any(|s| s.uuid.as_ref() == Some(&candidate));
             (!taken).then_some(candidate)
         })
     }
@@ -789,6 +835,14 @@ impl<S: PhaseMarker> Server<S> {
         let expected = password::hash(&self.ctx.config.server_password_hash, msg.name.as_bytes());
         if expected != msg.password {
             self.ctx.disconnect(peer, DisconnectReason::Refused);
+            return Ok(());
+        }
+
+        // The relay's own slot row wears the reserved prefix, so a client that
+        // claims it would put two identically named rows in the slot list.
+        // Refused as a name collision, which is what it is.
+        if auth::reserved(&sanitized) {
+            self.ctx.disconnect(peer, DisconnectReason::NameInUse);
             return Ok(());
         }
 
@@ -925,6 +979,13 @@ impl<S: PhaseMarker> Server<S> {
         // A slot is only reclaimed once the match itself is running.
         self.ctx.slots.add(uuid, name, S::PHASE == Phase::InGame);
         self.ctx.broadcast_player_slots();
+
+        // After the slot broadcast, so the name behind the sender UUID is
+        // already known to the client when the line arrives.
+        if !self.ctx.config.welcome_message.is_empty() {
+            let text = self.ctx.config.welcome_message.clone();
+            self.ctx.server_chat(Some(peer), &text);
+        }
 
         if joining {
             self.start_snapshot_fetch(peer);
@@ -1197,6 +1258,7 @@ impl Server<Idle> {
                 sessions: HashMap::new(),
                 slots: Slots::default(),
                 controller: None,
+                server_uuid: Guid::new(),
                 // Client ids start at 1 and only ever increase.
                 next_client_id: 1,
                 banned_ips: HashSet::new(),

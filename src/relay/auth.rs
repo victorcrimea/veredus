@@ -11,6 +11,11 @@ pub const ANONYMOUS: &str = "Anonymous";
 // XMPP username by cutting here, so any other separator breaks lobby mode.
 const SUFFIX_MARKER: &str = " (";
 
+// Worn by the relay's own slot row and refused to every client, so no player
+// can take a name that displays like the server. Four hyphens rather than a
+// word because sanitization leaves it intact and no lobby account can hold it.
+const RESERVED_PREFIX: &str = "----";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LateObserverPolicy {
     #[default]
@@ -38,6 +43,18 @@ pub fn sanitize(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+// The configured name is what an operator reads; the prefix is not theirs to
+// set, so a careless "SERVER" in the config still cannot collide with a player.
+pub fn server_display_name(configured: &str) -> String {
+    format!("{RESERVED_PREFIX}{configured}")
+}
+
+// Checked against the sanitized name, which has already been trimmed, so
+// leading whitespace cannot smuggle the prefix past this.
+pub fn reserved(name: &str) -> bool {
+    name.starts_with(RESERVED_PREFIX)
 }
 
 pub fn suffix_stripped(name: &str) -> &str {
