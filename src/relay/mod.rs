@@ -8,3 +8,4 @@ pub mod messages;
 pub mod password;
 pub mod server_fsm;
 pub mod session;
+pub mod slots;
