@@ -5,6 +5,7 @@ pub mod auth;
 pub mod enet_task;
 pub mod fault;
 pub mod game_server;
+pub mod gamestate_transfer;
 pub mod messages;
 pub mod monitor;
 pub mod password;
