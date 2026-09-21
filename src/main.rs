@@ -7,6 +7,9 @@ use std::path::PathBuf;
 
 use chrono::TimeDelta;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use veredus::cli;
 use veredus::game_pool::GameConfig;
@@ -19,7 +22,7 @@ use veredus::lobby::link::LobbyLink;
 use veredus::relay::password;
 use veredus::relay::server_fsm::Config;
 
-// Default directive when RUST_LOG is unset.
+// Default directive when RUST_LOG or LOKI_LOG is unset.
 const DEFAULT_LOG_DIRECTIVES: &str = "info";
 
 // How long a pooled-lobby game may sit with nobody ever having joined, or
@@ -28,9 +31,17 @@ const IDLE_SHUTDOWN: TimeDelta = TimeDelta::seconds(60);
 
 #[tokio::main]
 async fn main() {
-    let filter = EnvFilter::try_from_default_env()
+    let stdout_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_DIRECTIVES));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Per-layer filters rather than one global one: tracing-loki ships over a
+    // bounded channel and silently drops on overflow, so turning stdout up to
+    // trace for a debugging session must not flood Loki as well.
+    let loki_filter = EnvFilter::try_from_env("LOKI_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_DIRECTIVES));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(stdout_filter))
+        .with(build_loki_layer().map(|layer| layer.with_filter(loki_filter)))
+        .init();
 
     let mode = cli::parse_args();
     let mut pool = GamePool::new(mode.host);
@@ -39,6 +50,48 @@ async fn main() {
         Some(path) => run_pool_lobby_mode(&mut pool, path).await,
         None => run_standalone(&mut pool, mode.port).await,
     }
+}
+
+// Only low-cardinality values may be Loki labels, since every distinct label
+// combination is a separate stream. Per-game and per-peer context travels as
+// span fields instead, which tracing-loki flattens into the JSON line body, so
+// a query looks like {job="veredus"} | json | game_id="gid_0199...".
+fn build_loki_layer() -> Option<tracing_loki::Layer> {
+    // Unset means no Loki at all, so a developer checkout needs no config.
+    let url = std::env::var("LOKI_URL").ok()?;
+    // Tracing is not up yet, so a bad setting can only be reported on stderr.
+    let url = tracing_loki::url::Url::parse(&url).unwrap_or_else(|error| {
+        eprintln!("Error: invalid LOKI_URL '{url}': {error}");
+        std::process::exit(1);
+    });
+
+    // Several servers can ship to one Loki, and without a distinct instance
+    // label their streams would interleave.
+    let instance = std::env::var("LOKI_INSTANCE")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let env = std::env::var("LOKI_ENV").unwrap_or_else(|_| "dev".to_string());
+
+    let built = tracing_loki::builder()
+        .label("job", "veredus")
+        .and_then(|builder| builder.label("instance", instance))
+        .and_then(|builder| builder.label("env", env))
+        // A restart under the same instance would otherwise be
+        // indistinguishable in a stream; as a field it costs no cardinality.
+        .and_then(|builder| builder.extra_field("pid", std::process::id().to_string()))
+        .and_then(|builder| builder.build_url(url));
+    let (layer, task) = built.unwrap_or_else(|error| {
+        eprintln!("Error: failed to build the Loki sink: {error}");
+        std::process::exit(1);
+    });
+
+    // The layer only queues; this task is what actually ships to Loki, so it
+    // must live on the runtime for the whole process.
+    tokio::spawn(task);
+    Some(layer)
 }
 
 async fn run_standalone(pool: &mut GamePool, port: u16) {
