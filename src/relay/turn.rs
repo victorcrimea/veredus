@@ -19,7 +19,7 @@ pub const INITIAL_READY_TURN: u32 = 3;
 // agree with theirs.
 const FULL_HASH_EVERY: u32 = 20;
 
-fn needs_full_hash(turn: u32) -> bool {
+pub fn needs_full_hash(turn: u32) -> bool {
     turn == 1 || turn.is_multiple_of(FULL_HASH_EVERY)
 }
 
@@ -90,6 +90,11 @@ impl Default for TurnManager {
 impl TurnManager {
     pub fn ready_turn(&self) -> u32 {
         self.ready_turn
+    }
+
+    // The hash the players agreed on for `turn`, None while it is uncompared.
+    pub fn reference(&self, turn: u32) -> Option<&[u8]> {
+        self.references.get(&turn).map(Vec::as_slice)
     }
 
     pub fn is_registered(&self, peer: PeerID) -> bool {

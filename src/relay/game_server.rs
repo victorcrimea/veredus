@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::TryRecvError;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -30,6 +31,7 @@ use crate::relay::server_fsm::Idle;
 use crate::relay::server_fsm::Input;
 use crate::relay::server_fsm::Server;
 use crate::sidecar::AiHostProcess;
+use crate::sidecar::DumpRequest;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 // The FSM only needs a tick often enough to drive the connection warnings,
@@ -101,7 +103,7 @@ impl AiHostSlot {
         }
     }
 
-    // True once per exit. The process is dropped here, which reaps it.
+    // True once per exit. Its supervisor has already reaped it by then.
     fn take_exit(&mut self) -> bool {
         if let Some(status) = self.process.as_mut().and_then(|p| p.poll_exit()) {
             tracing::warn!(%status, "sidecar: AI host exited");
@@ -112,22 +114,36 @@ impl AiHostSlot {
     }
 }
 
+// Everything a game needs to drive pyrogenesis. `pyrogenesis_path` enables
+// one-shot state dumps, the AI host and the outcome replay; None means dump
+// effects answer at once. `ai_host_connect` is where the AI host dials back
+// to. `outcome_path` is where the match outcome is written; None only logs it.
+pub struct SidecarSetup {
+    pub pyrogenesis_path: Option<PathBuf>,
+    pub ai_host_connect: Option<SocketAddrV4>,
+    pub outcome_path: Option<PathBuf>,
+}
+
 // The ENet thread feeds decoded events in over `event_rx` and takes effects out
 // over `send_tx`. Every clock read lives here, on the IO side, so the FSM
 // itself stays a pure function of the inputs it is handed. `lobby` is None in
 // standalone mode; when present, its `auth_rx` half feeds Input::LobbyAuth and
-// its `events_tx` half is where lobby-listing effects go. `pyrogenesis_path`
-// enables one-shot state dumps and the AI host; None means dump effects answer
-// at once. `ai_host_connect` is where the AI host dials back to.
+// its `events_tx` half is where lobby-listing effects go. A match that ran is
+// replayed once the loop ends to work out its outcome; the returned handle is
+// that replay's thread.
 pub fn run_game_server(
     event_rx: Receiver<InboundNetworkMessage>,
     send_tx: Sender<OutboundNetworkMessage>,
     shutdown_requested: Arc<AtomicBool>,
     config: Config,
     lobby: Option<LobbyLink>,
-    pyrogenesis_path: Option<PathBuf>,
-    ai_host_connect: Option<SocketAddrV4>,
-) {
+    sidecar: SidecarSetup,
+) -> Option<JoinHandle<()>> {
+    let SidecarSetup {
+        pyrogenesis_path,
+        ai_host_connect,
+        outcome_path,
+    } = sidecar;
     // Parked in the listening state, which is the phase a relay spends its
     // whole idle life in.
     let mut server = Some(AnyServer::from(Server::<Idle>::new(config).listen()));
@@ -135,13 +151,14 @@ pub fn run_game_server(
     let mut last_tick: DateTime<Utc> = Utc::now();
     let (dump_tx, dump_rx) = std::sync::mpsc::channel::<(u32, Option<Vec<u8>>)>();
     let mut dump_slot = DumpSlot::default();
+    let mut outcome_request: Option<DumpRequest> = None;
     let mut ai_host = AiHostSlot {
         pyrogenesis_path: pyrogenesis_path.clone(),
         connect: ai_host_connect,
         process: None,
         exited: false,
     };
-    loop {
+    'game: loop {
         // Drained before the ENet events, so a lobby-auth prompt is queued
         // ahead of the AUTHENTICATE it is meant to precede.
         if let Some(lobby) = &lobby {
@@ -200,7 +217,7 @@ pub fn run_game_server(
                     // The ENet thread dropped its sender, which is how a
                     // deliberate shutdown reaches this loop.
                     tracing::info!("ENet event channel disconnected, shutting down");
-                    return;
+                    break 'game;
                 }
             }
         }
@@ -234,11 +251,13 @@ pub fn run_game_server(
                 &mut ai_host,
             );
             if !outcome.channel_ok {
-                return;
+                break 'game;
             }
             if outcome.game_over {
                 tracing::info!("idle-shutdown timeout elapsed, ending game");
-                let effects = server.take().expect("server is always present").shutdown();
+                let current = server.take().expect("server is always present");
+                outcome_request = current.outcome_request();
+                let effects = current.shutdown();
                 drain(
                     effects,
                     &send_tx,
@@ -248,13 +267,15 @@ pub fn run_game_server(
                     &mut dump_slot,
                     &mut ai_host,
                 );
-                return;
+                break 'game;
             }
         }
 
         if shutdown_requested.load(Ordering::SeqCst) {
             tracing::info!("shutdown requested, dropping every peer");
-            let effects = server.take().expect("server is always present").shutdown();
+            let current = server.take().expect("server is always present");
+            outcome_request = current.outcome_request();
+            let effects = current.shutdown();
             drain(
                 effects,
                 &send_tx,
@@ -264,11 +285,17 @@ pub fn run_game_server(
                 &mut dump_slot,
                 &mut ai_host,
             );
-            return;
+            break 'game;
         }
 
         std::thread::sleep(POLL_INTERVAL);
     }
+
+    // The two shutdown paths consume the server, so they read the record
+    // first; every other way out leaves it in place.
+    let request = outcome_request.or_else(|| server.as_ref()?.outcome_request())?;
+    let path = pyrogenesis_path?;
+    Some(spawn_outcome(path, request, outcome_path))
 }
 
 // Stats are cached rather than fed straight in, so the FSM sees timing only on
@@ -436,4 +463,78 @@ fn spawn_dump(
         // left to answer and the result is dropped.
         let _ = tx.send((id, state));
     });
+}
+
+// The outcome replay runs the whole match, which can take minutes, so it gets
+// a thread of its own and the game thread returns at once. Nothing can cancel
+// it but the process exiting.
+fn spawn_outcome(
+    pyrogenesis_path: PathBuf,
+    request: DumpRequest,
+    outcome_path: Option<PathBuf>,
+) -> JoinHandle<()> {
+    // Read here, on the game thread, for the same reasons as in spawn_dump.
+    let now = chrono::Utc::now();
+    let span = tracing::Span::current();
+    std::thread::spawn(move || {
+        let _guard = span.entered();
+        let turns = request.turn_lengths.len();
+        tracing::info!(turns, "sidecar: replaying match for its outcome");
+        let never = AtomicBool::new(false);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir =
+                std::env::temp_dir().join(format!("veredus-outcome-{}", uuid::Uuid::new_v4()));
+            let result =
+                crate::sidecar::resolve_outcome(&pyrogenesis_path, &dir, &request, now, &never);
+            let _ = std::fs::remove_dir_all(&dir);
+            result
+        }));
+        let (result, json) = match outcome {
+            Ok(Ok(resolved)) => resolved,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "sidecar: match outcome replay failed");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("sidecar: match outcome replay panicked");
+                return;
+            }
+        };
+        // Only names and states: the full result carries every player's
+        // statistics for the whole match and belongs in the file, not a log.
+        let players: Vec<(usize, &str, &str)> = result
+            .player_states
+            .iter()
+            .enumerate()
+            .map(|(id, p)| (id, p.name.as_deref().unwrap_or(""), p.state.as_str()))
+            .collect();
+        tracing::info!(
+            time_elapsed_ms = result.time_elapsed,
+            ?players,
+            "match outcome resolved"
+        );
+        if let Some(path) = outcome_path {
+            write_outcome(&path, &json);
+        }
+    })
+}
+
+// Written aside and renamed into place, so whoever watches the directory
+// never reads half a result.
+fn write_outcome(path: &std::path::Path, json: &str) {
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(%error, path = %parent.display(), "cannot create outcome directory");
+        return;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let written = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, path));
+    match written {
+        Ok(()) => tracing::info!(path = %path.display(), "match outcome written"),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!(%error, path = %path.display(), "cannot write match outcome");
+        }
+    }
 }

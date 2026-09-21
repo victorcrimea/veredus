@@ -258,8 +258,9 @@ pub struct Config {
     // controller with a name of its own is admitted.
     pub lobby_host_name: String,
     // When set, a joiner no live client can serve gets its snapshot from a
-    // one-shot pyrogenesis instead of being dropped. The IO side owns the
-    // actual path; this flag is what the FSM gates on.
+    // one-shot pyrogenesis instead of being dropped, and a match that ran is
+    // replayed for its outcome once it ends. The IO side owns the actual
+    // path; this flag is what the FSM gates on.
     pub sidecar_dumps: bool,
     // When set, a match whose settings have AI slots gets a pyrogenesis AI
     // host that plays them, so no stock client has to compute the AI.
@@ -788,6 +789,15 @@ impl From<Server<InGame>> for AnyServer {
 }
 
 impl AnyServer {
+    // Read once the game thread is done with the FSM, however it got there:
+    // the thread also ends when its socket closes, which no input announces.
+    pub fn outcome_request(&self) -> Option<DumpRequest> {
+        match self {
+            AnyServer::InGame(s) => s.outcome_request(),
+            _ => None,
+        }
+    }
+
     pub fn handle(self, input: Input) -> AnyServer {
         match self {
             AnyServer::Idle(s) => s.on_input(input),
@@ -1443,11 +1453,9 @@ impl<S: PhaseMarker> Server<S> {
         if !self.ctx.config.sidecar_dumps || turn < 1 {
             return false;
         }
-        let Some(settings) = self.st.settings() else {
+        if self.st.settings().is_none() {
             return false;
-        };
-        let settings_json = settings.json.clone();
-        let default_length = settings.turn_length_ms as u16;
+        }
         if let Some(dump) = self.ctx.dump.as_mut() {
             // One run per game: a joiner arriving mid-run waits behind it
             // whatever turn it asked for, instead of starting a second engine
@@ -1456,20 +1464,8 @@ impl<S: PhaseMarker> Server<S> {
             dump.waiting.push(joiner);
             return true;
         }
-        let mut turn_lengths = Vec::new();
-        for t in 1..=turn {
-            turn_lengths.push(self.ctx.log.turn_length(t).unwrap_or(default_length));
-        }
-        let mut commands = Vec::new();
-        for t in 1..=turn {
-            commands.extend(self.ctx.log.commands_for(t).iter().cloned());
-        }
-        let request = DumpRequest {
-            init_attributes: settings_json,
-            engine_version: SIMULATION_VERSION.to_string(),
-            mods: self.ctx.config.enabled_mods.clone(),
-            turn_lengths,
-            commands,
+        let Some(request) = self.match_record(turn) else {
+            return false;
         };
         let id = self.ctx.next_dump_id;
         self.ctx.next_dump_id = self.ctx.next_dump_id.wrapping_add(1);
@@ -1483,6 +1479,29 @@ impl<S: PhaseMarker> Server<S> {
             .effects
             .push(Effect::StateDump { id, turn, request });
         true
+    }
+
+    // Everything a one-shot replay needs to rebuild the match through wire
+    // turn `turn`. None before the settings are frozen.
+    fn match_record(&self, turn: u32) -> Option<DumpRequest> {
+        let settings = self.st.settings()?;
+        let default_length = settings.turn_length_ms as u16;
+        let mut turn_lengths = Vec::new();
+        for t in 1..=turn {
+            turn_lengths.push(self.ctx.log.turn_length(t).unwrap_or(default_length));
+        }
+        let mut commands = Vec::new();
+        for t in 1..=turn {
+            commands.extend(self.ctx.log.commands_for(t).iter().cloned());
+        }
+        Some(DumpRequest {
+            init_attributes: settings.json.clone(),
+            engine_version: SIMULATION_VERSION.to_string(),
+            mods: self.ctx.config.enabled_mods.clone(),
+            turn_lengths,
+            commands,
+            hashes: Vec::new(),
+        })
     }
 
     // Only an in-game client can serialize a live snapshot; asking anyone else
@@ -2225,6 +2244,21 @@ impl Server<Loading> {
 }
 
 impl Server<InGame> {
+    // The whole match as released, with the players' agreed hashes, for the
+    // replay that works out who won. None when no turn was ever released,
+    // since there is then no match to judge, or when there is no sidecar.
+    fn outcome_request(&self) -> Option<DumpRequest> {
+        let turn = self.ctx.turns.ready_turn();
+        if !self.ctx.config.sidecar_dumps || turn <= INITIAL_READY_TURN {
+            return None;
+        }
+        let mut request = self.match_record(turn)?;
+        request.hashes = (1..=turn)
+            .filter_map(|t| self.ctx.turns.reference(t).map(|hash| (t, hash.to_vec())))
+            .collect();
+        Some(request)
+    }
+
     fn on_input(mut self, input: Input) -> AnyServer {
         match input {
             Input::Received { peer, msg } => self.on_message(peer, msg),

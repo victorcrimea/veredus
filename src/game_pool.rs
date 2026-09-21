@@ -19,6 +19,7 @@ use crate::lobby::link::LobbyLink;
 use crate::network_message::InboundNetworkMessage;
 use crate::network_message::OutboundNetworkMessage;
 use crate::relay::enet_task::run_enet_host;
+use crate::relay::game_server::SidecarSetup;
 use crate::relay::game_server::run_game_server;
 use crate::relay::server_fsm::Config;
 
@@ -44,6 +45,9 @@ pub struct GameConfig {
     // Path to the pyrogenesis binary for one-shot state dumps. None disables
     // the sidecar fallback.
     pub pyrogenesis_path: Option<PathBuf>,
+    // Where the match outcome is written, as `<game_id>.json`. None only logs
+    // it.
+    pub outcome_dir: Option<PathBuf>,
 }
 
 struct GameHandle {
@@ -55,7 +59,8 @@ struct GameHandle {
     /// Set before `_shutdown_tx` is dropped so the server thread can tell a
     /// deliberate shutdown apart from the ENet thread dying on its own.
     shutdown_requested: Arc<AtomicBool>,
-    server_thread: Option<JoinHandle<()>>,
+    // Yields the outcome replay's thread, if the match got that far.
+    server_thread: Option<JoinHandle<Option<JoinHandle<()>>>>,
     enet_thread: Option<JoinHandle<()>>,
 }
 
@@ -63,6 +68,10 @@ pub struct GamePool {
     bind_ip: IpAddr,
     games: HashMap<GameId, GameHandle>,
     used_ports: Vec<u16>,
+    // Outcome replays outlive their games, so that destroying a game never
+    // waits minutes on one. Kept so the pool can wait for them when the
+    // process shuts down, which is the only way a standalone match ends.
+    outcomes: Vec<JoinHandle<()>>,
 }
 
 impl GamePool {
@@ -71,6 +80,7 @@ impl GamePool {
             bind_ip,
             games: HashMap::new(),
             used_ports: Vec::new(),
+            outcomes: Vec::new(),
         }
     }
 
@@ -85,6 +95,7 @@ impl GamePool {
             server: server_config,
             lobby,
             pyrogenesis_path,
+            outcome_dir,
         } = config;
         let port = match port {
             Some(port) => {
@@ -111,6 +122,7 @@ impl GamePool {
             .map_err(|error| format!("failed to bind {bind_addr}: {error}"))?;
 
         let game_id = GameId(Uuid::now_v7());
+        let outcome_path = outcome_dir.map(|dir| dir.join(format!("{game_id}.json")));
 
         let (event_tx, event_rx) = mpsc::channel::<InboundNetworkMessage>();
         let (send_tx, send_rx) = mpsc::channel::<OutboundNetworkMessage>();
@@ -139,17 +151,24 @@ impl GamePool {
                     shutdown_requested_for_thread,
                     server_config,
                     lobby,
-                    pyrogenesis_path,
-                    ai_host_connect,
-                );
+                    SidecarSetup {
+                        pyrogenesis_path,
+                        ai_host_connect,
+                        outcome_path,
+                    },
+                )
             }));
-            if let Err(panic_payload) = result {
-                let message = panic_payload
-                    .downcast_ref::<&str>()
-                    .map(|message| message.to_string())
-                    .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "non-string panic payload".to_string());
-                tracing::error!(panic = %message, "server thread panicked");
+            match result {
+                Ok(outcome) => outcome,
+                Err(panic_payload) => {
+                    let message = panic_payload
+                        .downcast_ref::<&str>()
+                        .map(|message| message.to_string())
+                        .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    tracing::error!(panic = %message, "server thread panicked");
+                    None
+                }
             }
         });
 
@@ -188,9 +207,12 @@ impl GamePool {
         if let Some(thread) = handle.enet_thread.take() {
             let _ = thread.join();
         }
-        if let Some(thread) = handle.server_thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = handle.server_thread.take()
+            && let Ok(Some(outcome)) = thread.join()
+        {
+            self.outcomes.push(outcome);
         }
+        self.outcomes.retain(|outcome| !outcome.is_finished());
 
         self.used_ports.retain(|used| *used != port);
         tracing::info!(game_id = %game_id, port, "game destroyed");
@@ -202,6 +224,15 @@ impl Drop for GamePool {
         let game_ids: Vec<GameId> = self.games.keys().cloned().collect();
         for game_id in game_ids {
             self.destroy_game(game_id);
+        }
+        if !self.outcomes.is_empty() {
+            tracing::info!(
+                pending = self.outcomes.len(),
+                "waiting for match outcome replays"
+            );
+        }
+        for outcome in self.outcomes.drain(..) {
+            let _ = outcome.join();
         }
     }
 }

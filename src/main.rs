@@ -47,8 +47,18 @@ async fn main() {
     let mut pool = GamePool::new(mode.host);
 
     match mode.lobby_config {
-        Some(path) => run_pool_lobby_mode(&mut pool, path, mode.pyrogenesis_path).await,
-        None => run_standalone(&mut pool, mode.port, mode.pyrogenesis_path).await,
+        Some(path) => {
+            run_pool_lobby_mode(&mut pool, path, mode.pyrogenesis_path, mode.outcome_dir).await
+        }
+        None => {
+            run_standalone(
+                &mut pool,
+                mode.port,
+                mode.pyrogenesis_path,
+                mode.outcome_dir,
+            )
+            .await
+        }
     }
 }
 
@@ -94,7 +104,12 @@ fn build_loki_layer() -> Option<tracing_loki::Layer> {
     Some(layer)
 }
 
-async fn run_standalone(pool: &mut GamePool, port: u16, pyrogenesis_path: Option<PathBuf>) {
+async fn run_standalone(
+    pool: &mut GamePool,
+    port: u16,
+    pyrogenesis_path: Option<PathBuf>,
+    outcome_dir: Option<PathBuf>,
+) {
     let (game_id, port) = pool
         .create_game(GameConfig {
             port: Some(port),
@@ -105,6 +120,7 @@ async fn run_standalone(pool: &mut GamePool, port: u16, pyrogenesis_path: Option
             },
             lobby: None,
             pyrogenesis_path,
+            outcome_dir,
         })
         .expect("Failed to create initial game");
 
@@ -118,6 +134,7 @@ async fn run_pool_lobby_mode(
     pool: &mut GamePool,
     config_path: PathBuf,
     pyrogenesis_path: Option<PathBuf>,
+    outcome_dir: Option<PathBuf>,
 ) {
     let config_data = std::fs::read_to_string(&config_path).unwrap_or_else(|error| {
         eprintln!(
@@ -219,6 +236,7 @@ async fn run_pool_lobby_mode(
                     server: server_config,
                     lobby: Some(LobbyLink { auth_rx, events_tx }),
                     pyrogenesis_path: pyrogenesis_path.clone(),
+                    outcome_dir: outcome_dir.clone(),
                 }) {
                     Ok((game_id, port)) => {
                         tracing::info!(

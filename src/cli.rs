@@ -28,6 +28,11 @@ struct Args {
     /// AI slots are played by a headless pyrogenesis instead of every client
     #[arg(long)]
     pyrogenesis_path: Option<PathBuf>,
+    /// Directory each finished match's outcome is written to, as
+    /// <game_id>.json; without it the outcome is only logged. Needs
+    /// --pyrogenesis-path, which replays the match to work the outcome out
+    #[arg(long)]
+    outcome_dir: Option<PathBuf>,
 }
 
 pub struct RunMode {
@@ -35,6 +40,7 @@ pub struct RunMode {
     pub port: u16,
     pub lobby_config: Option<PathBuf>,
     pub pyrogenesis_path: Option<PathBuf>,
+    pub outcome_dir: Option<PathBuf>,
 }
 
 pub fn parse_args() -> RunMode {
@@ -44,5 +50,6 @@ pub fn parse_args() -> RunMode {
         port: args.port,
         lobby_config: args.lobby_config,
         pyrogenesis_path: args.pyrogenesis_path,
+        outcome_dir: args.outcome_dir,
     }
 }
