@@ -102,7 +102,10 @@ fn pause_is_refused_for_observers_and_for_an_empty_budget() {
     // An observer holds no player, so its pause would freeze everyone
     // else's screen for nothing.
     {
-        let mut h = Harness::new();
+        let mut h = Harness::with_config(Config {
+            observer_delay_turns: 0,
+            ..Config::default()
+        });
         let a = PeerID(1);
         let a_guid = h.admit(a, "Alice");
         h.map_player_id_to_slot(a, 1, &a_guid);

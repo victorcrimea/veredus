@@ -254,6 +254,7 @@ fn observer_does_not_block_release_until_the_lag_limit() {
     {
         let mut h = Harness::with_config(Config {
             observer_lag_limit: Some(2),
+            observer_delay_turns: 0,
             ..Config::default()
         });
         let players = start_match(

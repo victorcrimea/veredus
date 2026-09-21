@@ -55,6 +55,8 @@ use crate::relay::messages::WrongHashPlayers;
 use crate::relay::monitor::Monitor;
 use crate::relay::monitor::PeerStats;
 use crate::relay::monitor::Warning;
+use crate::relay::observer_feed;
+use crate::relay::observer_feed::ObserverFeed;
 use crate::relay::password;
 use crate::relay::pause_budget;
 use crate::relay::pause_budget::BudgetEvent;
@@ -188,6 +190,9 @@ pub struct Config {
     pub observer_limit: usize,
     // None means an observer never blocks turn release.
     pub observer_lag_limit: Option<u32>,
+    // How many turns behind the players observers watch. 0 puts them on the
+    // live stream, where they may not pause.
+    pub observer_delay_turns: u32,
     pub buddies: HashSet<String>,
     pub max_sessions: usize,
     // Losing the controller is permanent in the stock server, which strands
@@ -228,6 +233,7 @@ impl Default for Config {
             late_observer_policy: LateObserverPolicy::default(),
             observer_limit: 8,
             observer_lag_limit: None,
+            observer_delay_turns: observer_feed::DEFAULT_DELAY_TURNS,
             buddies: HashSet::new(),
             max_sessions: MAX_SESSIONS,
             release_controller_on_leave: true,
@@ -272,6 +278,7 @@ pub(crate) struct Context {
     pause_budget: PauseBudget,
     turns: TurnManager,
     log: MatchLog,
+    feed: ObserverFeed,
     // Served to every joiner that asks, so it is shared rather than copied.
     join_snapshot: Option<Arc<Vec<u8>>>,
     // Both fed only by Input::Tick.now (A2). created_at is set on the first
@@ -468,6 +475,30 @@ impl Context {
         self.slots.slot_of(uuid) == Some(UNASSIGNED) && self.controller.as_ref() != Some(uuid)
     }
 
+    fn is_delayed_observer(&self, uuid: &Guid) -> bool {
+        self.config.observer_delay_turns > 0 && self.is_observer(uuid)
+    }
+
+    // The turn stream and flares as the players see them. Delayed observers
+    // get the same messages later, from the feed.
+    fn broadcast_live(&mut self, msg: &WireMessage) {
+        let peers: Vec<PeerID> = self
+            .sessions
+            .iter()
+            .filter(|(p, s)| s.is_in_game() && !self.turns.is_delayed(**p))
+            .map(|(p, _)| *p)
+            .collect();
+        for peer in peers {
+            self.send(peer, msg.clone());
+        }
+    }
+
+    fn broadcast_delayed(&mut self, msg: &WireMessage) {
+        for peer in self.turns.delayed_peers() {
+            self.send(peer, msg.clone());
+        }
+    }
+
     fn release_turns(&mut self, turn_length_ms: u32) {
         let released = self.turns.release(self.config.observer_lag_limit);
         let length = turn_length_ms as u16;
@@ -477,7 +508,44 @@ impl Context {
                 turn,
                 turn_length: length,
             });
-            self.broadcast(&msg, |s| s.is_in_game());
+            self.broadcast_live(&msg);
+        }
+        self.advance_feed();
+    }
+
+    // Counts a player who is rejoining too, so a reconnect does not drain the
+    // feed for good in the moment the player is away.
+    fn players_remain(&self) -> bool {
+        self.sessions.values().any(|s| {
+            (s.is_in_game() || s.is_syncing())
+                && s.uuid
+                    .as_ref()
+                    .and_then(|u| self.slots.slot_of(u))
+                    .is_some_and(|slot| slot != UNASSIGNED)
+        })
+    }
+
+    // Every turn is sealed live before it is sealed here, so its commands and
+    // its length are all in the match log by the time it is due.
+    fn advance_feed(&mut self) {
+        let draining = !self.players_remain();
+        let due = self.feed.advance(self.turns.ready_turn(), draining);
+        for turn in due {
+            let commands: Vec<PlayerCommand> = self.log.commands_for(turn).to_vec();
+            for command in commands {
+                self.broadcast_delayed(&WireMessage::PlayerCommand(command));
+            }
+            let turn_length = self
+                .log
+                .turn_length(turn)
+                .unwrap_or(self.config.turn_length_ms as u16);
+            self.broadcast_delayed(&WireMessage::TurnSealed(TurnSealed { turn, turn_length }));
+        }
+        for flare in self.feed.due_flares() {
+            self.broadcast_delayed(&WireMessage::Flare(flare));
+        }
+        for (joiner, join) in self.feed.due_joins() {
+            self.send(joiner, WireMessage::Join(join));
         }
     }
 
@@ -493,7 +561,10 @@ impl Context {
             hash_expected: mismatch.reference,
             player_names: names,
         });
-        self.broadcast(&msg, |s| s.is_in_game());
+        match mismatch.recipient {
+            Some(peer) => self.send(peer, msg),
+            None => self.broadcast(&msg, |s| s.is_in_game()),
+        }
     }
 }
 
@@ -732,6 +803,7 @@ impl<S: PhaseMarker> Server<S> {
         };
         self.ctx.transfers.forget(peer);
         self.ctx.turns.forget(peer);
+        self.ctx.feed.forget(peer);
 
         if let Some(uuid) = session.uuid.as_ref() {
             self.ctx.pause_budget.clear_pausing(uuid);
@@ -1184,18 +1256,33 @@ impl<S: PhaseMarker> Server<S> {
     }
 
     // Only an in-game client can serialize a live snapshot; asking anyone else
-    // is undefined behaviour on the client side.
+    // is undefined behaviour on the client side. A source on the same feed as
+    // the joiner is preferred: a delayed observer's state is already old
+    // enough for a delayed joiner to load straight away, and a live joiner
+    // sourced from one would only have a longer replay to sit through.
     fn start_snapshot_fetch(&mut self, joiner: PeerID) {
-        let mut candidates: Vec<(PeerID, bool, chrono::TimeDelta)> = self
+        let joiner_delayed = self
+            .ctx
+            .uuid_of(joiner)
+            .is_some_and(|u| self.ctx.is_delayed_observer(&u));
+        let mut candidates: Vec<(PeerID, bool, bool, chrono::TimeDelta)> = self
             .ctx
             .sessions
             .iter()
             .filter(|(p, s)| **p != joiner && s.is_in_game())
-            .map(|(p, s)| (*p, self.ctx.turns.is_out_of_sync(*p), s.mean_rtt))
+            .map(|(p, s)| {
+                let other_feed = self.ctx.turns.is_delayed(*p) != joiner_delayed;
+                (
+                    *p,
+                    other_feed,
+                    self.ctx.turns.is_out_of_sync(*p),
+                    s.mean_rtt,
+                )
+            })
             .collect();
-        candidates.sort_by_key(|(_, desynced, rtt)| (*desynced, *rtt));
+        candidates.sort_by_key(|(_, other_feed, desynced, rtt)| (*other_feed, *desynced, *rtt));
 
-        let Some((source, _, _)) = candidates.first().copied() else {
+        let Some((source, _, _, _)) = candidates.first().copied() else {
             // Nobody can supply the state, so the join cannot succeed.
             tracing::info!(?joiner, "no in-game session to source a snapshot from");
             self.ctx
@@ -1286,7 +1373,11 @@ impl<S: PhaseMarker> Server<S> {
         msg: GamestateRequest,
     ) -> Result<(), PeerFault> {
         let data = match msg.request_type {
-            KIND_RUNNING_GAME => self.ctx.join_snapshot.clone(),
+            KIND_RUNNING_GAME => self
+                .ctx
+                .feed
+                .snapshot_for(peer)
+                .or_else(|| self.ctx.join_snapshot.clone()),
             KIND_SAVEGAME => {
                 // Savegame start is not implemented, so there is never a
                 // cached saved state to answer with.
@@ -1444,6 +1535,7 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
 impl Server<Idle> {
     pub fn new(config: Config) -> Self {
         let pause_budget = PauseBudget::new(config.pause_budget);
+        let delay = config.observer_delay_turns;
         Server {
             ctx: Context {
                 config,
@@ -1460,6 +1552,7 @@ impl Server<Idle> {
                 pause_budget,
                 turns: TurnManager::default(),
                 log: MatchLog::default(),
+                feed: ObserverFeed::new(delay),
                 join_snapshot: None,
                 created_at: None,
                 empty_since: None,
@@ -1574,12 +1667,14 @@ impl Server<Setup> {
             .collect();
         for (peer, client_id, uuid) in starting {
             let observer = self.ctx.is_observer(&uuid);
+            let delayed = self.ctx.is_delayed_observer(&uuid);
             self.ctx.turns.register(
                 peer,
                 client_id,
                 INITIAL_READY_TURN,
                 FIRST_SIMULATED_TURN,
                 observer,
+                delayed,
             );
         }
 
@@ -1769,13 +1864,29 @@ impl Server<InGame> {
     // A completed snapshot is what unblocks the joiner that asked for it.
     fn on_snapshot_chunk(&mut self, peer: PeerID, msg: GamestateChunk) -> Result<(), PeerFault> {
         if let Some(TransferDone::JoinSnapshot { joiner }) = self.on_gamestate_chunk(peer, msg)? {
-            let json = self.st.settings.json.clone();
-            self.ctx.send(
-                joiner,
-                WireMessage::Join(Join {
-                    init_attributes: json,
-                }),
-            );
+            let join = Join {
+                init_attributes: self.st.settings.json.clone(),
+            };
+            let joiner_delayed = self
+                .ctx
+                .uuid_of(joiner)
+                .is_some_and(|u| self.ctx.is_delayed_observer(&u));
+            let snapshot = self.ctx.join_snapshot.clone();
+            match snapshot {
+                Some(snapshot) if joiner_delayed => {
+                    // The snapshot cannot be past the last turn its source
+                    // was sealed, so once the feed reaches that turn it shows
+                    // the joiner nothing a delayed observer may not see.
+                    let bound = if self.ctx.turns.is_delayed(peer) {
+                        self.ctx.feed.head()
+                    } else {
+                        self.ctx.turns.ready_turn()
+                    };
+                    self.ctx.feed.hold_join(joiner, bound, join, snapshot);
+                    self.ctx.advance_feed();
+                }
+                _ => self.ctx.send(joiner, WireMessage::Join(join)),
+            }
         }
         Ok(())
     }
@@ -1799,12 +1910,16 @@ impl Server<InGame> {
     fn on_player_pause(&mut self, peer: PeerID, msg: PlayerPause) -> Result<(), PeerFault> {
         let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
 
+        // A delayed observer pausing stops only its own feed, which blocks
+        // nobody's release, so it is neither relayed nor charged.
+        if self.ctx.turns.is_delayed(peer) {
+            return Ok(());
+        }
+
         if msg.pause {
-            // An observer owns no player, so its pause costs it nothing and
-            // would freeze everyone else's screen for the whole match. This
-            // holds only while observers watch the live turn stream: once they
-            // run on a feed that lags the match, pausing that feed stops
-            // nothing anyone else can see and can be allowed back.
+            // An observer on the live stream owns no player, so its pause
+            // costs it nothing and would freeze everyone else's screen for the
+            // whole match.
             let slot = self.ctx.slots.slot_of(&uuid).filter(|s| *s != UNASSIGNED);
             if slot.is_none() {
                 self.ctx
@@ -1881,15 +1996,29 @@ impl Server<InGame> {
         // Relayed unchanged, and the echo back to the sender is required: a
         // client executes its own commands only when the server returns them.
         let relayed = WireMessage::PlayerCommand(msg.clone());
-        self.ctx.broadcast(&relayed, |s| s.is_in_game());
+        self.ctx.broadcast_live(&relayed);
         self.ctx.log.record_command(msg);
         Ok(())
     }
 
     fn on_flare(&mut self, peer: PeerID, msg: Flare) -> Result<(), PeerFault> {
         let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
-        let relayed = WireMessage::Flare(Flare { guid: uuid, ..msg });
-        self.ctx.broadcast(&relayed, |s| s.is_in_game());
+        let flare = Flare { guid: uuid, ..msg };
+        self.ctx.broadcast_live(&WireMessage::Flare(flare.clone()));
+
+        // A flare marks a place at the moment it is raised, which for a
+        // player is the live turn and would tell a delayed observer where
+        // things are going to be.
+        let turn = if self.ctx.turns.is_delayed(peer) {
+            self.ctx.feed.head()
+        } else {
+            self.ctx.turns.ready_turn()
+        };
+        if turn <= self.ctx.feed.head() {
+            self.ctx.broadcast_delayed(&WireMessage::Flare(flare));
+        } else {
+            self.ctx.feed.queue_flare(turn, flare);
+        }
         Ok(())
     }
 
@@ -1903,7 +2032,7 @@ impl Server<InGame> {
     fn on_state_hash(&mut self, peer: PeerID, msg: StateHash) -> Result<(), PeerFault> {
         // The server runs no simulation, so it can only compare what the
         // clients report, never decide which of them is right.
-        if let Some(mismatch) = self.ctx.turns.on_state_hash(peer, msg.turn, msg.hash)? {
+        for mismatch in self.ctx.turns.on_state_hash(peer, msg.turn, msg.hash)? {
             self.ctx.report_mismatch(mismatch);
         }
         Ok(())
@@ -1917,6 +2046,11 @@ impl Server<InGame> {
         }
         let uuid = session.uuid.clone().ok_or(PeerFault::NoSession)?;
         let client_id = session.client_id().ok_or(PeerFault::NoSession)?;
+
+        if self.ctx.is_delayed_observer(&uuid) {
+            self.resume_delayed(peer, client_id, msg.current_turn);
+            return Ok(());
+        }
 
         let ready_turn = self.ctx.turns.ready_turn();
         // The replay must reach at least R+1 so the joiner's own next turn is
@@ -1959,8 +2093,40 @@ impl Server<InGame> {
             ready_turn + COMMAND_DELAY - 1,
             ready_turn,
             observer,
+            false,
         );
         Ok(())
+    }
+
+    // The live join replay, cut at the feed's head instead of the live turn.
+    // Commands past the head are not replayed: the feed sends each turn's
+    // commands together with its seal, so they are still to come.
+    fn resume_delayed(&mut self, peer: PeerID, client_id: u16, snapshot_turn: u32) {
+        let head = self.ctx.feed.head();
+        let default_length = self.st.settings.turn_length_ms as u16;
+        for turn in (snapshot_turn + 1)..=head {
+            let commands: Vec<PlayerCommand> = self.ctx.log.commands_for(turn).to_vec();
+            for command in commands {
+                self.ctx.send(peer, WireMessage::PlayerCommand(command));
+            }
+            let turn_length = self.ctx.log.turn_length(turn).unwrap_or(default_length);
+            self.ctx.send(
+                peer,
+                WireMessage::TurnSealed(TurnSealed { turn, turn_length }),
+            );
+        }
+
+        self.ctx.send(
+            peer,
+            WireMessage::LoadedGame(LoadedGame { current_turn: head }),
+        );
+        if let Some(session) = self.ctx.sessions.get_mut(&peer) {
+            session.set_role(Role::InGame);
+        }
+        self.ctx.feed.forget(peer);
+        self.ctx
+            .turns
+            .register(peer, client_id, head + COMMAND_DELAY - 1, head, true, true);
     }
 }
 

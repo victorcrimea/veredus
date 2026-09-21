@@ -11,6 +11,7 @@ use veredus::relay::messages::PreGameStatus;
 use veredus::relay::messages::StartSettings;
 use veredus::relay::messages::TurnSealed;
 use veredus::relay::messages::WireMessage;
+use veredus::relay::server_fsm::Config;
 use veredus::relay::server_fsm::Input;
 use veredus::relay::turn::INITIAL_READY_TURN;
 
@@ -39,7 +40,10 @@ fn turn_sealed(peer: PeerID, turn: u32) -> Input {
 // stream, none of them obvious from reading the diff.
 #[test]
 fn join_replay_is_contiguous_from_the_snapshot_turn() {
-    let mut h = Harness::new();
+    let mut h = Harness::with_config(Config {
+        observer_delay_turns: 0,
+        ..Config::default()
+    });
 
     let alice = PeerID(1);
     let alice_guid = h.admit(alice, "Alice");

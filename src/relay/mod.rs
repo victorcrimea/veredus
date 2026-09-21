@@ -8,6 +8,7 @@ pub mod game_server;
 pub mod gamestate_transfer;
 pub mod messages;
 pub mod monitor;
+pub mod observer_feed;
 pub mod password;
 pub mod pause_budget;
 pub mod server_fsm;
