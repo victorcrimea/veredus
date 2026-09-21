@@ -23,12 +23,18 @@ struct Args {
     /// instead of standalone
     #[arg(long)]
     lobby_config: Option<PathBuf>,
+    /// Path to the pyrogenesis binary; when set, joiners no live client can
+    /// serve get their snapshot from a one-shot replay instead of a drop, and
+    /// AI slots are played by a headless pyrogenesis instead of every client
+    #[arg(long)]
+    pyrogenesis_path: Option<PathBuf>,
 }
 
 pub struct RunMode {
     pub host: IpAddr,
     pub port: u16,
     pub lobby_config: Option<PathBuf>,
+    pub pyrogenesis_path: Option<PathBuf>,
 }
 
 pub fn parse_args() -> RunMode {
@@ -37,5 +43,6 @@ pub fn parse_args() -> RunMode {
         host: args.host,
         port: args.port,
         lobby_config: args.lobby_config,
+        pyrogenesis_path: args.pyrogenesis_path,
     }
 }

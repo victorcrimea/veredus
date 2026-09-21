@@ -13,6 +13,16 @@ use crate::relay::messages::PlayerCommand;
 // One below the 4-turn command delay, so turn 4 is the first release.
 pub const INITIAL_READY_TURN: u32 = 3;
 
+// Clients hash their complete state on turn 1 and every 20th turn, and only
+// unit positions otherwise. The AI host's complete state carries its live AI
+// registration, which no stock client has, so only its quick hashes can ever
+// agree with theirs.
+const FULL_HASH_EVERY: u32 = 20;
+
+fn needs_full_hash(turn: u32) -> bool {
+    turn == 1 || turn.is_multiple_of(FULL_HASH_EVERY)
+}
+
 struct ClientTurn {
     client_id: u16,
     ready_turn: u32,
@@ -25,6 +35,9 @@ struct ClientTurn {
     // late, and waiting for them would hold every player's desync report back
     // by the same amount.
     delayed: bool,
+    // The hosted-AI sidecar. Its full-turn hashes are not comparable with
+    // anyone's, and it is never the reference a player is judged against.
+    ai_host: bool,
 }
 
 // Bounded by the session count: hashes are discarded as soon as a turn is
@@ -119,8 +132,15 @@ impl TurnManager {
                 simulated_turn,
                 observer,
                 delayed,
+                ai_host: false,
             },
         );
+    }
+
+    pub fn mark_ai_host(&mut self, peer: PeerID) {
+        if let Some(client) = self.clients.get_mut(&peer) {
+            client.ai_host = true;
+        }
     }
 
     pub fn forget(&mut self, peer: PeerID) {
@@ -217,6 +237,9 @@ impl TurnManager {
             }
             return Ok(Vec::new());
         }
+        if client.ai_host && needs_full_hash(turn) {
+            return Ok(Vec::new());
+        }
         self.pending.entry(turn).or_default().insert(peer, hash);
         Ok(self.compare(turn))
     }
@@ -234,17 +257,23 @@ impl TurnManager {
         if !self
             .clients
             .iter()
-            .filter(|(_, c)| !c.delayed)
+            .filter(|(_, c)| !c.delayed && !(c.ai_host && needs_full_hash(turn)))
             .all(|(p, _)| reported.contains_key(p))
         {
             return found;
         }
 
         // The reference is whatever the lowest client id reported: the server
-        // runs no simulation, so it can only compare, never adjudicate.
+        // runs no simulation, so it can only compare, never adjudicate. The AI
+        // host sorts last, because a stock client is what the players trust.
         let Some(reference) = reported
             .iter()
-            .min_by_key(|(p, _)| self.clients.get(p).map(|c| c.client_id).unwrap_or(u16::MAX))
+            .min_by_key(|(p, _)| {
+                self.clients
+                    .get(p)
+                    .map(|c| (c.ai_host, c.client_id))
+                    .unwrap_or((true, u16::MAX))
+            })
             .map(|(_, hash)| hash.clone())
         else {
             return found;

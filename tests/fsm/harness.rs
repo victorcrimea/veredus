@@ -63,6 +63,14 @@ fn clone_effect(effect: &Effect) -> Effect {
             players: players.clone(),
         },
         Effect::GameOver => Effect::GameOver,
+        Effect::StateDump { id, turn, request } => Effect::StateDump {
+            id: *id,
+            turn: *turn,
+            request: request.clone(),
+        },
+        Effect::CancelStateDump { id } => Effect::CancelStateDump { id: *id },
+        Effect::SpawnAiHost { name } => Effect::SpawnAiHost { name: name.clone() },
+        Effect::StopAiHost => Effect::StopAiHost,
     }
 }
 

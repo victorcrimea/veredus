@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::net::IpAddr;
+use std::net::SocketAddrV4;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -27,30 +29,118 @@ use crate::relay::server_fsm::Effect;
 use crate::relay::server_fsm::Idle;
 use crate::relay::server_fsm::Input;
 use crate::relay::server_fsm::Server;
+use crate::sidecar::AiHostProcess;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 // The FSM only needs a tick often enough to drive the connection warnings,
 // which are emitted at most once a second.
 const TICK_INTERVAL: TimeDelta = TimeDelta::milliseconds(100);
 
+// The one in-flight one-shot dump, if any. The FSM allows only one run at a
+// time, so one slot is enough. Dropping it trips the cancel flag, so every
+// return from the game loop, and a panic caught by the pool, also kills a
+// running pyrogenesis instead of orphaning it.
+#[derive(Default)]
+struct DumpSlot {
+    id: Option<u32>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl DumpSlot {
+    // Records a fresh run, replacing the previous flag: a run started after a
+    // cancel must not inherit the old run's trip.
+    fn start(&mut self, id: u32) -> Arc<AtomicBool> {
+        self.id = Some(id);
+        self.cancel = Arc::new(AtomicBool::new(false));
+        Arc::clone(&self.cancel)
+    }
+
+    fn cancel(&self, id: u32) {
+        if self.id == Some(id) {
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for DumpSlot {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+// The hosted-AI process for this game, if one is running. It lives on this
+// thread so that every return from the game loop, and a panic caught by the
+// pool, drops it and with it kills the engine.
+struct AiHostSlot {
+    pyrogenesis_path: Option<PathBuf>,
+    // Where the AI host dials the relay. None when the socket is bound to an
+    // address loopback cannot reach, which the FSM only honours from loopback.
+    connect: Option<SocketAddrV4>,
+    process: Option<AiHostProcess>,
+    // A spawn that failed is reported on the next loop, as an exit is, so the
+    // FSM hears about both the same way.
+    exited: bool,
+}
+
+impl AiHostSlot {
+    fn spawn(&mut self, name: &str) {
+        self.process = None;
+        let (Some(path), Some(addr)) = (self.pyrogenesis_path.as_ref(), self.connect) else {
+            tracing::error!(
+                "sidecar: AI host cannot be spawned: no pyrogenesis or no loopback bind"
+            );
+            self.exited = true;
+            return;
+        };
+        match AiHostProcess::spawn(path, *addr.ip(), addr.port(), name) {
+            Ok(process) => self.process = Some(process),
+            Err(error) => {
+                tracing::error!(%error, "sidecar: AI host failed to spawn");
+                self.exited = true;
+            }
+        }
+    }
+
+    // True once per exit. The process is dropped here, which reaps it.
+    fn take_exit(&mut self) -> bool {
+        if let Some(status) = self.process.as_mut().and_then(|p| p.poll_exit()) {
+            tracing::warn!(%status, "sidecar: AI host exited");
+            self.process = None;
+            self.exited = true;
+        }
+        std::mem::take(&mut self.exited)
+    }
+}
+
 // The ENet thread feeds decoded events in over `event_rx` and takes effects out
 // over `send_tx`. Every clock read lives here, on the IO side, so the FSM
 // itself stays a pure function of the inputs it is handed. `lobby` is None in
 // standalone mode; when present, its `auth_rx` half feeds Input::LobbyAuth and
-// its `events_tx` half is where lobby-listing effects go.
+// its `events_tx` half is where lobby-listing effects go. `pyrogenesis_path`
+// enables one-shot state dumps and the AI host; None means dump effects answer
+// at once. `ai_host_connect` is where the AI host dials back to.
 pub fn run_game_server(
     event_rx: Receiver<InboundNetworkMessage>,
     send_tx: Sender<OutboundNetworkMessage>,
     shutdown_requested: Arc<AtomicBool>,
     config: Config,
     lobby: Option<LobbyLink>,
+    pyrogenesis_path: Option<PathBuf>,
+    ai_host_connect: Option<SocketAddrV4>,
 ) {
     // Parked in the listening state, which is the phase a relay spends its
     // whole idle life in.
     let mut server = Some(AnyServer::from(Server::<Idle>::new(config).listen()));
     let mut latest_stats: Vec<PeerStats> = Vec::new();
     let mut last_tick: DateTime<Utc> = Utc::now();
-
+    let (dump_tx, dump_rx) = std::sync::mpsc::channel::<(u32, Option<Vec<u8>>)>();
+    let mut dump_slot = DumpSlot::default();
+    let mut ai_host = AiHostSlot {
+        pyrogenesis_path: pyrogenesis_path.clone(),
+        connect: ai_host_connect,
+        process: None,
+        exited: false,
+    };
     loop {
         // Drained before the ENet events, so a lobby-auth prompt is queued
         // ahead of the AUTHENTICATE it is meant to precede.
@@ -71,6 +161,24 @@ pub fn run_game_server(
                     Err(TryRecvError::Disconnected) => break,
                 }
             }
+        }
+
+        if ai_host.take_exit() {
+            server = Some(
+                server
+                    .take()
+                    .expect("server is always present")
+                    .handle(Input::AiHostExited),
+            );
+        }
+
+        while let Ok((id, state)) = dump_rx.try_recv() {
+            server = Some(
+                server
+                    .take()
+                    .expect("server is always present")
+                    .handle(Input::StateDumped { id, state }),
+            );
         }
 
         loop {
@@ -116,14 +224,30 @@ pub fn run_game_server(
         }
 
         if let Some(current) = server.as_mut() {
-            let outcome = drain(current.take_effects(), &send_tx, lobby.as_ref());
+            let outcome = drain(
+                current.take_effects(),
+                &send_tx,
+                lobby.as_ref(),
+                pyrogenesis_path.as_ref(),
+                &dump_tx,
+                &mut dump_slot,
+                &mut ai_host,
+            );
             if !outcome.channel_ok {
                 return;
             }
             if outcome.game_over {
                 tracing::info!("idle-shutdown timeout elapsed, ending game");
                 let effects = server.take().expect("server is always present").shutdown();
-                drain(effects, &send_tx, lobby.as_ref());
+                drain(
+                    effects,
+                    &send_tx,
+                    lobby.as_ref(),
+                    pyrogenesis_path.as_ref(),
+                    &dump_tx,
+                    &mut dump_slot,
+                    &mut ai_host,
+                );
                 return;
             }
         }
@@ -131,7 +255,15 @@ pub fn run_game_server(
         if shutdown_requested.load(Ordering::SeqCst) {
             tracing::info!("shutdown requested, dropping every peer");
             let effects = server.take().expect("server is always present").shutdown();
-            drain(effects, &send_tx, lobby.as_ref());
+            drain(
+                effects,
+                &send_tx,
+                lobby.as_ref(),
+                pyrogenesis_path.as_ref(),
+                &dump_tx,
+                &mut dump_slot,
+                &mut ai_host,
+            );
             return;
         }
 
@@ -180,6 +312,10 @@ fn drain(
     effects: Vec<Effect>,
     send_tx: &Sender<OutboundNetworkMessage>,
     lobby: Option<&LobbyLink>,
+    pyrogenesis_path: Option<&PathBuf>,
+    dump_tx: &Sender<(u32, Option<Vec<u8>>)>,
+    dump_slot: &mut DumpSlot,
+    ai_host: &mut AiHostSlot,
 ) -> DrainOutcome {
     let mut outcome = DrainOutcome {
         channel_ok: true,
@@ -224,6 +360,23 @@ fn drain(
                 outcome.game_over = true;
                 continue;
             }
+            Effect::StateDump { id, turn, request } => {
+                let cancel = dump_slot.start(id);
+                spawn_dump(pyrogenesis_path, dump_tx, id, turn, request, cancel);
+                continue;
+            }
+            Effect::CancelStateDump { id } => {
+                dump_slot.cancel(id);
+                continue;
+            }
+            Effect::SpawnAiHost { name } => {
+                ai_host.spawn(&name);
+                continue;
+            }
+            Effect::StopAiHost => {
+                ai_host.process = None;
+                continue;
+            }
         };
         if send_tx.send(outbound).is_err() {
             tracing::info!("ENet send channel closed, shutting down");
@@ -233,4 +386,54 @@ fn drain(
     }
 
     outcome
+}
+
+// A dump runs on its own thread because the replay takes far longer than one
+// tick: the game loop keeps serving while pyrogenesis replays the match.
+// The result comes back over `dump_tx` and re-enters the FSM as an input.
+fn spawn_dump(
+    pyrogenesis_path: Option<&PathBuf>,
+    dump_tx: &Sender<(u32, Option<Vec<u8>>)>,
+    id: u32,
+    turn: u32,
+    request: crate::sidecar::DumpRequest,
+    cancel: Arc<AtomicBool>,
+) {
+    // Both read here, on the game thread, before the spawn: the dump module
+    // stays free of clock reads, and the thread's log lines carry the game id.
+    let now = chrono::Utc::now();
+    let span = tracing::Span::current();
+    let Some(path) = pyrogenesis_path.cloned() else {
+        // The FSM gate means this never happens, but a waiting joiner must
+        // not hang if it does.
+        let _ = dump_tx.send((id, None));
+        return;
+    };
+    let tx = dump_tx.clone();
+    std::thread::spawn(move || {
+        let _guard = span.entered();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir = std::env::temp_dir().join(format!("veredus-dump-{}", uuid::Uuid::new_v4()));
+            let result = crate::sidecar::dump_state(&path, &dir, turn, &request, now, &cancel);
+            let _ = std::fs::remove_dir_all(&dir);
+            result
+        }));
+        let state = match outcome {
+            Ok(Ok(bytes)) => {
+                tracing::info!(turn, bytes = bytes.len(), "sidecar: state dump ready");
+                Some(bytes)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(turn, %error, "sidecar: state dump failed");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(turn, "sidecar: state dump panicked");
+                None
+            }
+        };
+        // The game may have ended while the replay ran; then there is no one
+        // left to answer and the result is dropped.
+        let _ = tx.send((id, state));
+    });
 }

@@ -3,7 +3,10 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::net::SocketAddr;
+use std::net::SocketAddrV4;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -38,6 +41,9 @@ pub struct GameConfig {
     pub server: Config,
     // None in standalone mode; Some when a lobby account is hosting this game.
     pub lobby: Option<LobbyLink>,
+    // Path to the pyrogenesis binary for one-shot state dumps. None disables
+    // the sidecar fallback.
+    pub pyrogenesis_path: Option<PathBuf>,
 }
 
 struct GameHandle {
@@ -78,6 +84,7 @@ impl GamePool {
             port,
             server: server_config,
             lobby,
+            pyrogenesis_path,
         } = config;
         let port = match port {
             Some(port) => {
@@ -92,6 +99,10 @@ impl GamePool {
         };
 
         let bind_addr = SocketAddr::new(self.bind_ip, port);
+        // The AI host runs on this machine and is only recognised from
+        // loopback, so a socket bound elsewhere cannot host one.
+        let ai_host_connect = (self.bind_ip.is_unspecified() || self.bind_ip.is_loopback())
+            .then(|| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
 
         // Bound here rather than in the ENet thread: a bind failure has to reach
         // the caller as an error, not a panic in a thread nobody joins until
@@ -128,6 +139,8 @@ impl GamePool {
                     shutdown_requested_for_thread,
                     server_config,
                     lobby,
+                    pyrogenesis_path,
+                    ai_host_connect,
                 );
             }));
             if let Err(panic_payload) = result {

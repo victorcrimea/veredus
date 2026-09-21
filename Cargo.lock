@@ -3024,6 +3024,7 @@ name = "veredus"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64",
  "blake2 0.11.0",
  "chrono",
  "clap",

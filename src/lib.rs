@@ -6,4 +6,5 @@ pub mod game_pool;
 pub mod lobby;
 pub mod network_message;
 pub mod relay;
+pub mod sidecar;
 pub mod utils;

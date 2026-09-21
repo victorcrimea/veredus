@@ -47,8 +47,8 @@ async fn main() {
     let mut pool = GamePool::new(mode.host);
 
     match mode.lobby_config {
-        Some(path) => run_pool_lobby_mode(&mut pool, path).await,
-        None => run_standalone(&mut pool, mode.port).await,
+        Some(path) => run_pool_lobby_mode(&mut pool, path, mode.pyrogenesis_path).await,
+        None => run_standalone(&mut pool, mode.port, mode.pyrogenesis_path).await,
     }
 }
 
@@ -94,12 +94,17 @@ fn build_loki_layer() -> Option<tracing_loki::Layer> {
     Some(layer)
 }
 
-async fn run_standalone(pool: &mut GamePool, port: u16) {
+async fn run_standalone(pool: &mut GamePool, port: u16, pyrogenesis_path: Option<PathBuf>) {
     let (game_id, port) = pool
         .create_game(GameConfig {
             port: Some(port),
-            server: Config::default(),
+            server: Config {
+                sidecar_dumps: pyrogenesis_path.is_some(),
+                hosted_ai: pyrogenesis_path.is_some(),
+                ..Config::default()
+            },
             lobby: None,
+            pyrogenesis_path,
         })
         .expect("Failed to create initial game");
 
@@ -109,7 +114,11 @@ async fn run_standalone(pool: &mut GamePool, port: u16) {
     tokio::signal::ctrl_c().await.ok();
 }
 
-async fn run_pool_lobby_mode(pool: &mut GamePool, config_path: PathBuf) {
+async fn run_pool_lobby_mode(
+    pool: &mut GamePool,
+    config_path: PathBuf,
+    pyrogenesis_path: Option<PathBuf>,
+) {
     let config_data = std::fs::read_to_string(&config_path).unwrap_or_else(|error| {
         eprintln!(
             "Error: failed to read lobby config '{}': {error}",
@@ -197,6 +206,8 @@ async fn run_pool_lobby_mode(pool: &mut GamePool, config_path: PathBuf) {
                     server_name: server_name.clone(),
                     idle_shutdown: Some(IDLE_SHUTDOWN),
                     lobby_host_name: sender.clone(),
+                    sidecar_dumps: pyrogenesis_path.is_some(),
+                    hosted_ai: pyrogenesis_path.is_some(),
                     ..Config::default()
                 };
 
@@ -207,6 +218,7 @@ async fn run_pool_lobby_mode(pool: &mut GamePool, config_path: PathBuf) {
                     port: None,
                     server: server_config,
                     lobby: Some(LobbyLink { auth_rx, events_tx }),
+                    pyrogenesis_path: pyrogenesis_path.clone(),
                 }) {
                     Ok((game_id, port)) => {
                         tracing::info!(

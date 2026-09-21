@@ -70,10 +70,11 @@ use crate::relay::slots::UNASSIGNED;
 use crate::relay::turn::INITIAL_READY_TURN;
 use crate::relay::turn::MatchLog;
 use crate::relay::turn::TurnManager;
+use crate::sidecar::DumpRequest;
 
 const SYN_CHALLENGE: u32 = 0x5073013F;
 const GAME_VERSION: u32 = 0x01010019;
-const SIMULATION_VERSION: &str = "0.28.0";
+pub(crate) const SIMULATION_VERSION: &str = "0.28.0";
 
 // The one flag bit the ACK carries, telling the client to authenticate over
 // the lobby instead of answering straight away.
@@ -97,6 +98,14 @@ const FIRST_SIMULATED_TURN: u32 = 0;
 // How many fresh UUIDs to try before giving up on issuing a unique one.
 const UUID_ATTEMPTS: usize = 8;
 
+// How long a held start waits for the AI host to be admitted. Long enough for
+// a cold pyrogenesis to boot and connect, short enough that a controller whose
+// start is refused is not left waiting for nothing.
+const AI_HOST_ADMIT_TIMEOUT: TimeDelta = TimeDelta::seconds(30);
+
+// The per-slot fields that make a stock client register and run an AI.
+const AI_FIELDS: [&str; 3] = ["AI", "AIDiff", "AIBehavior"];
+
 #[derive(Debug)]
 pub enum Input {
     Connected {
@@ -119,6 +128,17 @@ pub enum Input {
         now: DateTime<Utc>,
         stats: Vec<PeerStats>,
     },
+    // A finished one-shot state dump from the IO side. None means the dump
+    // failed and the joiners waiting on it need the fallback path. The id
+    // matches the run that produced it, so a stale reply from a cancelled run
+    // is ignored instead of being credited to a newer one.
+    StateDumped {
+        id: u32,
+        state: Option<Vec<u8>>,
+    },
+    // The AI host process could not be spawned or has exited, from the IO
+    // side, which is the only place that can see the child.
+    AiHostExited,
 }
 
 #[derive(Debug, PartialEq)]
@@ -153,6 +173,27 @@ pub enum Effect {
     // The idle-shutdown timeout elapsed (A7). The game thread reacts by
     // shutting every session down and returning.
     GameOver,
+    // A one-shot pyrogenesis run should rebuild the state at `turn` for
+    // joiners no live client can serve. The IO side answers with
+    // Input::StateDumped. The id pairs each reply with its run, so a late
+    // reply from a cancelled run cannot be taken for the current one.
+    StateDump {
+        id: u32,
+        turn: u32,
+        request: DumpRequest,
+    },
+    // The last joiner waiting on a dump left, so the run is no longer needed.
+    // The IO side kills its pyrogenesis when the id matches its in-flight run.
+    CancelStateDump {
+        id: u32,
+    },
+    // A match with AI slots is starting, so the IO side launches the AI host
+    // that will join under `name` and play those slots.
+    SpawnAiHost {
+        name: String,
+    },
+    // The AI host is no longer wanted; the IO side kills and reaps it.
+    StopAiHost,
 }
 
 // Values travel as the ENet disconnect `data` word; only the number reaches the client.
@@ -216,6 +257,13 @@ pub struct Config {
     // The hostme sender, used as the lobby listing's hostUsername until a
     // controller with a name of its own is admitted.
     pub lobby_host_name: String,
+    // When set, a joiner no live client can serve gets its snapshot from a
+    // one-shot pyrogenesis instead of being dropped. The IO side owns the
+    // actual path; this flag is what the FSM gates on.
+    pub sidecar_dumps: bool,
+    // When set, a match whose settings have AI slots gets a pyrogenesis AI
+    // host that plays them, so no stock client has to compute the AI.
+    pub hosted_ai: bool,
 }
 
 impl Default for Config {
@@ -242,6 +290,8 @@ impl Default for Config {
             pause_budget: pause_budget::DEFAULT_BUDGET,
             idle_shutdown: None,
             lobby_host_name: String::new(),
+            sidecar_dumps: false,
+            hosted_ai: false,
         }
     }
 }
@@ -281,12 +331,40 @@ pub(crate) struct Context {
     feed: ObserverFeed,
     // Served to every joiner that asks, so it is shared rather than copied.
     join_snapshot: Option<Arc<Vec<u8>>>,
+    // The one in-flight state dump, if any. One run at a time bounds how many
+    // engine processes a game can accumulate, and joiners asking together
+    // share its cost.
+    dump: Option<PendingDump>,
+    next_dump_id: u32,
     // Both fed only by Input::Tick.now (A2). created_at is set on the first
     // tick; empty_since only once the game has held a player and lost every
     // one again.
     created_at: Option<DateTime<Utc>>,
     empty_since: Option<DateTime<Utc>>,
+    // The name the AI host authenticates under. Fixed per game, and only
+    // honoured from loopback while an AI host is expected, so a remote client
+    // that copies it off the slot list gains nothing.
+    ai_host_name: String,
+    // Present from the moment a hosted-AI start is requested until the AI
+    // host is gone.
+    ai_host: Option<AiHost>,
     effects: Vec<Effect>,
+}
+
+struct AiHost {
+    // None until it is admitted.
+    peer: Option<PeerID>,
+    // The AI player ids it may send commands for.
+    players: HashSet<i32>,
+}
+
+// The one in-flight one-shot state dump: the turn it rebuilds and every
+// joiner waiting on it. Joiners asking while it runs attach to it whatever
+// turn they asked for, instead of starting a second engine process.
+struct PendingDump {
+    id: u32,
+    turn: u32,
+    waiting: Vec<PeerID>,
 }
 
 // What a completed inbound transfer was for. The payload of a join snapshot
@@ -429,6 +507,24 @@ impl Context {
         self.sessions.get(&peer)?.uuid.clone()
     }
 
+    fn is_ai_host(&self, peer: PeerID) -> bool {
+        self.ai_host.as_ref().is_some_and(|h| h.peer == Some(peer))
+    }
+
+    fn is_ai_host_uuid(&self, uuid: &Guid) -> bool {
+        self.ai_host
+            .as_ref()
+            .and_then(|h| h.peer)
+            .and_then(|p| self.uuid_of(p))
+            .is_some_and(|u| &u == uuid)
+    }
+
+    // The AI host is launched on this machine and dials loopback, so only a
+    // loopback session can be it, and only before it has been admitted.
+    fn ai_host_expected(&self, addr: Ipv4Addr) -> bool {
+        addr.is_loopback() && self.ai_host.as_ref().is_some_and(|h| h.peer.is_none())
+    }
+
     // Which messages a session may send depends on the session's own phase,
     // not the server's. Handing back the UUID from the same call is what keeps
     // the two together: a handler cannot name its sender without first
@@ -471,8 +567,12 @@ impl Context {
 
     // An observer for turn-release purposes only. The controller keeps
     // blocking even when it holds no slot.
+    // The AI host holds no slot but plays every AI slot, so it blocks like a
+    // player and must never be moved onto the delayed feed.
     fn is_observer(&self, uuid: &Guid) -> bool {
-        self.slots.slot_of(uuid) == Some(UNASSIGNED) && self.controller.as_ref() != Some(uuid)
+        self.slots.slot_of(uuid) == Some(UNASSIGNED)
+            && self.controller.as_ref() != Some(uuid)
+            && !self.is_ai_host_uuid(uuid)
     }
 
     fn is_delayed_observer(&self, uuid: &Guid) -> bool {
@@ -583,6 +683,18 @@ pub struct AwaitSavegame {
     pub settings_json: Vec<u8>,
 }
 
+// Still server phase `setup` on the wire: the controller has started a match
+// with AI slots, and the start is held until the AI host that will play them
+// has been admitted, so it is there to receive the start with everyone else.
+pub struct AwaitAiHost {
+    pub settings: FrozenSettings,
+    // What every stock client is sent, and the AI host's own copy.
+    pub start: StartSettings,
+    pub ai_host_start: StartSettings,
+    // Anchored on the first tick, because the FSM only learns the time there.
+    pub requested_at: Option<DateTime<Utc>>,
+}
+
 pub struct Loading {
     pub settings: FrozenSettings,
     pub saved_state: Option<Vec<u8>>,
@@ -596,11 +708,17 @@ pub struct InGame {
 pub trait SetupPhase {}
 impl SetupPhase for Setup {}
 impl SetupPhase for AwaitSavegame {}
+impl SetupPhase for AwaitAiHost {}
 
 // Lets the shared handlers apply the phase-dependent rules without knowing
 // which typestate they were called from.
 pub trait PhaseMarker {
     const PHASE: Phase;
+    // The frozen settings, once a match has been configured. Setup-like
+    // phases have none, so snapshot dumps stay unreachable there.
+    fn settings(&self) -> Option<&FrozenSettings> {
+        None
+    }
 }
 impl PhaseMarker for Setup {
     const PHASE: Phase = Phase::Setup;
@@ -608,17 +726,27 @@ impl PhaseMarker for Setup {
 impl PhaseMarker for AwaitSavegame {
     const PHASE: Phase = Phase::Setup;
 }
+impl PhaseMarker for AwaitAiHost {
+    const PHASE: Phase = Phase::Setup;
+}
 impl PhaseMarker for Loading {
     const PHASE: Phase = Phase::Loading;
+    fn settings(&self) -> Option<&FrozenSettings> {
+        Some(&self.settings)
+    }
 }
 impl PhaseMarker for InGame {
     const PHASE: Phase = Phase::InGame;
+    fn settings(&self) -> Option<&FrozenSettings> {
+        Some(&self.settings)
+    }
 }
 
 pub enum AnyServer {
     Idle(Server<Idle>),
     Setup(Server<Setup>),
     AwaitSavegame(Server<AwaitSavegame>),
+    AwaitAiHost(Server<AwaitAiHost>),
     Loading(Server<Loading>),
     InGame(Server<InGame>),
 }
@@ -641,6 +769,12 @@ impl From<Server<AwaitSavegame>> for AnyServer {
     }
 }
 
+impl From<Server<AwaitAiHost>> for AnyServer {
+    fn from(s: Server<AwaitAiHost>) -> Self {
+        AnyServer::AwaitAiHost(s)
+    }
+}
+
 impl From<Server<Loading>> for AnyServer {
     fn from(s: Server<Loading>) -> Self {
         AnyServer::Loading(s)
@@ -659,6 +793,7 @@ impl AnyServer {
             AnyServer::Idle(s) => s.on_input(input),
             AnyServer::Setup(s) => s.on_input(input),
             AnyServer::AwaitSavegame(s) => s.on_input(input),
+            AnyServer::AwaitAiHost(s) => s.on_input(input),
             AnyServer::Loading(s) => s.on_input(input),
             AnyServer::InGame(s) => s.on_input(input),
         }
@@ -669,6 +804,7 @@ impl AnyServer {
             AnyServer::Idle(s) => s.take_effects(),
             AnyServer::Setup(s) => s.take_effects(),
             AnyServer::AwaitSavegame(s) => s.take_effects(),
+            AnyServer::AwaitAiHost(s) => s.take_effects(),
             AnyServer::Loading(s) => s.take_effects(),
             AnyServer::InGame(s) => s.take_effects(),
         }
@@ -679,6 +815,7 @@ impl AnyServer {
             AnyServer::Idle(s) => s.shutdown(),
             AnyServer::Setup(s) => s.shutdown(),
             AnyServer::AwaitSavegame(s) => s.shutdown(),
+            AnyServer::AwaitAiHost(s) => s.shutdown(),
             AnyServer::Loading(s) => s.shutdown(),
             AnyServer::InGame(s) => s.shutdown(),
         }
@@ -714,6 +851,12 @@ impl<S: PhaseMarker> Server<S> {
             Input::Disconnected { peer } => self.on_disconnected(peer),
             Input::LobbyAuth { username, token } => self.on_lobby_auth(username, token),
             Input::Tick { now, stats } => self.on_tick(now, stats),
+            // Only the in-game phase waits on dumps; everywhere else the
+            // result arrives for a game that has moved on.
+            Input::StateDumped { .. } => {}
+            // Only a held start acts on this; once the match runs, the AI
+            // host's departure is handled when its connection drops.
+            Input::AiHostExited => tracing::info!("sidecar: AI host process exited"),
         }
     }
 
@@ -804,6 +947,26 @@ impl<S: PhaseMarker> Server<S> {
         self.ctx.transfers.forget(peer);
         self.ctx.turns.forget(peer);
         self.ctx.feed.forget(peer);
+        if let Some(dump) = self.ctx.dump.as_mut() {
+            dump.waiting.retain(|p| *p != peer);
+            if dump.waiting.is_empty() {
+                // Nobody is left to answer, so the run is cancelled rather
+                // than burning a whole replay for no one.
+                let id = dump.id;
+                self.ctx.dump = None;
+                self.ctx.effects.push(Effect::CancelStateDump { id });
+            }
+        }
+
+        if self.ctx.is_ai_host(peer) {
+            // It is not respawned: a new one would have to rebuild the match
+            // state first, so its players simply stop acting.
+            tracing::warn!(?peer, "sidecar: AI host left the match");
+            self.ctx.ai_host = None;
+            self.ctx.effects.push(Effect::StopAiHost);
+            self.ctx
+                .server_chat(None, "The AI host left; AI players will stand idle.");
+        }
 
         if let Some(uuid) = session.uuid.as_ref() {
             self.ctx.pause_budget.clear_pausing(uuid);
@@ -924,7 +1087,12 @@ impl<S: PhaseMarker> Server<S> {
 
         let created_at = *self.ctx.created_at.get_or_insert(now);
         let ever_admitted = self.ctx.next_client_id > 1;
-        let anyone_admitted = self.ctx.sessions.values().any(|s| s.admitted.is_some());
+        // The AI host alone must not keep a game nobody plays in alive.
+        let anyone_admitted = self
+            .ctx
+            .sessions
+            .iter()
+            .any(|(p, s)| s.admitted.is_some() && !self.ctx.is_ai_host(*p));
 
         if anyone_admitted {
             self.ctx.empty_since = None;
@@ -1019,7 +1187,10 @@ impl<S: PhaseMarker> Server<S> {
             session.uuid = Some(uuid.clone());
         }
 
-        let flags = if self.ctx.config.lobby_mode {
+        // The AI host has no lobby account to authenticate with.
+        let addr = self.ctx.sessions.get(&peer).map(|s| s.addr);
+        let ai_host = addr.is_some_and(|a| self.ctx.ai_host_expected(a));
+        let flags = if self.ctx.config.lobby_mode && !ai_host {
             ACK_FLAG_LOBBY_AUTH
         } else {
             0
@@ -1063,7 +1234,11 @@ impl<S: PhaseMarker> Server<S> {
             return Err(PeerFault::WrongPhase);
         }
         let lobby_name = session.lobby_name.clone();
-        if self.ctx.config.lobby_mode && lobby_name.is_none() {
+        // It has no lobby account and is never handed the game password, so
+        // the checks that depend on either are skipped for it alone.
+        let is_ai_host =
+            self.ctx.ai_host_expected(session.addr) && msg.name == self.ctx.ai_host_name;
+        if self.ctx.config.lobby_mode && lobby_name.is_none() && !is_ai_host {
             // The client has not been prompted yet, so this cannot be its
             // real answer.
             return Err(PeerFault::WrongPhase);
@@ -1076,7 +1251,7 @@ impl<S: PhaseMarker> Server<S> {
             return Ok(());
         }
 
-        if self.ctx.config.lobby_mode {
+        if self.ctx.config.lobby_mode && !is_ai_host {
             let expected = lobby_name.unwrap_or_default().to_lowercase();
             if auth::suffix_stripped(&sanitized).to_lowercase() != expected {
                 self.disconnect(peer, DisconnectReason::LobbyAuthFailed);
@@ -1088,7 +1263,7 @@ impl<S: PhaseMarker> Server<S> {
         // always run: an empty server password hashes to "", which is exactly
         // what a client with no password sends.
         let expected = password::hash(&self.ctx.config.server_password_hash, msg.name.as_bytes());
-        if expected != msg.password {
+        if expected != msg.password && !is_ai_host {
             self.disconnect(peer, DisconnectReason::Refused);
             return Ok(());
         }
@@ -1139,6 +1314,10 @@ impl<S: PhaseMarker> Server<S> {
             }
         };
 
+        if is_ai_host && let Some(host) = self.ctx.ai_host.as_mut() {
+            host.peer = Some(peer);
+            tracing::info!(?peer, "sidecar: AI host admitted");
+        }
         self.admit_session(peer, uuid, name, joining, &msg.controller_secret);
         Ok(())
     }
@@ -1201,8 +1380,9 @@ impl<S: PhaseMarker> Server<S> {
 
         // The controller flag only ever reaches a client here; there is no
         // message that promotes an already-connected one.
-        let is_controller =
-            self.ctx.controller.is_none() && controller_secret == self.ctx.config.controller_secret;
+        let is_controller = self.ctx.controller.is_none()
+            && controller_secret == self.ctx.config.controller_secret
+            && !self.ctx.is_ai_host(peer);
         if is_controller {
             self.ctx.controller = Some(uuid.clone());
         }
@@ -1251,8 +1431,58 @@ impl<S: PhaseMarker> Server<S> {
         }
 
         if joining {
-            self.start_snapshot_fetch(peer);
+            self.start_snapshot_fetch(peer, true);
         }
+    }
+
+    // Asks the one-shot sidecar to rebuild the state at `turn` for `joiner`.
+    // True means the joiner now waits on a dump: either the run already in
+    // flight it attached to, or a fresh run the IO side will answer. False
+    // means no dump was started and the caller should try the next source.
+    fn request_state_dump(&mut self, joiner: PeerID, turn: u32) -> bool {
+        if !self.ctx.config.sidecar_dumps || turn < 1 {
+            return false;
+        }
+        let Some(settings) = self.st.settings() else {
+            return false;
+        };
+        let settings_json = settings.json.clone();
+        let default_length = settings.turn_length_ms as u16;
+        if let Some(dump) = self.ctx.dump.as_mut() {
+            // One run per game: a joiner arriving mid-run waits behind it
+            // whatever turn it asked for, instead of starting a second engine
+            // process. A delayed joiner is still held to the run's turn, and
+            // a live joiner just replays further from it.
+            dump.waiting.push(joiner);
+            return true;
+        }
+        let mut turn_lengths = Vec::new();
+        for t in 1..=turn {
+            turn_lengths.push(self.ctx.log.turn_length(t).unwrap_or(default_length));
+        }
+        let mut commands = Vec::new();
+        for t in 1..=turn {
+            commands.extend(self.ctx.log.commands_for(t).iter().cloned());
+        }
+        let request = DumpRequest {
+            init_attributes: settings_json,
+            engine_version: SIMULATION_VERSION.to_string(),
+            mods: self.ctx.config.enabled_mods.clone(),
+            turn_lengths,
+            commands,
+        };
+        let id = self.ctx.next_dump_id;
+        self.ctx.next_dump_id = self.ctx.next_dump_id.wrapping_add(1);
+        self.ctx.dump = Some(PendingDump {
+            id,
+            turn,
+            waiting: vec![joiner],
+        });
+        tracing::info!(?joiner, turn, "sidecar: requesting state dump");
+        self.ctx
+            .effects
+            .push(Effect::StateDump { id, turn, request });
+        true
     }
 
     // Only an in-game client can serialize a live snapshot; asking anyone else
@@ -1260,16 +1490,25 @@ impl<S: PhaseMarker> Server<S> {
     // the joiner is preferred: a delayed observer's state is already old
     // enough for a delayed joiner to load straight away, and a live joiner
     // sourced from one would only have a longer replay to sit through.
-    fn start_snapshot_fetch(&mut self, joiner: PeerID) {
+    // A delayed joiner tries the sidecar at the feed head first, so it can
+    // start watching without interrupting a player; a live joiner uses the
+    // sidecar only when no client can serve it. `allow_dump` is false on the
+    // retry after a failed dump, so one failure cannot loop back here.
+    fn start_snapshot_fetch(&mut self, joiner: PeerID, allow_dump: bool) {
         let joiner_delayed = self
             .ctx
             .uuid_of(joiner)
             .is_some_and(|u| self.ctx.is_delayed_observer(&u));
+        if allow_dump && joiner_delayed && self.request_state_dump(joiner, self.ctx.feed.head()) {
+            return;
+        }
         let mut candidates: Vec<(PeerID, bool, bool, chrono::TimeDelta)> = self
             .ctx
             .sessions
             .iter()
-            .filter(|(p, s)| **p != joiner && s.is_in_game())
+            // The AI host's state carries a live AI registration, which would
+            // start the joiner computing the AI too.
+            .filter(|(p, s)| **p != joiner && s.is_in_game() && !self.ctx.is_ai_host(**p))
             .map(|(p, s)| {
                 let other_feed = self.ctx.turns.is_delayed(*p) != joiner_delayed;
                 (
@@ -1283,6 +1522,9 @@ impl<S: PhaseMarker> Server<S> {
         candidates.sort_by_key(|(_, other_feed, desynced, rtt)| (*other_feed, *desynced, *rtt));
 
         let Some((source, _, _, _)) = candidates.first().copied() else {
+            if allow_dump && self.request_state_dump(joiner, self.ctx.turns.ready_turn()) {
+                return;
+            }
             // Nobody can supply the state, so the join cannot succeed.
             tracing::info!(?joiner, "no in-game session to source a snapshot from");
             self.ctx
@@ -1335,9 +1577,9 @@ impl<S: PhaseMarker> Server<S> {
             .iter()
             .find(|(_, s)| s.name() == Some(msg.name.as_str()))
             .map(|(p, _)| *p);
-        // The controller can never kick itself, and an unknown name does
-        // nothing at all.
-        let Some(target) = target.filter(|t| *t != peer) else {
+        // The controller can never kick itself or the AI host, and an unknown
+        // name does nothing at all.
+        let Some(target) = target.filter(|t| *t != peer && !self.ctx.is_ai_host(*t)) else {
             return Ok(());
         };
 
@@ -1510,6 +1752,11 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
         msg: MapPlayerIdToSlot,
     ) -> Result<(), PeerFault> {
         self.ctx.require_controller(peer)?;
+        // The controller's setup screen assigns every joiner a free slot, AI
+        // slots included, but a slot would make the AI host a player.
+        if self.ctx.is_ai_host_uuid(&msg.guid) {
+            return Ok(());
+        }
         self.ctx.slots.assign(msg.player_id, &msg.guid);
         self.broadcast_player_slots();
         Ok(())
@@ -1529,6 +1776,83 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
             self.ctx.fault(peer, fault);
         }
         None
+    }
+}
+
+impl<S: SetupPhase + PhaseMarker> Server<S> {
+    fn freeze(&self, json: &[u8]) -> FrozenSettings {
+        FrozenSettings {
+            cheats_enabled: cheats_enabled(json),
+            json: json.to_vec(),
+            turn_length_ms: self.ctx.config.turn_length_ms,
+        }
+    }
+
+    // Sends the start and registers every setup session for turn release.
+    // `ai_host_start` is the AI host's own copy, which keeps the AI slots
+    // that every other session's copy has stripped.
+    fn begin_match(&mut self, start: StartSettings, ai_host_start: Option<StartSettings>) {
+        // The clients observe these three in exactly this order.
+        let stale: Vec<PeerID> = self
+            .ctx
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.is_unauthenticated())
+            .map(|(p, _)| *p)
+            .collect();
+        for peer in stale {
+            self.disconnect(peer, DisconnectReason::ServerLoading);
+        }
+
+        self.broadcast_player_slots();
+
+        let ai_host_peer = self.ctx.ai_host.as_ref().and_then(|h| h.peer);
+        let relayed = WireMessage::StartSettings(start);
+        match (ai_host_peer, ai_host_start) {
+            (Some(ai_peer), Some(own)) => {
+                self.ctx
+                    .broadcast_except(ai_peer, &relayed, |s| s.is_setup());
+                self.ctx.send(ai_peer, WireMessage::StartSettings(own));
+            }
+            _ => self.ctx.broadcast(&relayed, |s| s.is_setup()),
+        }
+
+        // From here on every session that was in setup counts for turn
+        // release, and owes a seal for turn 4 and a hash for turn 1.
+        let starting: Vec<(PeerID, u16, Guid)> = self
+            .ctx
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.is_setup())
+            .filter_map(|(p, s)| Some((*p, s.client_id()?, s.uuid.clone()?)))
+            .collect();
+        for (peer, client_id, uuid) in starting {
+            let observer = self.ctx.is_observer(&uuid);
+            let delayed = self.ctx.is_delayed_observer(&uuid);
+            self.ctx.turns.register(
+                peer,
+                client_id,
+                INITIAL_READY_TURN,
+                FIRST_SIMULATED_TURN,
+                observer,
+                delayed,
+            );
+        }
+        if let Some(ai_peer) = ai_host_peer {
+            self.ctx.turns.mark_ai_host(ai_peer);
+        }
+    }
+
+    fn enter_loading(mut self, settings: FrozenSettings) -> Server<Loading> {
+        // The last listing update the match ever gets: Sec. 17.3 wants
+        // register followed by changestate, and register already went out
+        // from the broadcast_player_slots call in begin_match.
+        let (nbp, players) = self.ctx.lobby_counts();
+        self.ctx.effects.push(Effect::LobbyStarted { nbp, players });
+        self.with_state(Loading {
+            settings,
+            saved_state: None,
+        })
     }
 }
 
@@ -1554,8 +1878,12 @@ impl Server<Idle> {
                 log: MatchLog::default(),
                 feed: ObserverFeed::new(delay),
                 join_snapshot: None,
+                dump: None,
+                next_dump_id: 0,
                 created_at: None,
                 empty_since: None,
+                ai_host_name: format!("AI host {}", &Guid::new().0[..8]),
+                ai_host: None,
                 effects: Vec::new(),
             },
             st: Idle,
@@ -1574,16 +1902,8 @@ impl Server<Idle> {
 }
 
 impl Server<Setup> {
-    pub fn start(mut self, settings: FrozenSettings) -> Server<Loading> {
-        // The last listing update the match ever gets: Sec. 17.3 wants
-        // register followed by changestate, and register already went out
-        // from the broadcast_player_slots call in on_start_settings.
-        let (nbp, players) = self.ctx.lobby_counts();
-        self.ctx.effects.push(Effect::LobbyStarted { nbp, players });
-        self.with_state(Loading {
-            settings,
-            saved_state: None,
-        })
+    pub fn start(self, settings: FrozenSettings) -> Server<Loading> {
+        self.enter_loading(settings)
     }
 
     pub fn start_savegame(self, settings_json: Vec<u8>) -> Server<AwaitSavegame> {
@@ -1605,11 +1925,11 @@ impl Server<Setup> {
             return self.into();
         };
         match msg {
-            WireMessage::StartSettings(m) => {
-                if let Some(settings) = self.on_start_settings(peer, m) {
-                    return self.start(settings).into();
-                }
-            }
+            WireMessage::StartSettings(m) => match self.on_start_settings(peer, m) {
+                Some(StartOutcome::Started(settings)) => return self.start(settings).into(),
+                Some(StartOutcome::AwaitAiHost(held)) => return self.with_state(held).into(),
+                None => {}
+            },
             WireMessage::StartSavegameSettings(m) => {
                 if let Some(json) = self.on_start_savegame_settings(peer, m) {
                     return self.start_savegame(json).into();
@@ -1621,7 +1941,7 @@ impl Server<Setup> {
     }
 
     // None means the start was rejected or ignored and nothing was sent.
-    fn on_start_settings(&mut self, peer: PeerID, msg: StartSettings) -> Option<FrozenSettings> {
+    fn on_start_settings(&mut self, peer: PeerID, msg: StartSettings) -> Option<StartOutcome> {
         if self.ctx.require_controller(peer).is_err() {
             return None;
         }
@@ -1633,52 +1953,37 @@ impl Server<Setup> {
             return None;
         }
 
-        let settings = FrozenSettings {
-            cheats_enabled: cheats_enabled(&msg.init_attributes),
-            json: msg.init_attributes.clone(),
-            turn_length_ms: self.ctx.config.turn_length_ms,
+        let split = if self.ctx.config.hosted_ai {
+            split_ai_settings(&msg.init_attributes)
+        } else {
+            None
+        };
+        let Some(split) = split else {
+            let settings = self.freeze(&msg.init_attributes);
+            self.begin_match(msg, None);
+            return Some(StartOutcome::Started(settings));
         };
 
-        // The clients observe these three in exactly this order.
-        let stale: Vec<PeerID> = self
-            .ctx
-            .sessions
-            .iter()
-            .filter(|(_, s)| s.is_unauthenticated())
-            .map(|(p, _)| *p)
-            .collect();
-        for peer in stale {
-            self.disconnect(peer, DisconnectReason::ServerLoading);
-        }
-
-        self.broadcast_player_slots();
-
-        let relayed = WireMessage::StartSettings(msg);
-        self.ctx.broadcast(&relayed, |s| s.is_setup());
-
-        // From here on every session that was in setup counts for turn
-        // release, and owes a seal for turn 4 and a hash for turn 1.
-        let starting: Vec<(PeerID, u16, Guid)> = self
-            .ctx
-            .sessions
-            .iter()
-            .filter(|(_, s)| s.is_setup())
-            .filter_map(|(p, s)| Some((*p, s.client_id()?, s.uuid.clone()?)))
-            .collect();
-        for (peer, client_id, uuid) in starting {
-            let observer = self.ctx.is_observer(&uuid);
-            let delayed = self.ctx.is_delayed_observer(&uuid);
-            self.ctx.turns.register(
-                peer,
-                client_id,
-                INITIAL_READY_TURN,
-                FIRST_SIMULATED_TURN,
-                observer,
-                delayed,
-            );
-        }
-
-        Some(settings)
+        // The start goes out only once the AI host is in, so that it loads
+        // with everyone else and holds its place in turn release from turn 1.
+        tracing::info!(ai_players = ?split.players, "sidecar: holding start for the AI host");
+        let settings = self.freeze(&split.stock);
+        self.ctx.ai_host = Some(AiHost {
+            peer: None,
+            players: split.players,
+        });
+        let name = self.ctx.ai_host_name.clone();
+        self.ctx.effects.push(Effect::SpawnAiHost { name });
+        Some(StartOutcome::AwaitAiHost(AwaitAiHost {
+            settings,
+            start: StartSettings {
+                init_attributes: split.stock,
+            },
+            ai_host_start: StartSettings {
+                init_attributes: split.ai_host,
+            },
+            requested_at: None,
+        }))
     }
 
     // Not implemented: the saved-game flow would be "controller only, request
@@ -1736,6 +2041,93 @@ impl Server<AwaitSavegame> {
 
     fn on_savegame_complete(&mut self, _peer: PeerID) -> FrozenSettings {
         todo!("freeze settings, relay START_SAVEGAME_SETTINGS to setup sessions")
+    }
+}
+
+impl Server<AwaitAiHost> {
+    fn on_input(mut self, input: Input) -> AnyServer {
+        match input {
+            Input::Received { peer, msg } => self.on_message(peer, msg),
+            Input::AiHostExited => self.refuse_start("the AI host process exited").into(),
+            Input::Tick { now, stats } => {
+                self.on_tick(now, stats);
+                if self.admit_timed_out(now) {
+                    return self
+                        .refuse_start("the AI host was not admitted in time")
+                        .into();
+                }
+                self.into()
+            }
+            Input::Disconnected { peer } => {
+                self.on_disconnected(peer);
+                // Nobody would be left to take the match through loading.
+                let controller_present = self
+                    .ctx
+                    .controller
+                    .as_ref()
+                    .is_some_and(|c| self.ctx.peer_of(c).is_some());
+                if !controller_present {
+                    return self.refuse_start("the controller left").into();
+                }
+                self.into()
+            }
+            other => {
+                self.on_common_input(other);
+                self.into()
+            }
+        }
+    }
+
+    fn on_message(mut self, peer: PeerID, msg: WireMessage) -> AnyServer {
+        let Some(msg) = self.on_setup_message(peer, msg) else {
+            return self.into();
+        };
+        match msg {
+            WireMessage::StartSettings(_) | WireMessage::StartSavegameSettings(_) => {
+                tracing::debug!(?peer, "start ignored: a start is already held");
+            }
+            WireMessage::Authenticate(m) => {
+                self.on_common_message(peer, WireMessage::Authenticate(m));
+                if self.ctx.ai_host.as_ref().is_some_and(|h| h.peer.is_some()) {
+                    return self.ai_host_admitted().into();
+                }
+            }
+            other => self.on_common_message(peer, other),
+        }
+        self.into()
+    }
+
+    // Rebuilt as Setup only to borrow its start path: no input is handled in
+    // between, so nothing can observe the intermediate phase.
+    fn ai_host_admitted(self) -> Server<Loading> {
+        let Server { ctx, st } = self;
+        let mut server = Server { ctx, st: Setup };
+        server.begin_match(st.start, Some(st.ai_host_start));
+        server.enter_loading(st.settings)
+    }
+
+    // A negative delta re-anchors rather than firing early (A7).
+    fn admit_timed_out(&mut self, now: DateTime<Utc>) -> bool {
+        let anchor = *self.st.requested_at.get_or_insert(now);
+        let elapsed = now.signed_duration_since(anchor);
+        if elapsed < TimeDelta::zero() {
+            self.st.requested_at = Some(now);
+            return false;
+        }
+        elapsed >= AI_HOST_ADMIT_TIMEOUT
+    }
+
+    // Nothing of the start has reached any client yet, so going back to setup
+    // is enough; the chat line is what tells the controller to try again.
+    fn refuse_start(mut self, why: &str) -> Server<Setup> {
+        tracing::warn!(why, "sidecar: hosted-AI start refused");
+        self.ctx.ai_host = None;
+        self.ctx.effects.push(Effect::StopAiHost);
+        self.ctx.server_chat(
+            None,
+            "The AI host failed to start; the game was not started.",
+        );
+        self.with_state(Setup)
     }
 }
 
@@ -1836,6 +2228,7 @@ impl Server<InGame> {
     fn on_input(mut self, input: Input) -> AnyServer {
         match input {
             Input::Received { peer, msg } => self.on_message(peer, msg),
+            Input::StateDumped { id, state } => self.on_state_dumped(id, state),
             other => self.on_common_input(other),
         }
         self.into()
@@ -1864,31 +2257,91 @@ impl Server<InGame> {
     // A completed snapshot is what unblocks the joiner that asked for it.
     fn on_snapshot_chunk(&mut self, peer: PeerID, msg: GamestateChunk) -> Result<(), PeerFault> {
         if let Some(TransferDone::JoinSnapshot { joiner }) = self.on_gamestate_chunk(peer, msg)? {
-            let join = Join {
-                init_attributes: self.st.settings.json.clone(),
+            // The snapshot cannot be past the last turn its source was
+            // sealed, so a delayed joiner waits until the feed reaches that
+            // turn before it sees anything.
+            let bound = if self.ctx.turns.is_delayed(peer) {
+                self.ctx.feed.head()
+            } else {
+                self.ctx.turns.ready_turn()
             };
-            let joiner_delayed = self
-                .ctx
-                .uuid_of(joiner)
-                .is_some_and(|u| self.ctx.is_delayed_observer(&u));
-            let snapshot = self.ctx.join_snapshot.clone();
-            match snapshot {
-                Some(snapshot) if joiner_delayed => {
-                    // The snapshot cannot be past the last turn its source
-                    // was sealed, so once the feed reaches that turn it shows
-                    // the joiner nothing a delayed observer may not see.
-                    let bound = if self.ctx.turns.is_delayed(peer) {
-                        self.ctx.feed.head()
-                    } else {
-                        self.ctx.turns.ready_turn()
-                    };
-                    self.ctx.feed.hold_join(joiner, bound, join, snapshot);
-                    self.ctx.advance_feed();
-                }
-                _ => self.ctx.send(joiner, WireMessage::Join(join)),
-            }
+            let Some(snapshot) = self.ctx.join_snapshot.clone() else {
+                return Ok(());
+            };
+            self.deliver_snapshot(joiner, snapshot, bound);
         }
         Ok(())
+    }
+
+    // Hands a snapshot to one joiner: a delayed joiner waits on the feed
+    // until its state is due, everyone else loads straight away. A live
+    // joiner downloads from the shared cache, so its snapshot always goes
+    // there, even one older than live: any snapshot turn is valid, because
+    // the join replay catches the joiner up from wherever it loads.
+    fn deliver_snapshot(&mut self, joiner: PeerID, snapshot: Arc<Vec<u8>>, bound: u32) {
+        let join = Join {
+            init_attributes: self.st.settings.json.clone(),
+        };
+        let joiner_delayed = self
+            .ctx
+            .uuid_of(joiner)
+            .is_some_and(|u| self.ctx.is_delayed_observer(&u));
+        if joiner_delayed {
+            self.ctx.feed.hold_join(joiner, bound, join, snapshot);
+            self.ctx.advance_feed();
+        } else {
+            self.ctx.join_snapshot = Some(snapshot);
+            self.ctx.send(joiner, WireMessage::Join(join));
+        }
+    }
+
+    fn on_state_dumped(&mut self, id: u32, state: Option<Vec<u8>>) {
+        // A reply from a cancelled run carries its old id and is dropped, so
+        // it can never be credited to the newer run waiting behind it.
+        if self.ctx.dump.as_ref().is_none_or(|dump| dump.id != id) {
+            return;
+        }
+        let dump = self.ctx.dump.take().expect("dump was just checked");
+        let turn = dump.turn;
+        let waiting = dump.waiting;
+        match state {
+            Some(bytes) => {
+                tracing::info!(turn, joiners = waiting.len(), "sidecar: state dump ready");
+                let snapshot = Arc::new(bytes);
+                for joiner in waiting {
+                    let still_syncing = self
+                        .ctx
+                        .sessions
+                        .get(&joiner)
+                        .is_some_and(|s| s.is_syncing());
+                    if still_syncing {
+                        self.deliver_snapshot(joiner, snapshot.clone(), turn);
+                    }
+                }
+            }
+            None => {
+                for joiner in waiting {
+                    let Some(session) = self.ctx.sessions.get(&joiner) else {
+                        continue;
+                    };
+                    if !session.is_syncing() {
+                        continue;
+                    }
+                    let delayed = session
+                        .uuid
+                        .clone()
+                        .is_some_and(|u| self.ctx.is_delayed_observer(&u));
+                    if delayed {
+                        // A failed dump falls back to a live client rather
+                        // than dropping the observer outright.
+                        self.start_snapshot_fetch(joiner, false);
+                    } else {
+                        self.ctx
+                            .disconnect(joiner, DisconnectReason::MatchInProgress);
+                    }
+                }
+            }
+        }
     }
 
     fn on_joined(&mut self, peer: PeerID, _msg: Joined) -> Result<(), PeerFault> {
@@ -1986,7 +2439,13 @@ impl Server<InGame> {
             // An observer holds a slot-table entry but owns no player, so a
             // command claiming player -1 must not be allowed to match it.
             let slot = self.ctx.slots.slot_of(&uuid).filter(|s| *s != UNASSIGNED);
-            if slot.map(i32::from) != Some(msg.player) {
+            let ai_player = self.ctx.is_ai_host(peer)
+                && self
+                    .ctx
+                    .ai_host
+                    .as_ref()
+                    .is_some_and(|h| h.players.contains(&msg.player));
+            if slot.map(i32::from) != Some(msg.player) && !ai_player {
                 // Silently, because a cheat attempt is not worth a disconnect.
                 tracing::debug!(?peer, slot = ?slot, claimed = msg.player, "command slot mismatch");
                 return Ok(());
@@ -2145,4 +2604,71 @@ fn cheats_enabled(json: &[u8]) -> bool {
         .take(4)
         .collect();
     value.starts_with(b"true")
+}
+
+// What START_SETTINGS becomes when a match has AI slots: every stock client
+// gets `stock` and the AI host gets `ai_host`.
+struct AiSettingsSplit {
+    stock: Vec<u8>,
+    ai_host: Vec<u8>,
+    players: HashSet<i32>,
+}
+
+enum StartOutcome {
+    Started(FrozenSettings),
+    AwaitAiHost(AwaitAiHost),
+}
+
+// None when there is no AI slot, or the settings cannot be read, in which
+// case the match starts the stock way with every client running its own AI.
+//
+// The AI slots are stripped from what stock clients receive: a client that
+// sees a slot as AI computes it locally and flags the player as AI, and that
+// flag changes how commands are processed, so it has to read the same on
+// every client. The map is also forced explored, because an unflagged AI no
+// longer skips the fog check when it places buildings, and it has no
+// scouting of its own to explore with. The AI host keeps the AI fields so it
+// still registers the bots.
+fn split_ai_settings(json: &[u8]) -> Option<AiSettingsSplit> {
+    let mut attribs: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let settings = attribs.get_mut("settings")?.as_object_mut()?;
+    // A PlayerData index is the player id, index 0 being gaia.
+    let players: HashSet<i32> = settings
+        .get("PlayerData")?
+        .as_array()?
+        .iter()
+        .enumerate()
+        .filter(|(_, pd)| {
+            pd.get("AI")
+                .and_then(|ai| ai.as_str())
+                .is_some_and(|ai| !ai.is_empty())
+        })
+        .map(|(i, _)| i as i32)
+        .collect();
+    if players.is_empty() {
+        return None;
+    }
+    settings.insert("ExploreMap".to_string(), serde_json::Value::Bool(true));
+    let ai_host = serde_json::to_vec(&attribs).ok()?;
+
+    let player_data = attribs
+        .get_mut("settings")?
+        .get_mut("PlayerData")?
+        .as_array_mut()?;
+    for &player in &players {
+        if let Some(slot) = player_data
+            .get_mut(player as usize)
+            .and_then(|pd| pd.as_object_mut())
+        {
+            for field in AI_FIELDS {
+                slot.remove(field);
+            }
+        }
+    }
+    let stock = serde_json::to_vec(&attribs).ok()?;
+    Some(AiSettingsSplit {
+        stock,
+        ai_host,
+        players,
+    })
 }
