@@ -12,10 +12,12 @@ use std::thread::JoinHandle;
 
 use uuid::Uuid;
 
+use crate::lobby::link::LobbyLink;
 use crate::network_message::InboundNetworkMessage;
 use crate::network_message::OutboundNetworkMessage;
 use crate::relay::enet_task::run_enet_host;
 use crate::relay::game_server::run_game_server;
+use crate::relay::server_fsm::Config;
 
 // A 100-port window above the default port lets one process host several games
 // without asking the operator for a range.
@@ -33,6 +35,9 @@ impl std::fmt::Display for GameId {
 pub struct GameConfig {
     // None takes the first free port in the pool's range.
     pub port: Option<u16>,
+    pub server: Config,
+    // None in standalone mode; Some when a lobby account is hosting this game.
+    pub lobby: Option<LobbyLink>,
 }
 
 struct GameHandle {
@@ -69,7 +74,12 @@ impl GamePool {
     }
 
     pub fn create_game(&mut self, config: GameConfig) -> Result<(GameId, u16), String> {
-        let port = match config.port {
+        let GameConfig {
+            port,
+            server: server_config,
+            lobby,
+        } = config;
+        let port = match port {
             Some(port) => {
                 if self.used_ports.contains(&port) {
                     return Err(format!("port {port} is already in use"));
@@ -112,7 +122,13 @@ impl GamePool {
             let span = tracing::info_span!("game", game_id = %server_game_id, port);
             let _guard = span.entered();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_game_server(event_rx, send_tx, shutdown_requested_for_thread);
+                run_game_server(
+                    event_rx,
+                    send_tx,
+                    shutdown_requested_for_thread,
+                    server_config,
+                    lobby,
+                );
             }));
             if let Err(panic_payload) = result {
                 let message = panic_payload

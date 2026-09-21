@@ -134,6 +134,23 @@ pub enum Effect {
         peer: PeerID,
         reason: DisconnectReason,
     },
+    // Sec. 17.3: sent once a map is selected and again on any settings or
+    // player-slot change, while still in setup. Debounced and suppressed
+    // when unchanged, but that is the lobby layer's job, not the FSM's.
+    LobbyListing {
+        host_username: String,
+        nbp: u32,
+        players: String,
+    },
+    // Sec. 17.3: sent once, right after the last LobbyListing before a match
+    // starts.
+    LobbyStarted {
+        nbp: u32,
+        players: String,
+    },
+    // The idle-shutdown timeout elapsed (A7). The game thread reacts by
+    // shutting every session down and returning.
+    GameOver,
 }
 
 // Values travel as the ENet disconnect `data` word; only the number reaches the client.
@@ -187,6 +204,13 @@ pub struct Config {
     // value longer than any match anyone would play is how the policy is
     // turned off, so there is no second switch to keep in step with this one.
     pub pause_budget: TimeDelta,
+    // How long the game may sit with nobody ever having joined, or with
+    // everybody gone, before it shuts itself down. None means never, which is
+    // what keeps a standalone game running with nobody watching it.
+    pub idle_shutdown: Option<TimeDelta>,
+    // The hostme sender, used as the lobby listing's hostUsername until a
+    // controller with a name of its own is admitted.
+    pub lobby_host_name: String,
 }
 
 impl Default for Config {
@@ -210,6 +234,8 @@ impl Default for Config {
             server_name: "SERVER".to_string(),
             welcome_message: String::new(),
             pause_budget: pause_budget::DEFAULT_BUDGET,
+            idle_shutdown: None,
+            lobby_host_name: String::new(),
         }
     }
 }
@@ -248,6 +274,11 @@ pub(crate) struct Context {
     log: MatchLog,
     // Served to every joiner that asks, so it is shared rather than copied.
     join_snapshot: Option<Arc<Vec<u8>>>,
+    // Both fed only by Input::Tick.now (A2). created_at is set on the first
+    // tick; empty_since only once the game has held a player and lost every
+    // one again.
+    created_at: Option<DateTime<Utc>>,
+    empty_since: Option<DateTime<Utc>>,
     effects: Vec<Effect>,
 }
 
@@ -316,6 +347,32 @@ impl Context {
         });
         let msg = WireMessage::PlayerSlots(slots);
         self.broadcast(&msg, |s| s.is_setup() || s.is_syncing() || s.is_in_game());
+    }
+
+    // Sec. 17.3: nbp/players are the connected player slots, not sessions;
+    // an observer holds no slot and is never counted.
+    fn lobby_counts(&self) -> (u32, String) {
+        let names = self.slots.connected_player_names();
+        (names.len() as u32, names.join(", "))
+    }
+
+    // The controller's name once one is admitted, else the hostme sender
+    // that is standing in for it (Sec. 17.3's hostUsername).
+    fn lobby_host_username(&self) -> String {
+        self.controller
+            .as_ref()
+            .and_then(|c| self.name_of(c))
+            .unwrap_or_else(|| self.config.lobby_host_name.clone())
+    }
+
+    fn push_lobby_listing(&mut self) {
+        let (nbp, players) = self.lobby_counts();
+        let host_username = self.lobby_host_username();
+        self.effects.push(Effect::LobbyListing {
+            host_username,
+            nbp,
+            players,
+        });
     }
 
     // A line in the stock chat box, spoken by the relay itself. `to` is None
@@ -628,6 +685,24 @@ impl<S: PhaseMarker> Server<S> {
         }
     }
 
+    // Wraps the Context methods of the same name so a lobby listing update
+    // rides along whenever the slot table changes during setup (Sec. 17.3).
+    // Context itself cannot make that call: it is phase-erased by design
+    // (A2), so the decision has to be made here, where S::PHASE is known.
+    fn broadcast_player_slots(&mut self) {
+        self.ctx.broadcast_player_slots();
+        if S::PHASE == Phase::Setup {
+            self.ctx.push_lobby_listing();
+        }
+    }
+
+    fn disconnect(&mut self, peer: PeerID, reason: DisconnectReason) {
+        self.ctx.disconnect(peer, reason);
+        if S::PHASE == Phase::Setup {
+            self.ctx.push_lobby_listing();
+        }
+    }
+
     fn on_connected(&mut self, peer: PeerID, addr: Ipv4Addr) {
         // The ban is checked before anything else, so a banned address never
         // gets a session or a handshake.
@@ -671,7 +746,7 @@ impl<S: PhaseMarker> Server<S> {
             // Losing a session before admission has no further effect.
             if session.admitted.is_some() {
                 self.ctx.slots.mark_disconnected(uuid);
-                self.ctx.broadcast_player_slots();
+                self.broadcast_player_slots();
             }
         }
 
@@ -711,6 +786,11 @@ impl<S: PhaseMarker> Server<S> {
                 session.since_last_received = sample.since_last_received;
             }
         }
+
+        if self.idle_shutdown_due(now) {
+            self.ctx.effects.push(Effect::GameOver);
+        }
+
         // Before the warning gate, on its own anchor: the budget is charged
         // from the elapsed it works out itself, so it neither depends on nor
         // disturbs the once-a-second warning cadence.
@@ -759,6 +839,42 @@ impl<S: PhaseMarker> Server<S> {
                 s.is_in_game() || (in_setup && s.is_setup())
             });
         }
+    }
+
+    // GameOver fires once in either case: nobody has ever been admitted
+    // within the timeout of creation, or nobody admitted has been present for
+    // the timeout. A negative delta re-anchors instead of firing early or
+    // stalling (A7): a wall-clock step backwards just restarts the wait.
+    fn idle_shutdown_due(&mut self, now: DateTime<Utc>) -> bool {
+        let Some(timeout) = self.ctx.config.idle_shutdown else {
+            return false;
+        };
+
+        let created_at = *self.ctx.created_at.get_or_insert(now);
+        let ever_admitted = self.ctx.next_client_id > 1;
+        let anyone_admitted = self.ctx.sessions.values().any(|s| s.admitted.is_some());
+
+        if anyone_admitted {
+            self.ctx.empty_since = None;
+            return false;
+        }
+
+        let anchor = if ever_admitted {
+            *self.ctx.empty_since.get_or_insert(now)
+        } else {
+            created_at
+        };
+
+        let elapsed = now.signed_duration_since(anchor);
+        if elapsed < TimeDelta::zero() {
+            if ever_admitted {
+                self.ctx.empty_since = Some(now);
+            } else {
+                self.ctx.created_at = Some(now);
+            }
+            return false;
+        }
+        elapsed >= timeout
     }
 
     fn on_budget_event(&mut self, event: BudgetEvent) {
@@ -824,7 +940,7 @@ impl<S: PhaseMarker> Server<S> {
         }
 
         let Some(uuid) = self.issue_uuid() else {
-            self.ctx.disconnect(peer, DisconnectReason::NoUuid);
+            self.disconnect(peer, DisconnectReason::NoUuid);
             return Ok(());
         };
         if let Some(session) = self.ctx.sessions.get_mut(&peer) {
@@ -884,14 +1000,14 @@ impl<S: PhaseMarker> Server<S> {
         let sanitized = auth::sanitize(&msg.name);
 
         if S::PHASE == Phase::Loading {
-            self.ctx.disconnect(peer, DisconnectReason::ServerLoading);
+            self.disconnect(peer, DisconnectReason::ServerLoading);
             return Ok(());
         }
 
         if self.ctx.config.lobby_mode {
             let expected = lobby_name.unwrap_or_default().to_lowercase();
             if auth::suffix_stripped(&sanitized).to_lowercase() != expected {
-                self.ctx.disconnect(peer, DisconnectReason::LobbyAuthFailed);
+                self.disconnect(peer, DisconnectReason::LobbyAuthFailed);
                 return Ok(());
             }
         }
@@ -901,7 +1017,7 @@ impl<S: PhaseMarker> Server<S> {
         // what a client with no password sends.
         let expected = password::hash(&self.ctx.config.server_password_hash, msg.name.as_bytes());
         if expected != msg.password {
-            self.ctx.disconnect(peer, DisconnectReason::Refused);
+            self.disconnect(peer, DisconnectReason::Refused);
             return Ok(());
         }
 
@@ -909,7 +1025,7 @@ impl<S: PhaseMarker> Server<S> {
         // claims it would put two identically named rows in the slot list.
         // Refused as a name collision, which is what it is.
         if auth::reserved(&sanitized) {
-            self.ctx.disconnect(peer, DisconnectReason::NameInUse);
+            self.disconnect(peer, DisconnectReason::NameInUse);
             return Ok(());
         }
 
@@ -927,7 +1043,7 @@ impl<S: PhaseMarker> Server<S> {
                 .values()
                 .any(|s| s.name() == Some(sanitized.as_str()))
             {
-                self.ctx.disconnect(peer, DisconnectReason::NameInUse);
+                self.disconnect(peer, DisconnectReason::NameInUse);
                 return Ok(());
             }
             sanitized
@@ -939,14 +1055,14 @@ impl<S: PhaseMarker> Server<S> {
             name.as_str()
         };
         if self.ctx.banned_names.contains(ban_key) {
-            self.ctx.disconnect(peer, DisconnectReason::Banned);
+            self.disconnect(peer, DisconnectReason::Banned);
             return Ok(());
         }
 
         let joining = match self.admit(&name) {
             Ok(joining) => joining,
             Err(reason) => {
-                self.ctx.disconnect(peer, reason);
+                self.disconnect(peer, reason);
                 return Ok(());
             }
         };
@@ -1053,7 +1169,7 @@ impl<S: PhaseMarker> Server<S> {
         if let Some(old) = displaced {
             self.ctx.pause_budget.inherit(&old, &uuid);
         }
-        self.ctx.broadcast_player_slots();
+        self.broadcast_player_slots();
 
         // After the slot broadcast, so the name behind the sender UUID is
         // already known to the client when the line arrives.
@@ -1155,7 +1271,7 @@ impl<S: PhaseMarker> Server<S> {
         } else {
             DisconnectReason::Kicked
         };
-        self.ctx.disconnect(target, reason);
+        self.disconnect(target, reason);
 
         let relayed = WireMessage::Kicked(msg);
         self.ctx.broadcast(&relayed, |s| {
@@ -1284,7 +1400,7 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
     fn on_reset_pregame_status(&mut self, peer: PeerID) -> Result<(), PeerFault> {
         self.ctx.require_controller(peer)?;
         self.ctx.slots.reset_pregame();
-        self.ctx.broadcast_player_slots();
+        self.broadcast_player_slots();
         Ok(())
     }
 
@@ -1304,7 +1420,7 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
     ) -> Result<(), PeerFault> {
         self.ctx.require_controller(peer)?;
         self.ctx.slots.assign(msg.player_id, &msg.guid);
-        self.ctx.broadcast_player_slots();
+        self.broadcast_player_slots();
         Ok(())
     }
 
@@ -1345,6 +1461,8 @@ impl Server<Idle> {
                 turns: TurnManager::default(),
                 log: MatchLog::default(),
                 join_snapshot: None,
+                created_at: None,
+                empty_since: None,
                 effects: Vec::new(),
             },
             st: Idle,
@@ -1363,7 +1481,12 @@ impl Server<Idle> {
 }
 
 impl Server<Setup> {
-    pub fn start(self, settings: FrozenSettings) -> Server<Loading> {
+    pub fn start(mut self, settings: FrozenSettings) -> Server<Loading> {
+        // The last listing update the match ever gets: Sec. 17.3 wants
+        // register followed by changestate, and register already went out
+        // from the broadcast_player_slots call in on_start_settings.
+        let (nbp, players) = self.ctx.lobby_counts();
+        self.ctx.effects.push(Effect::LobbyStarted { nbp, players });
         self.with_state(Loading {
             settings,
             saved_state: None,
@@ -1432,10 +1555,10 @@ impl Server<Setup> {
             .map(|(p, _)| *p)
             .collect();
         for peer in stale {
-            self.ctx.disconnect(peer, DisconnectReason::ServerLoading);
+            self.disconnect(peer, DisconnectReason::ServerLoading);
         }
 
-        self.ctx.broadcast_player_slots();
+        self.broadcast_player_slots();
 
         let relayed = WireMessage::StartSettings(msg);
         self.ctx.broadcast(&relayed, |s| s.is_setup());

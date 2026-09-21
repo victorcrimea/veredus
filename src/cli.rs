@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 
 use clap::Parser;
 
@@ -15,12 +16,26 @@ struct Args {
     /// Bind address
     #[arg(long, default_value = DEFAULT_HOST)]
     host: IpAddr,
-    /// Listen port
+    /// Listen port (standalone mode only; a lobby-config game picks its own)
     #[arg(long, default_value_t = DEFAULT_PORT)]
     port: u16,
+    /// Path to a pooled-account lobby config; when set, runs pool-lobby mode
+    /// instead of standalone
+    #[arg(long)]
+    lobby_config: Option<PathBuf>,
 }
 
-pub fn parse_args() -> (IpAddr, u16) {
+pub struct RunMode {
+    pub host: IpAddr,
+    pub port: u16,
+    pub lobby_config: Option<PathBuf>,
+}
+
+pub fn parse_args() -> RunMode {
     let args = Args::parse();
-    (args.host, args.port)
+    RunMode {
+        host: args.host,
+        port: args.port,
+        lobby_config: args.lobby_config,
+    }
 }

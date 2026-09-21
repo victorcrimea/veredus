@@ -49,6 +49,20 @@ fn clone_effect(effect: &Effect) -> Effect {
             peer: *peer,
             reason: *reason,
         },
+        Effect::LobbyListing {
+            host_username,
+            nbp,
+            players,
+        } => Effect::LobbyListing {
+            host_username: host_username.clone(),
+            nbp: *nbp,
+            players: players.clone(),
+        },
+        Effect::LobbyStarted { nbp, players } => Effect::LobbyStarted {
+            nbp: *nbp,
+            players: players.clone(),
+        },
+        Effect::GameOver => Effect::GameOver,
     }
 }
 

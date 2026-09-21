@@ -138,6 +138,16 @@ impl Slots {
         self.entries.iter().any(|e| !e.connected && e.name == name)
     }
 
+    // The nbp/players pair a lobby game listing reports (PROTOCOL.md Sec.
+    // 17.3): connected slots with a player id, an observer holding none.
+    pub fn connected_player_names(&self) -> Vec<&str> {
+        self.entries
+            .iter()
+            .filter(|e| e.connected && e.slot != UNASSIGNED)
+            .map(|e| e.name.as_str())
+            .collect()
+    }
+
     // Connected entries only, ordered by UUID string as the clients expect.
     pub fn to_message(&self) -> PlayerSlots {
         let mut hosts: Vec<&PlayerSlot> = self.entries.iter().filter(|e| e.connected).collect();

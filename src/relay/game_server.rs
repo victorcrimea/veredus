@@ -14,6 +14,9 @@ use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
 
+use crate::lobby::link::GameToLobby;
+use crate::lobby::link::LobbyAuthToken;
+use crate::lobby::link::LobbyLink;
 use crate::network_message::InboundNetworkMessage;
 use crate::network_message::OutboundNetworkMessage;
 use crate::relay::messages::WireMessage;
@@ -32,21 +35,44 @@ const TICK_INTERVAL: TimeDelta = TimeDelta::milliseconds(100);
 
 // The ENet thread feeds decoded events in over `event_rx` and takes effects out
 // over `send_tx`. Every clock read lives here, on the IO side, so the FSM
-// itself stays a pure function of the inputs it is handed.
+// itself stays a pure function of the inputs it is handed. `lobby` is None in
+// standalone mode; when present, its `auth_rx` half feeds Input::LobbyAuth and
+// its `events_tx` half is where lobby-listing effects go.
 pub fn run_game_server(
     event_rx: Receiver<InboundNetworkMessage>,
     send_tx: Sender<OutboundNetworkMessage>,
     shutdown_requested: Arc<AtomicBool>,
+    config: Config,
+    lobby: Option<LobbyLink>,
 ) {
     // Parked in the listening state, which is the phase a relay spends its
     // whole idle life in.
-    let mut server = Some(AnyServer::from(
-        Server::<Idle>::new(Config::default()).listen(),
-    ));
+    let mut server = Some(AnyServer::from(Server::<Idle>::new(config).listen()));
     let mut latest_stats: Vec<PeerStats> = Vec::new();
     let mut last_tick: DateTime<Utc> = Utc::now();
 
     loop {
+        // Drained before the ENet events, so a lobby-auth prompt is queued
+        // ahead of the AUTHENTICATE it is meant to precede.
+        if let Some(lobby) = &lobby {
+            loop {
+                match lobby.auth_rx.try_recv() {
+                    Ok(LobbyAuthToken { username, token }) => {
+                        server = Some(
+                            server
+                                .take()
+                                .expect("server is always present")
+                                .handle(Input::LobbyAuth { username, token }),
+                        );
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    // The account was released or the lobby side is gone; the
+                    // game keeps running, just with no more auth prompts.
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+
         loop {
             match event_rx.try_recv() {
                 Ok(message) => {
@@ -89,16 +115,23 @@ pub fn run_game_server(
             );
         }
 
-        if let Some(current) = server.as_mut()
-            && !drain(current.take_effects(), &send_tx)
-        {
-            return;
+        if let Some(current) = server.as_mut() {
+            let outcome = drain(current.take_effects(), &send_tx, lobby.as_ref());
+            if !outcome.channel_ok {
+                return;
+            }
+            if outcome.game_over {
+                tracing::info!("idle-shutdown timeout elapsed, ending game");
+                let effects = server.take().expect("server is always present").shutdown();
+                drain(effects, &send_tx, lobby.as_ref());
+                return;
+            }
         }
 
         if shutdown_requested.load(Ordering::SeqCst) {
             tracing::info!("shutdown requested, dropping every peer");
             let effects = server.take().expect("server is always present").shutdown();
-            drain(effects, &send_tx);
+            drain(effects, &send_tx, lobby.as_ref());
             return;
         }
 
@@ -137,8 +170,22 @@ fn to_input(message: InboundNetworkMessage, latest_stats: &mut Vec<PeerStats>) -
     }
 }
 
-// Returns false once the ENet thread is gone and there is nothing left to send to.
-fn drain(effects: Vec<Effect>, send_tx: &Sender<OutboundNetworkMessage>) -> bool {
+struct DrainOutcome {
+    // False once the ENet thread is gone and there is nothing left to send to.
+    channel_ok: bool,
+    game_over: bool,
+}
+
+fn drain(
+    effects: Vec<Effect>,
+    send_tx: &Sender<OutboundNetworkMessage>,
+    lobby: Option<&LobbyLink>,
+) -> DrainOutcome {
+    let mut outcome = DrainOutcome {
+        channel_ok: true,
+        game_over: false,
+    };
+
     for effect in effects {
         let outbound = match effect {
             Effect::Send { peer, msg } => OutboundNetworkMessage::Message {
@@ -153,11 +200,37 @@ fn drain(effects: Vec<Effect>, send_tx: &Sender<OutboundNetworkMessage>) -> bool
                 peer,
                 reason: reason as u32,
             },
+            Effect::LobbyListing {
+                host_username,
+                nbp,
+                players,
+            } => {
+                if let Some(lobby) = lobby {
+                    let _ = lobby.events_tx.send(GameToLobby::Listing {
+                        host_username,
+                        nbp,
+                        players,
+                    });
+                }
+                continue;
+            }
+            Effect::LobbyStarted { nbp, players } => {
+                if let Some(lobby) = lobby {
+                    let _ = lobby.events_tx.send(GameToLobby::Started { nbp, players });
+                }
+                continue;
+            }
+            Effect::GameOver => {
+                outcome.game_over = true;
+                continue;
+            }
         };
         if send_tx.send(outbound).is_err() {
             tracing::info!("ENet send channel closed, shutting down");
-            return false;
+            outcome.channel_ok = false;
+            return outcome;
         }
     }
-    true
+
+    outcome
 }
