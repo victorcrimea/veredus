@@ -278,7 +278,8 @@ pub struct Config {
     // which is the only thing direct-IP clients can join.
     pub server_password_hash: String,
     // Empty means the first client to authenticate becomes controller, because
-    // that is the secret every stock client sends.
+    // that is the secret every stock client sends. In lobby mode that client
+    // must also be lobby_host_name.
     pub controller_secret: String,
     pub allow_duplicate_names: bool,
     pub late_observer_policy: LateObserverPolicy,
@@ -313,7 +314,9 @@ pub struct Config {
     // what keeps a standalone game running with nobody watching it.
     pub idle_shutdown: Option<TimeDelta>,
     // The hostme sender, used as the lobby listing's hostUsername until a
-    // controller with a name of its own is admitted.
+    // controller with a name of its own is admitted. In lobby mode it is also
+    // the only account that may become controller, since a stock client has
+    // no secret to prove it is the host with.
     pub lobby_host_name: String,
     // When set, a joiner no live client can serve gets its snapshot from a
     // one-shot pyrogenesis instead of being dropped, and a match that ran is
@@ -1775,10 +1778,23 @@ impl<S: PhaseMarker> Server<S> {
         let client_id = self.ctx.next_client_id;
         self.ctx.next_client_id = self.ctx.next_client_id.saturating_add(1);
 
+        // In lobby mode the listing is public before the hostme sender has
+        // joined, so first-joiner would hand their game to whoever is fastest.
+        // The lobby name is verified by the lobby, unlike a typed one.
+        let is_host = !self.ctx.config.lobby_mode
+            || self
+                .ctx
+                .sessions
+                .get(&peer)
+                .and_then(|s| s.lobby_name.as_deref())
+                .is_some_and(|n| {
+                    n.to_lowercase() == self.ctx.config.lobby_host_name.to_lowercase()
+                });
         // The controller flag only ever reaches a client here; there is no
         // message that promotes an already-connected one.
         let is_controller = self.ctx.controller.is_none()
             && controller_secret == self.ctx.config.controller_secret
+            && is_host
             && !self.ctx.is_ai_host(peer);
         if is_controller {
             self.ctx.controller = Some(uuid.clone());
