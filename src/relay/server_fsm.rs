@@ -440,8 +440,6 @@ pub(crate) struct Context {
     turns: TurnManager,
     log: MatchLog,
     feed: ObserverFeed,
-    // Served to every joiner that asks, so it is shared rather than copied.
-    join_snapshot: Option<Arc<Vec<u8>>>,
     // The one in-flight state dump, if any. One run at a time bounds how many
     // engine processes a game can accumulate, and joiners asking together
     // share its cost.
@@ -535,11 +533,12 @@ impl CheckpointChain {
     }
 }
 
-// What a completed inbound transfer was for. The payload of a join snapshot
-// is cached here; only the savegame bytes travel back out, because that is
-// what drives a phase transition.
+// What a completed inbound transfer was for, with its payload.
 pub(crate) enum TransferDone {
-    JoinSnapshot { joiner: PeerID },
+    JoinSnapshot {
+        joiner: PeerID,
+        snapshot: Arc<Vec<u8>>,
+    },
     Savegame(Vec<u8>),
 }
 
@@ -848,7 +847,8 @@ impl Context {
         for flare in self.feed.due_flares() {
             self.broadcast_delayed(&WireMessage::Flare(flare));
         }
-        for (joiner, join) in self.feed.due_joins() {
+        for (joiner, join, snapshot) in self.feed.due_joins() {
+            self.transfers.grant(joiner, snapshot);
             self.send(joiner, WireMessage::Join(join));
         }
     }
@@ -1960,11 +1960,20 @@ impl<S: PhaseMarker> Server<S> {
     }
 
     // Hands a snapshot to one joiner: a delayed joiner waits on the feed
-    // until its state is due, everyone else loads straight away. A live
-    // joiner downloads from the shared cache, so its snapshot always goes
-    // there, even one older than live: any snapshot turn is valid, because
-    // the join replay catches the joiner up from wherever it loads.
+    // until its state is due, everyone else loads straight away, even from
+    // a snapshot older than live: any snapshot turn is valid, because the
+    // join replay catches the joiner up from wherever it loads.
     fn deliver_snapshot(&mut self, joiner: PeerID, snapshot: Arc<Vec<u8>>, bound: u32) {
+        // A joiner that left while its snapshot was fetched must not leave a
+        // grant behind for whichever peer is handed its id next.
+        if !self
+            .ctx
+            .sessions
+            .get(&joiner)
+            .is_some_and(Session::is_syncing)
+        {
+            return;
+        }
         let Some(settings) = self.st.settings() else {
             return;
         };
@@ -1979,7 +1988,7 @@ impl<S: PhaseMarker> Server<S> {
             self.ctx.feed.hold_join(joiner, bound, join, snapshot);
             self.ctx.advance_feed();
         } else {
-            self.ctx.join_snapshot = Some(snapshot);
+            self.ctx.transfers.grant(joiner, snapshot);
             self.ctx.send(joiner, WireMessage::Join(join));
         }
     }
@@ -2057,12 +2066,17 @@ impl<S: PhaseMarker> Server<S> {
         peer: PeerID,
         msg: GamestateRequest,
     ) -> Result<(), PeerFault> {
+        // Only a joiner may download state, and only what its own JOIN
+        // granted: anyone else asking is after the match state of a game it
+        // never authenticated to, or state newer than its delay allows.
+        self.ctx.speaker(peer, Session::is_syncing)?;
         let data = match msg.request_type {
-            KIND_RUNNING_GAME => self
-                .ctx
-                .feed
-                .snapshot_for(peer)
-                .or_else(|| self.ctx.join_snapshot.clone()),
+            KIND_RUNNING_GAME => Some(
+                self.ctx
+                    .transfers
+                    .take_grant(peer)
+                    .ok_or(PeerFault::WrongPhase)?,
+            ),
             KIND_SAVEGAME => {
                 // Savegame start is not implemented, so there is never a
                 // cached saved state to answer with.
@@ -2133,8 +2147,10 @@ impl<S: PhaseMarker> Server<S> {
             .on_chunk(peer, msg.request_id, &msg.data)?
         {
             Some((Purpose::JoinSnapshot { joiner }, bytes)) => {
-                self.ctx.join_snapshot = Some(Arc::new(bytes));
-                Ok(Some(TransferDone::JoinSnapshot { joiner }))
+                Ok(Some(TransferDone::JoinSnapshot {
+                    joiner,
+                    snapshot: Arc::new(bytes),
+                }))
             }
             Some((Purpose::Savegame, bytes)) => Ok(Some(TransferDone::Savegame(bytes))),
             None => Ok(None),
@@ -2336,7 +2352,6 @@ impl Server<Idle> {
                 turns: TurnManager::default(),
                 log: MatchLog::default(),
                 feed: ObserverFeed::new(delay),
-                join_snapshot: None,
                 dump: None,
                 next_dump_id: 0,
                 checkpoints: CheckpointChain::default(),
@@ -2914,7 +2929,9 @@ impl<S: MatchPhase> Server<S> {
 
     // A completed snapshot is what unblocks the joiner that asked for it.
     fn on_snapshot_chunk(&mut self, peer: PeerID, msg: GamestateChunk) -> Result<(), PeerFault> {
-        if let Some(TransferDone::JoinSnapshot { joiner }) = self.on_gamestate_chunk(peer, msg)? {
+        if let Some(TransferDone::JoinSnapshot { joiner, snapshot }) =
+            self.on_gamestate_chunk(peer, msg)?
+        {
             // The snapshot cannot be past the last turn its source was
             // sealed, so a delayed joiner waits until the feed reaches that
             // turn before it sees anything.
@@ -2922,9 +2939,6 @@ impl<S: MatchPhase> Server<S> {
                 self.ctx.feed.head()
             } else {
                 self.ctx.turns.ready_turn()
-            };
-            let Some(snapshot) = self.ctx.join_snapshot.clone() else {
-                return Ok(());
             };
             self.ctx.counters.join_from_client += 1;
             self.deliver_snapshot(joiner, snapshot, bound);

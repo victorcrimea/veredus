@@ -49,6 +49,10 @@ pub struct Transfers {
     // already says which side requested, so the two maps cannot collide.
     outgoing: HashMap<(PeerID, u32), Outgoing>,
     incoming: HashMap<(PeerID, u32), Incoming>,
+    // A peer may download only the snapshot its own JOIN was built for, and
+    // only once. Anything else would hand the match state to whoever asks,
+    // and let a delayed observer fetch state its feed has not reached yet.
+    granted: HashMap<PeerID, Arc<Vec<u8>>>,
 }
 
 impl Transfers {
@@ -66,6 +70,14 @@ impl Transfers {
                 buf: Vec::new(),
             },
         );
+    }
+
+    pub fn grant(&mut self, peer: PeerID, data: Arc<Vec<u8>>) {
+        self.granted.insert(peer, data);
+    }
+
+    pub fn take_grant(&mut self, peer: PeerID) -> Option<Arc<Vec<u8>>> {
+        self.granted.remove(&peer)
     }
 
     // Returns the chunks that fit the window straight away; an empty payload
@@ -179,9 +191,11 @@ impl Transfers {
         Ok(Some((rx.purpose, rx.buf)))
     }
 
-    // A departing peer takes both directions of its transfers with it.
+    // A departing peer takes both directions of its transfers, and any
+    // download it was granted, with it.
     pub fn forget(&mut self, peer: PeerID) {
         self.outgoing.retain(|(p, _), _| *p != peer);
         self.incoming.retain(|(p, _), _| *p != peer);
+        self.granted.remove(&peer);
     }
 }

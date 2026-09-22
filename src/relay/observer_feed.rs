@@ -38,11 +38,9 @@ struct HeldJoin {
     // taken. The snapshot's own turn is inside its compressed payload, which
     // stays opaque, but it cannot be past what its source was allowed to run.
     bound: u32,
-    // None once sent.
-    join: Option<Join>,
-    // Kept per joiner, because the shared join cache can be overwritten by a
-    // live snapshot while this one waits, and that would hand the joiner
-    // state it must not see yet, from a turn the feed has not reached.
+    join: Join,
+    // Held back with the JOIN, because a joiner that could download it
+    // earlier would see state from a turn the feed has not reached.
     snapshot: Arc<Vec<u8>>,
 }
 
@@ -91,23 +89,28 @@ impl ObserverFeed {
             joiner,
             HeldJoin {
                 bound,
-                join: Some(join),
+                join,
                 snapshot,
             },
         );
     }
 
-    pub fn due_joins(&mut self) -> Vec<(PeerID, Join)> {
+    // A released join leaves the feed together with its snapshot, which the
+    // caller grants to the joiner as it sends the JOIN.
+    pub fn due_joins(&mut self) -> Vec<(PeerID, Join, Arc<Vec<u8>>)> {
         let head = self.head;
-        self.joins
-            .iter_mut()
+        let due: Vec<PeerID> = self
+            .joins
+            .iter()
             .filter(|(_, held)| held.bound <= head)
-            .filter_map(|(peer, held)| Some((*peer, held.join.take()?)))
+            .map(|(peer, _)| *peer)
+            .collect();
+        due.into_iter()
+            .filter_map(|peer| {
+                let held = self.joins.remove(&peer)?;
+                Some((peer, held.join, held.snapshot))
+            })
             .collect()
-    }
-
-    pub fn snapshot_for(&self, joiner: PeerID) -> Option<Arc<Vec<u8>>> {
-        self.joins.get(&joiner).map(|held| held.snapshot.clone())
     }
 
     // Called once the joiner has loaded, and on departure.
