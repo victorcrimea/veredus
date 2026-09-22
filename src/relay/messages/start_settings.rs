@@ -46,16 +46,5 @@ impl StartSettings {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_game_start() {
-        let msg = StartSettings {
-            init_attributes: vec![0xDE, 0xAD],
-        };
-        let bytes = msg.to_bytes();
-        let decoded = StartSettings::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, msg);
-    }
-}
+#[path = "../../../tests/unit/relay/messages/start_settings.rs"]
+mod tests;

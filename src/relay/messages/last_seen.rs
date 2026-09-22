@@ -69,17 +69,5 @@ impl LastSeen {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_client_timeout() {
-        let msg = LastSeen {
-            guid: Guid("abc123".to_string()),
-            last_received_time: 5000,
-        };
-        let bytes = msg.to_bytes();
-        let decoded = LastSeen::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, msg);
-    }
-}
+#[path = "../../../tests/unit/relay/messages/last_seen.rs"]
+mod tests;

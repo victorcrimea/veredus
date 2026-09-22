@@ -65,18 +65,5 @@ impl PerformanceEntry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_performance_entry() {
-        let msg = PerformanceEntry {
-            guid: Guid("abc123".to_string()),
-            mean_rtt: 50,
-        };
-        let bytes = msg.to_bytes();
-        let (decoded, pos) = PerformanceEntry::from_bytes(&bytes, 0).unwrap();
-        assert_eq!(decoded, msg);
-        assert_eq!(pos, bytes.len());
-    }
-}
+#[path = "../../../tests/unit/relay/messages/performance_entry.rs"]
+mod tests;

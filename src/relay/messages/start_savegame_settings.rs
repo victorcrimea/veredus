@@ -52,16 +52,5 @@ impl StartSavegameSettings {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_game_saved_start() {
-        let msg = StartSavegameSettings {
-            init_attributes: r#"{"mapType":"random"}"#.to_string(),
-        };
-        let bytes = msg.to_bytes();
-        let decoded = StartSavegameSettings::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, msg);
-    }
-}
+#[path = "../../../tests/unit/relay/messages/start_savegame_settings.rs"]
+mod tests;

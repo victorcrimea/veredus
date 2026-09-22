@@ -35,34 +35,5 @@ impl LaggingClients {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::guid::Guid;
-    use super::*;
-
-    #[test]
-    fn roundtrip_client_performance() {
-        let msg = LaggingClients {
-            clients: vec![
-                PerformanceEntry {
-                    guid: Guid("abc".to_string()),
-                    mean_rtt: 50,
-                },
-                PerformanceEntry {
-                    guid: Guid("def".to_string()),
-                    mean_rtt: 100,
-                },
-            ],
-        };
-        let bytes = msg.to_bytes();
-        let decoded = LaggingClients::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, msg);
-    }
-
-    #[test]
-    fn roundtrip_client_performance_empty() {
-        let msg = LaggingClients { clients: vec![] };
-        let bytes = msg.to_bytes();
-        let decoded = LaggingClients::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, msg);
-    }
-}
+#[path = "../../../tests/unit/relay/messages/lagging_clients.rs"]
+mod tests;

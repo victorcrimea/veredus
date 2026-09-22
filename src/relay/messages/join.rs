@@ -46,16 +46,5 @@ impl Join {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_join_sync_start() {
-        let msg = Join {
-            init_attributes: vec![0xBE, 0xEF],
-        };
-        let bytes = msg.to_bytes();
-        let decoded = Join::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, msg);
-    }
-}
+#[path = "../../../tests/unit/relay/messages/join.rs"]
+mod tests;
