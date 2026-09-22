@@ -30,32 +30,42 @@ struct ClientTurn {
     // The controller counts as a player here even when it holds no slot, so
     // it keeps blocking release and the match cannot run away from it.
     observer: bool,
-    // On the delayed observer feed. Such a client never blocks release and is
-    // left out of the live hash comparison: its reports arrive a whole delay
-    // late, and waiting for them would hold every player's desync report back
-    // by the same amount.
+    // On the delayed observer feed. Such a client never blocks release; like
+    // every observer it is left out of the live hash comparison, its reports
+    // arriving a whole delay late.
     delayed: bool,
     // The hosted-AI sidecar. Its full-turn hashes are not comparable with
     // anyone's, and it is never the reference a player is judged against.
     ai_host: bool,
 }
 
-// Bounded by the session count: hashes are discarded as soon as a turn is
-// compared, and a departing client is forgotten outright.
+// Pending hashes stay bounded by how far the players drift apart: a compared
+// turn retires every older one, nothing is stored while a desync is latched,
+// and a departing client is forgotten outright.
 pub struct TurnManager {
     ready_turn: u32,
     clients: HashMap<PeerID, ClientTurn>,
+    // Players' hashes only. Observers are judged against the players' agreed
+    // hash instead, so a slow or desynced observer neither holds the players'
+    // comparison back nor gets reported to them.
     pending: HashMap<u32, HashMap<PeerID, Vec<u8>>>,
     // Comparison stops while anyone is known to be out of sync, and resumes
-    // once they have all left, so one desync does not spam every turn.
+    // once they have all left, so one desync does not spam every turn. The
+    // hashes reported meanwhile are dropped rather than kept for later: a
+    // desynced player that plays on would otherwise grow them for the rest of
+    // the match.
     out_of_sync: HashSet<PeerID>,
+    // Clients report in sequence, so once a turn is compared no older turn
+    // can ever complete, and an observer's hash for one has nothing left to
+    // be judged against.
+    last_compared: u32,
     // The agreed hash of every compared turn, kept for the whole match: a
     // delayed observer reports a turn long after the players have, and a late
     // observer can start from any turn the feed has reached. Sixteen bytes a
     // turn.
     references: HashMap<u32, Vec<u8>>,
-    // Delayed observers' hashes for turns whose reference is not known yet,
-    // which happens only while the live comparison is suspended.
+    // Observers' hashes for turns the players have not agreed on yet. Kept
+    // only while that agreement can still come.
     observer_pending: HashMap<u32, HashMap<PeerID, Vec<u8>>>,
     // Tracked apart from `out_of_sync`, so that one observer going out of sync
     // neither suspends the players' comparison nor anybody else's.
@@ -68,8 +78,9 @@ pub struct HashMismatch {
     pub turn: u32,
     pub reference: Vec<u8>,
     pub mismatched: Vec<PeerID>,
-    // Some for a delayed observer, which is told on its own: everyone else is
-    // a whole delay past that turn and has no use for the report.
+    // Some for an observer, which is told on its own: one observer's desync
+    // says nothing about the players, and a delayed one's turn is a whole
+    // delay behind everyone else.
     pub recipient: Option<PeerID>,
 }
 
@@ -80,6 +91,7 @@ impl Default for TurnManager {
             clients: HashMap::new(),
             pending: HashMap::new(),
             out_of_sync: HashSet::new(),
+            last_compared: 0,
             references: HashMap::new(),
             observer_pending: HashMap::new(),
             observers_out_of_sync: HashSet::new(),
@@ -227,14 +239,14 @@ impl TurnManager {
             return Err(PeerFault::StateHashOutOfSequence { got: turn, want });
         }
         client.simulated_turn = turn;
-        if client.delayed {
+        if client.observer || client.delayed {
             if self.references.contains_key(&turn) {
                 return Ok(self
                     .compare_observer(peer, turn, &hash)
                     .into_iter()
                     .collect());
             }
-            if !self.observers_out_of_sync.contains(&peer) {
+            if !self.observers_out_of_sync.contains(&peer) && self.reference_may_come(turn) {
                 self.observer_pending
                     .entry(turn)
                     .or_default()
@@ -245,8 +257,19 @@ impl TurnManager {
         if client.ai_host && needs_full_hash(turn) {
             return Ok(Vec::new());
         }
+        if !self.out_of_sync.is_empty() {
+            return Ok(Vec::new());
+        }
         self.pending.entry(turn).or_default().insert(peer, hash);
         Ok(self.compare(turn))
+    }
+
+    // Nothing is agreed while a desync is latched, and nothing ever again for
+    // a turn already retired or once no player is left to report it.
+    fn reference_may_come(&self, turn: u32) -> bool {
+        self.out_of_sync.is_empty()
+            && turn > self.last_compared
+            && self.clients.values().any(|c| !c.observer && !c.delayed)
     }
 
     // A departure can complete a comparison that was waiting on the departed
@@ -262,7 +285,7 @@ impl TurnManager {
         if !self
             .clients
             .iter()
-            .filter(|(_, c)| !c.delayed && !(c.ai_host && needs_full_hash(turn)))
+            .filter(|(_, c)| !c.observer && !c.delayed && !(c.ai_host && needs_full_hash(turn)))
             .all(|(p, _)| reported.contains_key(p))
         {
             return found;
@@ -290,7 +313,8 @@ impl TurnManager {
             .map(|(peer, _)| *peer)
             .collect();
 
-        self.pending.remove(&turn);
+        self.pending.retain(|t, _| *t > turn);
+        self.last_compared = self.last_compared.max(turn);
         self.references.insert(turn, reference.clone());
 
         if !mismatched.is_empty() {
@@ -307,6 +331,7 @@ impl TurnManager {
         for (peer, hash) in self.observer_pending.remove(&turn).unwrap_or_default() {
             found.extend(self.compare_observer(peer, turn, &hash));
         }
+        self.observer_pending.retain(|t, _| *t > turn);
         found
     }
 
@@ -329,7 +354,9 @@ impl TurnManager {
         })
     }
 
-    // Comparison resumes only once every out-of-sync client has gone.
+    // Comparison resumes only once every out-of-sync client has gone, and only
+    // for turns reported since: the ones reported during the desync were
+    // never kept.
     pub fn recheck_pending(&mut self) -> Vec<HashMismatch> {
         if !self.out_of_sync.is_empty() {
             return Vec::new();

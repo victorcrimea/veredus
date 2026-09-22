@@ -405,7 +405,7 @@ pub enum Phase {
 pub struct Counters {
     // Turns whose hashes disagreed among the players.
     pub hash_mismatches: u64,
-    // Turns on which one delayed observer disagreed with the agreed hash.
+    // Turns on which one observer disagreed with the agreed hash.
     pub observer_hash_mismatches: u64,
     // Snapshots handed to joiners, by where they came from.
     pub join_from_checkpoint: u64,
@@ -1698,12 +1698,14 @@ impl<S: PhaseMarker> Server<S> {
             sanitized
         };
 
+        // A lobby name passes authentication in any capitalization, so the
+        // ban has to hold in all of them too.
         let ban_key = if self.ctx.config.lobby_mode {
-            auth::suffix_stripped(&name)
+            auth::suffix_stripped(&name).to_lowercase()
         } else {
-            name.as_str()
+            name.clone()
         };
-        if self.ctx.banned_names.contains(ban_key) {
+        if self.ctx.banned_names.contains(&ban_key) {
             self.disconnect(peer, DisconnectReason::Banned);
             return Ok(());
         }
@@ -2105,7 +2107,7 @@ impl<S: PhaseMarker> Server<S> {
 
         if msg.ban {
             let key = if self.ctx.config.lobby_mode {
-                auth::suffix_stripped(&msg.name).to_string()
+                auth::suffix_stripped(&msg.name).to_lowercase()
             } else {
                 msg.name.clone()
             };
@@ -2352,6 +2354,7 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
             self.disconnect(peer, DisconnectReason::ServerLoading);
         }
 
+        self.ctx.slots.purge_disconnected();
         self.broadcast_player_slots();
 
         let ai_host_peer = self.ctx.ai_host.as_ref().and_then(|h| h.peer);

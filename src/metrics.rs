@@ -232,7 +232,7 @@ pub static OOS_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static OBSERVER_OOS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "game_observer_oos_total",
-        "Turns on which a delayed observer disagreed with the players' agreed hash",
+        "Turns on which an observer disagreed with the players' agreed hash",
         GAME_LABELS
     )
     .unwrap()
