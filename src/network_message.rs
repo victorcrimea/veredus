@@ -2,10 +2,40 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use rusty_enet::PeerID;
 
 use crate::relay::monitor::PeerStats;
+
+// A per-peer inbound byte budget is charged on the ENet thread (which is
+// where every peer's messages are counted) and released whenever this drops,
+// which covers the whole time the copy is alive: queued in the channel and
+// being decoded on the server thread. That is what lets the budget bound the
+// channel without the server thread having to remember to give bytes back.
+#[derive(Debug)]
+pub struct InboundCredit {
+    outstanding: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl InboundCredit {
+    pub fn new(outstanding: &Arc<AtomicUsize>, bytes: usize) -> Self {
+        outstanding.fetch_add(bytes, Ordering::Relaxed);
+        Self {
+            outstanding: Arc::clone(outstanding),
+            bytes,
+        }
+    }
+}
+
+impl Drop for InboundCredit {
+    fn drop(&mut self) {
+        self.outstanding.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
 
 // Raw bytes cross the thread boundary on purpose: only the game-server thread
 // owns the message catalog, so the ENet thread stays a dumb packet pump.
@@ -23,6 +53,10 @@ pub enum InboundNetworkMessage {
     Message {
         peer: PeerID,
         data: Vec<u8>,
+        // Dropped once the server thread is done with `data`, which is what
+        // charges the peer's inbound budget for the whole time the copy is
+        // alive rather than just while it sits in the channel.
+        credit: InboundCredit,
     },
     // Peer timing is only reachable from the thread that owns the host, so it
     // is sampled there and carried over rather than looked up on demand. The

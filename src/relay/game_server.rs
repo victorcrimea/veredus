@@ -475,18 +475,28 @@ fn to_input(
             metrics.disconnected();
             Some(Input::Disconnected { peer })
         }
-        InboundNetworkMessage::Message { peer, data } => match WireMessage::from_bytes(&data) {
-            Ok(msg) => {
-                metrics.message_received(msg.name());
-                Some(Input::Received { peer, msg })
+        // `credit` is dropped at the end of this arm regardless of outcome,
+        // which is what releases the sender's inbound budget once this
+        // thread is actually done with `data` rather than when it left the
+        // channel.
+        InboundNetworkMessage::Message {
+            peer,
+            data,
+            credit: _,
+        } => {
+            match WireMessage::from_bytes(&data) {
+                Ok(msg) => {
+                    metrics.message_received(msg.name());
+                    Some(Input::Received { peer, msg })
+                }
+                // One bad packet is dropped and the connection stays open.
+                Err(error) => {
+                    tracing::debug!(?peer, %error, bytes = data.len(), "undecodable packet dropped");
+                    metrics.undecodable();
+                    None
+                }
             }
-            // One bad packet is dropped and the connection stays open.
-            Err(error) => {
-                tracing::debug!(?peer, %error, bytes = data.len(), "undecodable packet dropped");
-                metrics.undecodable();
-                None
-            }
-        },
+        }
         InboundNetworkMessage::Stats {
             stats,
             packet_loss,

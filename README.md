@@ -235,6 +235,12 @@ span (a child of `game`) carrying peer, uuid, lobby name, client id and
 name. The client IP is deliberately not a span field: it is logged only on
 connect, disconnect and refused-connection lines.
 
+Two counters cover the ENet socket thread, which has no per-game series of
+its own: `enet_inbound_dropped_packets_total` (a peer's undelivered inbound
+backlog was full and a packet was dropped) and
+`enet_slow_peer_disconnects_total` (a peer's outgoing queue stayed over its
+cap for about 30 seconds and was disconnected).
+
 ## Further reading
 
 - [PROTOCOL.md](PROTOCOL.md) - the wire protocol, message layouts and lobby

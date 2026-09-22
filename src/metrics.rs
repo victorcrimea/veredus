@@ -388,6 +388,24 @@ pub static LOBBY_AUTH_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     .unwrap()
 });
 
+// Global rather than per-game: both are counted on the ENet thread, which
+// has no GameMetrics of its own (that is built on the server thread, A5).
+pub static ENET_INBOUND_DROPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "enet_inbound_dropped_packets_total",
+        "Packets dropped because the sending peer's undelivered inbound backlog was full"
+    )
+    .unwrap()
+});
+
+pub static ENET_SLOW_PEER_DISCONNECTS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "enet_slow_peer_disconnects_total",
+        "Peers disconnected because their outgoing queue stayed over the cap"
+    )
+    .unwrap()
+});
+
 // The statics register on first use, so without this a scrape before the
 // first game or lobby event would be missing families rather than showing 0.
 pub fn init() {
@@ -398,6 +416,8 @@ pub fn init() {
     LazyLock::force(&GAME_TURNS);
     LazyLock::force(&LOBBY_ACCOUNTS);
     LazyLock::force(&LOBBY_ACCOUNTS_BUSY);
+    LazyLock::force(&ENET_INBOUND_DROPPED_TOTAL);
+    LazyLock::force(&ENET_SLOW_PEER_DISCONNECTS_TOTAL);
     LazyLock::force(&LOBBY_STREAM_ENDED_TOTAL);
     LazyLock::force(&LOBBY_AUTH_TOTAL);
 }
