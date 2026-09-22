@@ -335,8 +335,8 @@ pub fn run_game_server(
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    // The ENet thread dropped its sender, which is how a
-                    // deliberate shutdown reaches this loop.
+                    // The ENet thread stops only once this thread drops
+                    // `send_tx`, so reaching here means it died on its own.
                     tracing::info!("ENet event channel disconnected, shutting down");
                     metrics.ended(if shutdown_requested.load(Ordering::SeqCst) {
                         "shutdown"
@@ -385,7 +385,14 @@ pub fn run_game_server(
                 let current = server.take().expect("server is always present");
                 outcome_request = current.outcome_request();
                 observe_final(&current, &latest_stats, &latest_loss, metrics);
-                let effects = current.shutdown();
+                // Outside post-game this is the idle timeout, where normally
+                // no human is admitted to read the line.
+                let reason = if matches!(current, AnyServer::PostGame(_)) {
+                    "the match is over"
+                } else {
+                    "the game was idle"
+                };
+                let effects = current.shutdown(reason);
                 drain(
                     effects,
                     &send_tx,
@@ -404,7 +411,7 @@ pub fn run_game_server(
             let current = server.take().expect("server is always present");
             outcome_request = current.outcome_request();
             observe_final(&current, &latest_stats, &latest_loss, metrics);
-            let effects = current.shutdown();
+            let effects = current.shutdown("the server is closing this game");
             drain(
                 effects,
                 &send_tx,
@@ -419,6 +426,11 @@ pub fn run_game_server(
         metrics.tick(Utc::now().signed_duration_since(tick_start));
         std::thread::sleep(POLL_INTERVAL);
     }
+
+    // The ENet thread drains, flushes and exits once this sender is gone, so
+    // dropping it here, after the farewell is queued, is what lets clients
+    // hear the shutdown without waiting on the checkpoint join below.
+    drop(send_tx);
 
     if let Some(current) = server.as_ref() {
         observe_final(current, &latest_stats, &latest_loss, metrics);

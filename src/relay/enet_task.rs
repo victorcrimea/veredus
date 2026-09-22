@@ -34,7 +34,6 @@ pub fn run_enet_host(
     socket: UdpSocket,
     event_tx: Sender<InboundNetworkMessage>,
     send_rx: Receiver<OutboundNetworkMessage>,
-    shutdown_rx: Receiver<()>,
 ) {
     // Read before the socket moves into the host, which takes ownership of it.
     let bind_addr = socket
@@ -61,15 +60,11 @@ pub fn run_enet_host(
 
     let mut last_stats = Utc::now();
 
-    'outer: loop {
-        match shutdown_rx.try_recv() {
-            Ok(_) | Err(TryRecvError::Disconnected) => {
-                tracing::info!("ENet host shutting down");
-                break;
-            }
-            Err(TryRecvError::Empty) => {}
-        }
-
+    // The server thread ends this loop by dropping its sender, never the other
+    // way round, so whatever it queued last (the shutdown farewell) is still
+    // drained and flushed before the host goes away.
+    let mut closing = false;
+    loop {
         for _ in 0..MAX_EVENTS_PER_TICK {
             match host.service() {
                 Ok(Some(event)) => {
@@ -107,9 +102,11 @@ pub fn run_enet_host(
                         },
                     };
 
+                    // The server thread is gone, but what it sent before going
+                    // is still buffered, so the drain below still runs.
                     if let Err(error) = event_tx.send(inbound_message) {
                         tracing::error!(?error, "failed to forward ENet event to server thread");
-                        break 'outer;
+                        break;
                     }
                 }
                 Ok(None) => break,
@@ -120,7 +117,15 @@ pub fn run_enet_host(
             }
         }
 
-        while let Ok(message) = send_rx.try_recv() {
+        loop {
+            let message = match send_rx.try_recv() {
+                Ok(message) => message,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    closing = true;
+                    break;
+                }
+            };
             match message {
                 OutboundNetworkMessage::Message { peer, data } => match host.get_peer_mut(peer) {
                     Some(handle) => {
@@ -148,12 +153,22 @@ pub fn run_enet_host(
                     }
                 }
                 OutboundNetworkMessage::DisconnectNow { peer, reason } => {
+                    // disconnect_now() discards the peer's queue, so anything
+                    // queued just before it, such as the shutdown chat line,
+                    // has to be on the wire first.
+                    host.flush();
                     match host.get_peer_mut(peer) {
                         Some(handle) => handle.disconnect_now(reason),
                         None => tracing::debug!(?peer, "immediate disconnect for unknown peer"),
                     }
                 }
             }
+        }
+
+        if closing {
+            host.flush();
+            tracing::info!("ENet host shutting down");
+            break;
         }
 
         // A wall clock can step backwards, so a negative delta samples now and
@@ -185,9 +200,10 @@ pub fn run_enet_host(
                 bytes_received: host.total_received_data(),
                 bytes_sent: host.total_sent_data(),
             };
+            // The server thread is gone; the next drain sees its sender
+            // closed and ends the loop.
             if event_tx.send(stats).is_err() {
                 tracing::error!("failed to forward peer stats to server thread");
-                break 'outer;
             }
         }
 

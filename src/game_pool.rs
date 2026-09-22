@@ -53,12 +53,9 @@ pub struct GameConfig {
 
 struct GameHandle {
     port: u16,
-    /// Dropping this sender triggers the shutdown cascade: the ENet thread
-    /// sees the channel close, breaks, drops `event_tx`, and the server thread
-    /// then returns.
-    _shutdown_tx: mpsc::Sender<()>,
-    /// Set before `_shutdown_tx` is dropped so the server thread can tell a
-    /// deliberate shutdown apart from the ENet thread dying on its own.
+    /// Setting this starts the shutdown: the server thread tells every client
+    /// why, drops its outbound sender and returns, and the ENet thread drains
+    /// that last traffic, flushes and exits.
     shutdown_requested: Arc<AtomicBool>,
     // Yields the outcome replay's thread, if the match got that far.
     server_thread: Option<JoinHandle<Option<JoinHandle<()>>>>,
@@ -127,7 +124,6 @@ impl GamePool {
 
         let (event_tx, event_rx) = mpsc::channel::<InboundNetworkMessage>();
         let (send_tx, send_rx) = mpsc::channel::<OutboundNetworkMessage>();
-        let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
 
         // Spans are thread-local, so each thread enters its own copy instead of
         // inheriting one from the pool. Every log line then carries game_id and
@@ -136,7 +132,7 @@ impl GamePool {
         let enet_thread = std::thread::spawn(move || {
             let span = tracing::info_span!("game", game_id = %enet_game_id, port);
             let _guard = span.entered();
-            run_enet_host(socket, event_tx, send_rx, shutdown_rx);
+            run_enet_host(socket, event_tx, send_rx);
         });
 
         let server_game_id = game_id.to_string();
@@ -183,7 +179,6 @@ impl GamePool {
             game_id.clone(),
             GameHandle {
                 port,
-                _shutdown_tx: shutdown_tx,
                 shutdown_requested,
                 server_thread: Some(server_thread),
                 enet_thread: Some(enet_thread),
@@ -205,18 +200,15 @@ impl GamePool {
 
         handle.shutdown_requested.store(true, Ordering::SeqCst);
 
-        // Dropping `shutdown_tx` triggers the cascade: the ENet thread sees the
-        // channel close, breaks, drops `event_tx`, and the server thread then
-        // returns.
-        drop(handle._shutdown_tx);
-
-        if let Some(thread) = handle.enet_thread.take() {
-            let _ = thread.join();
-        }
+        // Server thread first: the ENet thread only exits once the server
+        // thread has queued its farewell and dropped the outbound sender.
         if let Some(thread) = handle.server_thread.take()
             && let Ok(Some(outcome)) = thread.join()
         {
             self.outcomes.push(outcome);
+        }
+        if let Some(thread) = handle.enet_thread.take() {
+            let _ = thread.join();
         }
         self.outcomes.retain(|outcome| !outcome.is_finished());
 

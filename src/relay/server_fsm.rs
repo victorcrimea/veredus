@@ -1122,15 +1122,15 @@ impl AnyServer {
         }
     }
 
-    pub fn shutdown(self) -> Vec<Effect> {
+    pub fn shutdown(self, reason: &str) -> Vec<Effect> {
         match self {
-            AnyServer::Idle(s) => s.shutdown(),
-            AnyServer::Setup(s) => s.shutdown(),
-            AnyServer::AwaitSavegame(s) => s.shutdown(),
-            AnyServer::AwaitAiHost(s) => s.shutdown(),
-            AnyServer::Loading(s) => s.shutdown(),
-            AnyServer::InGame(s) => s.shutdown(),
-            AnyServer::PostGame(s) => s.shutdown(),
+            AnyServer::Idle(s) => s.shutdown(reason),
+            AnyServer::Setup(s) => s.shutdown(reason),
+            AnyServer::AwaitSavegame(s) => s.shutdown(reason),
+            AnyServer::AwaitAiHost(s) => s.shutdown(reason),
+            AnyServer::Loading(s) => s.shutdown(reason),
+            AnyServer::InGame(s) => s.shutdown(reason),
+            AnyServer::PostGame(s) => s.shutdown(reason),
         }
     }
 }
@@ -1144,7 +1144,11 @@ impl<S> Server<S> {
         std::mem::take(&mut self.ctx.effects)
     }
 
-    pub fn shutdown(mut self) -> Vec<Effect> {
+    // The disconnect reason is a bare code the client maps to a fixed
+    // string, so the why is told in chat first.
+    pub fn shutdown(mut self, reason: &str) -> Vec<Effect> {
+        self.ctx
+            .server_chat(None, &format!("Server shutdown: {reason}"));
         let peers: Vec<PeerID> = self.ctx.sessions.keys().copied().collect();
         for peer in peers {
             self.ctx.effects.push(Effect::DisconnectNow {

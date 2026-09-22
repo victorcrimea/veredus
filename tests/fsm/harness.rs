@@ -288,7 +288,7 @@ impl Harness {
         self.server
             .take()
             .expect("harness server missing")
-            .shutdown()
+            .shutdown("test")
     }
 
     // Admits each named entry in order (the first becomes controller),
