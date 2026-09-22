@@ -222,7 +222,7 @@ fn guard_orphan(cmd: &mut Command) {
             // The parent may have died between fork and prctl, in which case
             // the signal would never come.
             if libc::getppid() != parent {
-                return Err(std::io::Error::other("parent exited before exec"));
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
             }
             Ok(())
         });
