@@ -5,13 +5,15 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use chrono::TimeDelta;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use veredus::cli;
+use veredus::cli::Command;
+use veredus::config::FileConfig;
+use veredus::config::LogSection;
 use veredus::game_pool::GameConfig;
 use veredus::game_pool::GameId;
 use veredus::game_pool::GamePool;
@@ -22,61 +24,99 @@ use veredus::lobby::link::LobbyLink;
 use veredus::relay::password;
 use veredus::relay::server_fsm::Config;
 
-// Default directive when RUST_LOG or LOKI_LOG is unset.
+// Default directive when neither the environment nor the config file sets one.
 const DEFAULT_LOG_DIRECTIVES: &str = "info";
-
-// How long a pooled-lobby game may sit with nobody ever having joined, or
-// with everybody gone, before it shuts itself down and frees its account.
-const IDLE_SHUTDOWN: TimeDelta = TimeDelta::seconds(60);
 
 #[tokio::main]
 async fn main() {
-    let stdout_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_DIRECTIVES));
+    // Tracing is not up yet, so a bad config can only be reported on stderr.
+    let mode = match cli::parse_args() {
+        Ok(Command::GenConfig(path)) => {
+            if let Err(error) = FileConfig::write_default(&path) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
+            println!("wrote default config to {}", path.display());
+            return;
+        }
+        Ok(Command::Run(mode)) => *mode,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let config = mode.config;
+
+    let stdout_filter = log_filter("RUST_LOG", &config.log.directives);
     // Per-layer filters rather than one global one: tracing-loki ships over a
     // bounded channel and silently drops on overflow, so turning stdout up to
     // trace for a debugging session must not flood Loki as well.
-    let loki_filter = EnvFilter::try_from_env("LOKI_LOG")
-        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_DIRECTIVES));
+    let loki_filter = log_filter("LOKI_LOG", &config.log.loki_directives);
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_filter(stdout_filter))
-        .with(build_loki_layer().map(|layer| layer.with_filter(loki_filter)))
+        .with(build_loki_layer(&config.log).map(|layer| layer.with_filter(loki_filter)))
         .init();
 
-    let mode = cli::parse_args();
-    let mut pool = GamePool::new(mode.host);
+    let mut pool = GamePool::new(config.server.host);
+    let pyrogenesis_path = config.server.pyrogenesis_path();
+    let outcome_dir = config.server.outcome_dir();
+    let base = config.game.server_config(
+        pyrogenesis_path.is_some(),
+        config.server.checkpoint_interval_turns,
+    );
 
-    match mode.lobby_config {
-        Some(path) => {
-            run_pool_lobby_mode(
-                &mut pool,
-                path,
-                mode.pyrogenesis_path,
-                mode.outcome_dir,
-                mode.checkpoint_interval_turns,
-            )
-            .await
+    match mode.lobby {
+        Some(lobby_config) => {
+            let base = Config {
+                idle_shutdown: Some(config.lobby.idle_shutdown()),
+                ..base
+            };
+            run_pool_lobby_mode(&mut pool, lobby_config, base, pyrogenesis_path, outcome_dir).await
         }
         None => {
             run_standalone(
                 &mut pool,
-                mode.port,
-                mode.pyrogenesis_path,
-                mode.outcome_dir,
-                mode.checkpoint_interval_turns,
+                config.server.port,
+                base,
+                pyrogenesis_path,
+                outcome_dir,
             )
             .await
         }
     }
 }
 
+// The environment wins over the file so one debugging session can turn a
+// module up without editing the config everyone else runs with.
+fn log_filter(env_var: &str, from_file: &str) -> EnvFilter {
+    EnvFilter::try_from_env(env_var).unwrap_or_else(|_| {
+        let directives = if from_file.is_empty() {
+            DEFAULT_LOG_DIRECTIVES
+        } else {
+            from_file
+        };
+        EnvFilter::try_new(directives).unwrap_or_else(|error| {
+            eprintln!("Error: invalid log directives '{directives}': {error}");
+            std::process::exit(1);
+        })
+    })
+}
+
+// Unlike the other settings, an empty environment variable still counts as
+// set, which matches how these were read before the config file existed.
+fn env_or(env_var: &str, from_file: &str) -> Option<String> {
+    std::env::var(env_var)
+        .ok()
+        .or_else(|| (!from_file.is_empty()).then(|| from_file.to_string()))
+}
+
 // Only low-cardinality values may be Loki labels, since every distinct label
 // combination is a separate stream. Per-game and per-peer context travels as
 // span fields instead, which tracing-loki flattens into the JSON line body, so
 // a query looks like {job="veredus"} | json | game_id="gid_0199...".
-fn build_loki_layer() -> Option<tracing_loki::Layer> {
+fn build_loki_layer(log: &LogSection) -> Option<tracing_loki::Layer> {
     // Unset means no Loki at all, so a developer checkout needs no config.
-    let url = std::env::var("LOKI_URL").ok()?;
+    let url = env_or("LOKI_URL", &log.loki_url)?;
     // Tracing is not up yet, so a bad setting can only be reported on stderr.
     let url = tracing_loki::url::Url::parse(&url).unwrap_or_else(|error| {
         eprintln!("Error: invalid LOKI_URL '{url}': {error}");
@@ -85,13 +125,12 @@ fn build_loki_layer() -> Option<tracing_loki::Layer> {
 
     // Several servers can ship to one Loki, and without a distinct instance
     // label their streams would interleave.
-    let instance = std::env::var("LOKI_INSTANCE")
-        .ok()
+    let instance = env_or("LOKI_INSTANCE", &log.loki_instance)
         .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
-    let env = std::env::var("LOKI_ENV").unwrap_or_else(|_| "dev".to_string());
+    let env = env_or("LOKI_ENV", &log.loki_env).unwrap_or_else(|| "dev".to_string());
 
     let built = tracing_loki::builder()
         .label("job", "veredus")
@@ -115,19 +154,14 @@ fn build_loki_layer() -> Option<tracing_loki::Layer> {
 async fn run_standalone(
     pool: &mut GamePool,
     port: u16,
+    server_config: Config,
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
-    checkpoint_interval_turns: u32,
 ) {
     let (game_id, port) = pool
         .create_game(GameConfig {
             port: Some(port),
-            server: Config {
-                sidecar_dumps: pyrogenesis_path.is_some(),
-                hosted_ai: pyrogenesis_path.is_some(),
-                checkpoint_interval_turns,
-                ..Config::default()
-            },
+            server: server_config,
             lobby: None,
             pyrogenesis_path,
             outcome_dir,
@@ -142,22 +176,11 @@ async fn run_standalone(
 
 async fn run_pool_lobby_mode(
     pool: &mut GamePool,
-    config_path: PathBuf,
+    lobby_config: LobbyConfig,
+    base: Config,
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
-    checkpoint_interval_turns: u32,
 ) {
-    let config_data = std::fs::read_to_string(&config_path).unwrap_or_else(|error| {
-        eprintln!(
-            "Error: failed to read lobby config '{}': {error}",
-            config_path.display()
-        );
-        std::process::exit(1);
-    });
-    let lobby_config: LobbyConfig = serde_json::from_str(&config_data).unwrap_or_else(|error| {
-        eprintln!("Error: failed to parse lobby config: {error}");
-        std::process::exit(1);
-    });
     tracing::info!(
         accounts = lobby_config.accounts.len(),
         muc_room = %lobby_config.muc_room,
@@ -232,12 +255,8 @@ async fn run_pool_lobby_mode(
                     lobby_mode: true,
                     server_password_hash: password_hash.clone(),
                     server_name: server_name.clone(),
-                    idle_shutdown: Some(IDLE_SHUTDOWN),
                     lobby_host_name: sender.clone(),
-                    sidecar_dumps: pyrogenesis_path.is_some(),
-                    hosted_ai: pyrogenesis_path.is_some(),
-                    checkpoint_interval_turns,
-                    ..Config::default()
+                    ..base.clone()
                 };
 
                 let (auth_tx, auth_rx) = std::sync::mpsc::channel();

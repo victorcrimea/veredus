@@ -2,29 +2,38 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::net::IpAddr;
+use std::path::Path;
 use std::path::PathBuf;
 
 use clap::Parser;
 
-// 0x5073, the port stock clients dial unless they are told otherwise.
-const DEFAULT_PORT: u16 = 20595;
-const DEFAULT_HOST: &str = "0.0.0.0";
-// Two minutes of play at the default 200 ms turn: long enough that a run's
-// fixed cost (start, map load, deserialize) stays small next to the turns it
-// replays, short enough that a joiner never catches up for long.
-const DEFAULT_CHECKPOINT_INTERVAL_TURNS: u32 = 600;
+use crate::config::DEFAULT_CONFIG_PATH;
+use crate::config::FileConfig;
+use crate::lobby::LobbyConfig;
 
+// No flag carries a clap default: a default would be indistinguishable from
+// a flag the operator typed, and a typed flag must win over the config file
+// while an untyped one must not.
 #[derive(Parser)]
 #[command(name = "veredus", about = "0 A.D. relay server", version)]
 struct Args {
-    /// Bind address
-    #[arg(long, default_value = DEFAULT_HOST)]
-    host: IpAddr,
-    /// Listen port (standalone mode only; a lobby-config game picks its own)
-    #[arg(long, default_value_t = DEFAULT_PORT)]
-    port: u16,
-    /// Path to a pooled-account lobby config; when set, runs pool-lobby mode
-    /// instead of standalone
+    /// TOML config file; without it, ./config.toml is loaded when present.
+    /// Every flag below overrides the matching setting in the file
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Write the default config to PATH (default ./config.toml) and exit;
+    /// refuses to overwrite an existing file
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = DEFAULT_CONFIG_PATH)]
+    gen_config: Option<PathBuf>,
+    /// Bind address [default: 0.0.0.0]
+    #[arg(long)]
+    host: Option<IpAddr>,
+    /// Listen port (standalone mode only; a lobby game picks its own)
+    /// [default: 20595]
+    #[arg(long)]
+    port: Option<u16>,
+    /// Path to a pooled-account lobby config (JSON); when set, runs pool-lobby
+    /// mode with it in place of the config file's [lobby] table
     #[arg(long)]
     lobby_config: Option<PathBuf>,
     /// Path to the pyrogenesis binary; when set, joiners no live client can
@@ -40,27 +49,63 @@ struct Args {
     /// Turns between two sidecar checkpoints, each resumed from the last;
     /// joiners are served the newest one and the outcome file follows the
     /// match while it runs. 0 disables them. Needs --pyrogenesis-path
-    #[arg(long, default_value_t = DEFAULT_CHECKPOINT_INTERVAL_TURNS)]
-    checkpoint_interval_turns: u32,
+    /// [default: 600]
+    #[arg(long)]
+    checkpoint_interval_turns: Option<u32>,
+}
+
+pub enum Command {
+    GenConfig(PathBuf),
+    Run(Box<RunMode>),
 }
 
 pub struct RunMode {
-    pub host: IpAddr,
-    pub port: u16,
-    pub lobby_config: Option<PathBuf>,
-    pub pyrogenesis_path: Option<PathBuf>,
-    pub outcome_dir: Option<PathBuf>,
-    pub checkpoint_interval_turns: u32,
+    // The config file with every command line override applied.
+    pub config: FileConfig,
+    // Some selects pool-lobby mode.
+    pub lobby: Option<LobbyConfig>,
 }
 
-pub fn parse_args() -> RunMode {
+// Tracing is not up yet when this runs, because the config decides how it is
+// set up, so errors come back as text for main to print.
+pub fn parse_args() -> Result<Command, String> {
     let args = Args::parse();
-    RunMode {
-        host: args.host,
-        port: args.port,
-        lobby_config: args.lobby_config,
-        pyrogenesis_path: args.pyrogenesis_path,
-        outcome_dir: args.outcome_dir,
-        checkpoint_interval_turns: args.checkpoint_interval_turns,
+    if let Some(path) = args.gen_config {
+        return Ok(Command::GenConfig(path));
     }
+
+    let mut config = match &args.config {
+        Some(path) => FileConfig::load(path, true)?,
+        None => FileConfig::load(DEFAULT_CONFIG_PATH.as_ref(), false)?,
+    };
+
+    if let Some(host) = args.host {
+        config.server.host = host;
+    }
+    if let Some(port) = args.port {
+        config.server.port = port;
+    }
+    if let Some(path) = args.pyrogenesis_path {
+        config.server.pyrogenesis_path = path;
+    }
+    if let Some(path) = args.outcome_dir {
+        config.server.outcome_dir = path;
+    }
+    if let Some(turns) = args.checkpoint_interval_turns {
+        config.server.checkpoint_interval_turns = turns;
+    }
+
+    let lobby = match args.lobby_config {
+        Some(path) => Some(load_lobby_json(&path)?),
+        None if config.lobby.enabled => Some(config.lobby.to_lobby_config()?),
+        None => None,
+    };
+
+    Ok(Command::Run(Box::new(RunMode { config, lobby })))
+}
+
+fn load_lobby_json(path: &Path) -> Result<LobbyConfig, String> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read lobby config '{}': {error}", path.display()))?;
+    serde_json::from_str(&data).map_err(|error| format!("failed to parse lobby config: {error}"))
 }

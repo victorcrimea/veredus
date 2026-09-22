@@ -236,6 +236,7 @@ pub enum DisconnectReason {
     SimulationOrModMismatch = 17,
 }
 
+#[derive(Clone)]
 pub struct Config {
     pub enabled_mods: Vec<EnabledMod>,
     pub lobby_mode: bool,

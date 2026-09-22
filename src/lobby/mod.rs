@@ -44,11 +44,11 @@ const REGISTER_DEBOUNCE: Duration = Duration::from_millis(500);
 // Shutdown must not hang on a lobby server that stopped answering.
 const STREAM_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn default_server_name() -> String {
+pub(crate) fn default_server_name() -> String {
     "Veredus".to_string()
 }
 
-fn default_engine_version() -> String {
+pub(crate) fn default_engine_version() -> String {
     "0.28.0".to_string()
 }
 

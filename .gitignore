@@ -18,3 +18,6 @@ AGENTS.md
 
 # Added by cargo
 /target
+
+# Local server config (generate with --gen-config)
+/config.toml

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod cli;
+pub mod config;
 pub mod game_pool;
 pub mod lobby;
 pub mod network_message;
