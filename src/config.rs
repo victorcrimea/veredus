@@ -15,6 +15,7 @@ use serde::Serialize;
 use crate::lobby::LobbyConfig;
 use crate::lobby::XmppCredentials;
 use crate::relay::auth::LateObserverPolicy;
+use crate::relay::enet_task::EnetLimits;
 use crate::relay::enet_task::PEER_LIMIT;
 use crate::relay::messages::EnabledMod;
 use crate::relay::server_fsm::Config;
@@ -32,6 +33,14 @@ const DEFAULT_IDLE_SHUTDOWN_SECS: u64 = 60;
 // a decision for the operator, not a default.
 const DEFAULT_METRICS_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_METRICS_PORT: u16 = 9091;
+// The message header counts its length in 16 bits, so no packet larger than
+// this can hold a message; it is also the floor, since a lower cap would drop
+// the biggest legitimate game settings.
+const DEFAULT_ENET_MAX_PACKET_BYTES: usize = u16::MAX as usize;
+// What one peer, authenticated or not, may make the relay hold in half
+// reassembled or undelivered packets: a few maximum-size messages, which is
+// more than a stock client ever has in flight.
+const DEFAULT_ENET_MAX_WAITING_BYTES: usize = 256 * 1024;
 
 // Loaded without --config only when present, so a checkout with no file still
 // runs on the built-in defaults.
@@ -67,6 +76,8 @@ pub struct ServerSection {
     // Standalone mode only: stop the process once its game ends instead of
     // hosting a fresh one on the same port, for a supervisor that restarts it.
     pub exit_after_game: bool,
+    pub enet_max_packet_bytes: usize,
+    pub enet_max_waiting_bytes: usize,
 }
 
 impl Default for ServerSection {
@@ -80,6 +91,8 @@ impl Default for ServerSection {
             metrics_host: DEFAULT_METRICS_HOST,
             metrics_port: DEFAULT_METRICS_PORT,
             exit_after_game: false,
+            enet_max_packet_bytes: DEFAULT_ENET_MAX_PACKET_BYTES,
+            enet_max_waiting_bytes: DEFAULT_ENET_MAX_WAITING_BYTES,
         }
     }
 }
@@ -91,6 +104,13 @@ impl ServerSection {
 
     pub fn outcome_dir(&self) -> Option<PathBuf> {
         non_empty_path(&self.outcome_dir)
+    }
+
+    pub fn enet_limits(&self) -> EnetLimits {
+        EnetLimits {
+            max_packet_bytes: self.enet_max_packet_bytes,
+            max_waiting_bytes: self.enet_max_waiting_bytes,
+        }
     }
 }
 
@@ -381,6 +401,15 @@ impl FileConfig {
                 "[game] max_sessions must be between 2 and {PEER_LIMIT}, got {}",
                 self.game.max_sessions
             ));
+        }
+        if self.server.enet_max_packet_bytes < DEFAULT_ENET_MAX_PACKET_BYTES {
+            return Err(format!(
+                "[server] enet_max_packet_bytes must be at least {DEFAULT_ENET_MAX_PACKET_BYTES}, got {}",
+                self.server.enet_max_packet_bytes
+            ));
+        }
+        if self.server.enet_max_waiting_bytes == 0 {
+            return Err("[server] enet_max_waiting_bytes must be at least 1".to_string());
         }
         Ok(())
     }
