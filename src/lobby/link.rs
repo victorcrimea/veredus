@@ -28,6 +28,15 @@ pub struct LobbyMap {
     pub max_players: u32,
 }
 
+// The listing is built from controller-supplied settings on the game thread,
+// so the work it does must be bounded by what was actually decoded, never by
+// a length field inside the decoded value: a hostile array can claim any
+// length while carrying almost no props, and looping up to that length would
+// stall the whole game.
+const MAX_VICTORY_CONDITIONS: usize = 64;
+const MIN_LISTED_PLAYERS: u32 = 2;
+const MAX_LISTED_PLAYERS: u32 = 64;
+
 impl LobbyMap {
     // Mirrors what the stock client itself sends in
     // gui/gamesetup/Controllers/LobbyGameRegistration.js: `root` is the whole
@@ -58,17 +67,28 @@ impl LobbyMap {
         };
         let victory_conditions = settings
             .and_then(|s| s.get("VictoryConditions"))
-            .map(|vc| {
-                let len = vc.array_len().unwrap_or(0);
-                (0..len)
-                    .filter_map(|i| vc.array_get(i).and_then(|v| v.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(",")
+            .and_then(|vc| match vc {
+                ScriptValue::Array { props, .. } => Some(
+                    props
+                        .iter()
+                        .take(MAX_VICTORY_CONDITIONS)
+                        .filter_map(|(_, v)| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                _ => None,
             })
             .unwrap_or_default();
         let max_players = settings
             .and_then(|s| s.get("PlayerData"))
-            .and_then(|pd| pd.array_len())
+            .and_then(|pd| match pd {
+                ScriptValue::Array { props, .. } => Some(
+                    u32::try_from(props.len())
+                        .unwrap_or(MAX_LISTED_PLAYERS)
+                        .clamp(MIN_LISTED_PLAYERS, MAX_LISTED_PLAYERS),
+                ),
+                _ => None,
+            })
             .unwrap_or(0);
         Some(LobbyMap {
             map_name,
@@ -107,3 +127,7 @@ pub enum GameToLobby {
     // but it is no longer one to list.
     Ended,
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/lobby/link.rs"]
+mod tests;
