@@ -1129,12 +1129,14 @@ impl<S: PhaseMarker> Server<S> {
         // The ban is checked before anything else, so a banned address never
         // gets a session or a handshake.
         if self.ctx.banned_ips.contains(&addr) {
+            tracing::info!(peer = peer.0, ip = %addr, "connection refused: banned address");
             self.ctx.effects.push(Effect::Disconnect {
                 peer,
                 reason: DisconnectReason::Banned,
             });
             return;
         }
+        tracing::info!(peer = peer.0, ip = %addr, "client connected");
         self.ctx.sessions.insert(peer, Session::new(addr));
 
         // The client compares its mismatch report against this SYN, so it must

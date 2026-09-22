@@ -91,7 +91,11 @@ pub fn run_enet_host(
                             InboundNetworkMessage::Connect { peer, addr }
                         }
                         EventNoRef::Disconnect { peer, data } => {
-                            InboundNetworkMessage::Disconnect { peer, reason: data }
+                            InboundNetworkMessage::Disconnect {
+                                peer,
+                                addr,
+                                reason: data,
+                            }
                         }
                         EventNoRef::Receive {
                             peer,

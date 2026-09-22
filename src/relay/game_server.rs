@@ -374,8 +374,11 @@ fn to_input(message: InboundNetworkMessage, latest_stats: &mut Vec<PeerStats>) -
                 None
             }
         },
-        InboundNetworkMessage::Disconnect { peer, reason } => {
-            tracing::debug!(?peer, reason, "peer disconnected");
+        // Logged here rather than in the FSM because only this side knows
+        // the ENet reason word, and a peer refused at connect, which never
+        // got a session, is still logged with its address.
+        InboundNetworkMessage::Disconnect { peer, addr, reason } => {
+            tracing::info!(peer = peer.0, ip = %addr, enet_reason = reason, "client disconnected");
             Some(Input::Disconnected { peer })
         }
         InboundNetworkMessage::Message { peer, data } => match WireMessage::from_bytes(&data) {
