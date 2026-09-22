@@ -34,10 +34,16 @@ const TAG_OBJECT_SET: u8 = 0x10;
 // Nesting deep enough to matter here would mean a hostile or corrupt
 // packet, since real game settings never nest this deep.
 const MAX_DEPTH: usize = 64;
-// Bounds the total number of values a decode can produce, so a chain of
-// PRIOR_OBJECT references to a large array cannot clone its way to an
-// unbounded tree from a small packet.
+// Bounds the total number and byte size of every value produced while
+// decoding, so a small packet of PRIOR_OBJECT backrefs to a large
+// subtree cannot clone its way to unbounded memory: resolving a backref
+// is charged the same as decoding its target fresh, and so is the copy
+// kept in `refs` for later backrefs to name.
 const MAX_NODES: usize = 100_000;
+// Same budget, counted in bytes of string and ArrayBuffer payload, so a
+// backref chain to one large string cannot stay under MAX_NODES while
+// still cloning unbounded memory.
+const MAX_BYTES: usize = 1 << 20;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ScriptValueError {
@@ -53,7 +59,7 @@ pub enum ScriptValueError {
     BadBackref(u32),
     #[error("nesting exceeds the depth limit")]
     TooDeep,
-    #[error("decoded value exceeds the node limit")]
+    #[error("decoded value exceeds the size limit")]
     TooLarge,
     #[error("{0} trailing bytes after the root value")]
     TrailingBytes(usize),
@@ -133,16 +139,53 @@ impl ScriptValue {
     }
 }
 
+// What a decoded value cost to produce, in the two units MAX_NODES and
+// MAX_BYTES budget separately: a doubling chain of small containers is
+// caught by the node count, a chain of backrefs to one large string is
+// caught by the byte count.
+#[derive(Debug, Clone, Copy, Default)]
+struct Cost {
+    nodes: usize,
+    bytes: usize,
+}
+
+impl Cost {
+    fn add(self, other: Cost) -> Cost {
+        Cost {
+            nodes: self.nodes + other.nodes,
+            bytes: self.bytes + other.bytes,
+        }
+    }
+
+    // The cost of what was decoded between two `tree` readings, taken
+    // before and after a container's payload, so a later backref to that
+    // container can be charged as if it were decoded fresh again.
+    fn since(self, start: Cost) -> Cost {
+        Cost {
+            nodes: self.nodes - start.nodes,
+            bytes: self.bytes - start.bytes,
+        }
+    }
+}
+
 struct Decoder<'a> {
     data: &'a [u8],
     pos: usize,
     // Reference numbers are assigned from 1, in pre-order, to every tag that
     // can be named again later (Sec. 5). A slot is None while that value's
     // own payload is still being read, which is how a self-referential
-    // cycle is told apart from a legitimate forward reference.
-    refs: HashMap<u32, Option<ScriptValue>>,
+    // cycle is told apart from a legitimate forward reference. A finished
+    // slot also keeps the cost it was charged when decoded, so resolving a
+    // PRIOR_OBJECT to it is charged that same cost again rather than for
+    // free.
+    refs: HashMap<u32, Option<(ScriptValue, Cost)>>,
     next_ref: u32,
-    nodes: usize,
+    // The cost of the value tree currently being built; only read via
+    // `since` to measure one container's own subtree.
+    tree: Cost,
+    // Every cost ever charged, including backref clones and refs-table
+    // copies. This is what MAX_NODES and MAX_BYTES bound.
+    spent: Cost,
 }
 
 impl<'a> Decoder<'a> {
@@ -152,16 +195,33 @@ impl<'a> Decoder<'a> {
             pos: 0,
             refs: HashMap::new(),
             next_ref: 1,
-            nodes: 0,
+            tree: Cost::default(),
+            spent: Cost::default(),
         }
     }
 
-    fn take_node(&mut self) -> Result<(), ScriptValueError> {
-        self.nodes += 1;
-        if self.nodes > MAX_NODES {
+    // Charges `cost` against both the current subtree and the total spend,
+    // so it counts toward an enclosing container's own subtree cost. Used
+    // for freshly decoded values and for backref clones, which become part
+    // of the tree they are read into.
+    fn charge(&mut self, cost: Cost) -> Result<(), ScriptValueError> {
+        self.tree = self.tree.add(cost);
+        self.charge_copy(cost)
+    }
+
+    // Charges `cost` against the total spend only, for memory that is real
+    // but not part of the value being built right now: the copy `fill_ref`
+    // keeps in `refs` for a future backref.
+    fn charge_copy(&mut self, cost: Cost) -> Result<(), ScriptValueError> {
+        self.spent = self.spent.add(cost);
+        if self.spent.nodes > MAX_NODES || self.spent.bytes > MAX_BYTES {
             return Err(ScriptValueError::TooLarge);
         }
         Ok(())
+    }
+
+    fn take_node(&mut self) -> Result<(), ScriptValueError> {
+        self.charge(Cost { nodes: 1, bytes: 0 })
     }
 
     fn read_u8(&mut self) -> Result<u8, ScriptValueError> {
@@ -212,10 +272,18 @@ impl<'a> Decoder<'a> {
         let len = self.read_u32()? as usize;
         if latin1 != 0 {
             let bytes = self.read_bytes(len)?;
+            self.charge(Cost {
+                nodes: 0,
+                bytes: len,
+            })?;
             Ok(bytes.iter().map(|&b| b as char).collect())
         } else {
             let byte_len = len.checked_mul(2).ok_or(ScriptValueError::Truncated)?;
             let bytes = self.read_bytes(byte_len)?;
+            self.charge(Cost {
+                nodes: 0,
+                bytes: byte_len,
+            })?;
             let units: Vec<u16> = bytes
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -240,6 +308,9 @@ impl<'a> Decoder<'a> {
         if depth > MAX_DEPTH {
             return Err(ScriptValueError::TooDeep);
         }
+        // Taken before this node's own charge, so a container arm below
+        // can measure its whole subtree, itself included, with `since`.
+        let start = self.tree;
         self.take_node()?;
         let tag = self.read_u8()?;
         match tag {
@@ -264,13 +335,20 @@ impl<'a> Decoder<'a> {
             TAG_INT => Ok(ScriptValue::Int(self.read_u32()? as i32)),
             TAG_PRIOR_OBJECT => {
                 let n = self.read_u32()?;
+                // Some(None) is a reference to a value still being decoded:
+                // a cycle, which structured clone cannot produce for these
+                // tags, so it is treated the same as an out-of-range number.
+                let cost = match self.refs.get(&n) {
+                    Some(Some((_, cost))) => *cost,
+                    Some(None) | None => return Err(ScriptValueError::BadBackref(n)),
+                };
+                // Charged, and found to fit the budget, before the clone
+                // below runs: a hostile chain of backrefs to one large
+                // subtree must not get even one more free clone of it.
+                self.charge(cost)?;
                 match self.refs.get(&n) {
-                    Some(Some(value)) => Ok(value.clone()),
-                    // Some(None) is a reference to a value still being
-                    // decoded: a cycle, which structured clone cannot
-                    // produce for these tags, so it is treated the same as
-                    // an out-of-range number.
-                    Some(None) | None => Err(ScriptValueError::BadBackref(n)),
+                    Some(Some((value, _))) => Ok(value.clone()),
+                    _ => unreachable!("checked above; refs is only ever appended to"),
                 }
             }
             TAG_DOUBLE => Ok(ScriptValue::Double(self.read_f64()?)),
@@ -282,14 +360,16 @@ impl<'a> Decoder<'a> {
                 let length = self.read_u32()?;
                 let props = self.read_props(depth + 1)?;
                 let value = ScriptValue::Array { length, props };
-                self.fill_ref(reference, value.clone());
+                let cost = self.tree.since(start);
+                self.fill_ref(reference, &value, cost)?;
                 Ok(value)
             }
             TAG_OBJECT => {
                 let reference = self.reserve_ref();
                 let props = self.read_props(depth + 1)?;
                 let value = ScriptValue::Object(props);
-                self.fill_ref(reference, value.clone());
+                let cost = self.tree.since(start);
+                self.fill_ref(reference, &value, cost)?;
                 Ok(value)
             }
             TAG_TYPED_ARRAY => {
@@ -306,15 +386,21 @@ impl<'a> Decoder<'a> {
                     length,
                     buffer: Box::new(buffer),
                 };
-                self.fill_ref(reference, value.clone());
+                let cost = self.tree.since(start);
+                self.fill_ref(reference, &value, cost)?;
                 Ok(value)
             }
             TAG_ARRAY_BUFFER => {
                 let reference = self.reserve_ref();
                 let len = self.read_u32()? as usize;
-                let bytes = self.read_bytes(len)?.to_vec();
-                let value = ScriptValue::ArrayBuffer(bytes);
-                self.fill_ref(reference, value.clone());
+                let bytes = self.read_bytes(len)?;
+                self.charge(Cost {
+                    nodes: 0,
+                    bytes: len,
+                })?;
+                let value = ScriptValue::ArrayBuffer(bytes.to_vec());
+                let cost = self.tree.since(start);
+                self.fill_ref(reference, &value, cost)?;
                 Ok(value)
             }
             TAG_OBJECT_MAP => {
@@ -327,7 +413,8 @@ impl<'a> Decoder<'a> {
                     entries.push((key, val));
                 }
                 let value = ScriptValue::Map(entries);
-                self.fill_ref(reference, value.clone());
+                let cost = self.tree.since(start);
+                self.fill_ref(reference, &value, cost)?;
                 Ok(value)
             }
             TAG_OBJECT_SET => {
@@ -338,7 +425,8 @@ impl<'a> Decoder<'a> {
                     entries.push(self.read_value(depth + 1)?);
                 }
                 let value = ScriptValue::Set(entries);
-                self.fill_ref(reference, value.clone());
+                let cost = self.tree.since(start);
+                self.fill_ref(reference, &value, cost)?;
                 Ok(value)
             }
             // Nothing on the wire says which of the three OBJECT_PROTOTYPE
@@ -357,8 +445,18 @@ impl<'a> Decoder<'a> {
         n
     }
 
-    fn fill_ref(&mut self, reference: u32, value: ScriptValue) {
-        self.refs.insert(reference, Some(value));
+    // Keeping this copy for a future PRIOR_OBJECT is real memory, so it is
+    // charged before it is made; a subtree already at the budget's edge
+    // must not get a second copy for free.
+    fn fill_ref(
+        &mut self,
+        reference: u32,
+        value: &ScriptValue,
+        cost: Cost,
+    ) -> Result<(), ScriptValueError> {
+        self.charge_copy(cost)?;
+        self.refs.insert(reference, Some((value.clone(), cost)));
+        Ok(())
     }
 }
 

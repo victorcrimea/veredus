@@ -168,3 +168,94 @@ fn rejects_excess_depth() {
     bytes.push(TAG_VOID);
     assert_eq!(decode(&bytes), Err(ScriptValueError::TooDeep));
 }
+
+#[test]
+fn rejects_backref_doubling_chain() {
+    // {a0: [1], a1: [PRIOR(a0), PRIOR(a0)], a2: [PRIOR(a1), PRIOR(a1)], ...}.
+    // Charging a resolved backref its target's whole subtree cost (rather
+    // than the 1 node the backref tag itself takes) means the budget
+    // catches the doubling within a couple dozen props, instead of the
+    // decode materialising the 2^N clones the chain implies.
+    fn key(s: &str) -> Vec<u8> {
+        let mut bytes = vec![1u8]; // latin1
+        bytes.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(s.as_bytes());
+        bytes
+    }
+
+    const LEVELS: u32 = 30;
+    let mut bytes = vec![TAG_OBJECT];
+    bytes.extend_from_slice(&(LEVELS + 1).to_le_bytes()); // props: a0..a{LEVELS}
+
+    // a0 = [1]. The outer object is ref 1, so a0, the first array
+    // decoded, is ref 2.
+    bytes.extend(key("a0"));
+    bytes.push(TAG_ARRAY);
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // arrayLength
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 prop
+    bytes.extend(key("0"));
+    bytes.push(TAG_INT);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+
+    // a{i} = [PRIOR(a{i-1}), PRIOR(a{i-1})]; each array takes the next
+    // reference number, so a{i-1}'s is i+1.
+    for i in 1..=LEVELS {
+        let prev_ref = i + 1;
+        bytes.extend(key(&format!("a{i}")));
+        bytes.push(TAG_ARRAY);
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // arrayLength
+        bytes.extend_from_slice(&2u32.to_le_bytes()); // 2 props
+        bytes.extend(key("0"));
+        bytes.push(TAG_PRIOR_OBJECT);
+        bytes.extend_from_slice(&prev_ref.to_le_bytes());
+        bytes.extend(key("1"));
+        bytes.push(TAG_PRIOR_OBJECT);
+        bytes.extend_from_slice(&prev_ref.to_le_bytes());
+    }
+
+    assert_eq!(decode(&bytes), Err(ScriptValueError::TooLarge));
+}
+
+#[test]
+fn rejects_backref_string_amplification() {
+    // {o: {s: <32 KiB string>}, r: [PRIOR(o) x 40]}. The string is too
+    // small to trip MAX_NODES on its own, but bytes are charged the same
+    // way nodes are, so cloning it a few dozen times through backrefs
+    // still trips MAX_BYTES.
+    fn key(s: &str) -> Vec<u8> {
+        let mut bytes = vec![1u8]; // latin1
+        bytes.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(s.as_bytes());
+        bytes
+    }
+
+    const STRING_LEN: usize = 32 * 1024;
+    const COPIES: u32 = 40;
+
+    let mut bytes = vec![TAG_OBJECT];
+    bytes.extend_from_slice(&2u32.to_le_bytes()); // props: o, r
+
+    // o = { s: <32 KiB string> }. The outer object is ref 1, so o, the
+    // first referenceable value decoded, is ref 2.
+    bytes.extend(key("o"));
+    bytes.push(TAG_OBJECT);
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 prop
+    bytes.extend(key("s"));
+    bytes.push(TAG_STRING);
+    bytes.push(1); // latin1
+    bytes.extend_from_slice(&(STRING_LEN as u32).to_le_bytes());
+    bytes.extend(std::iter::repeat_n(b'x', STRING_LEN));
+
+    // r = [PRIOR(o); COPIES].
+    bytes.extend(key("r"));
+    bytes.push(TAG_ARRAY);
+    bytes.extend_from_slice(&COPIES.to_le_bytes()); // arrayLength
+    bytes.extend_from_slice(&COPIES.to_le_bytes()); // props count
+    for i in 0..COPIES {
+        bytes.extend(key(&i.to_string()));
+        bytes.push(TAG_PRIOR_OBJECT);
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+    }
+
+    assert_eq!(decode(&bytes), Err(ScriptValueError::TooLarge));
+}
