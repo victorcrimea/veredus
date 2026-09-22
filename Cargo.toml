@@ -34,6 +34,7 @@ sasl = "0.5"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 toml = "1.1.6"
 prometheus = { version = "0.13", features = ["process"] }
+unicode-general-category = "1.1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

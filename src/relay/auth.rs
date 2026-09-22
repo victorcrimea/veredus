@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::relay::messages::EnabledMod;
+use unicode_general_category::GeneralCategory;
+use unicode_general_category::get_general_category;
 
 pub const MAX_NAME_LEN: usize = 32;
 pub const ANONYMOUS: &str = "Anonymous";
@@ -34,6 +36,7 @@ pub fn sanitize(raw: &str) -> String {
             ']' => '}',
             other => other,
         })
+        .filter(|c| !c.is_control() && get_general_category(*c) != GeneralCategory::Format)
         .take(MAX_NAME_LEN)
         .collect();
 
@@ -96,3 +99,7 @@ pub fn compatible(
             == format!("{}-{}", client.name, client.version)
     })
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/relay/auth.rs"]
+mod tests;
