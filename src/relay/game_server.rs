@@ -280,6 +280,18 @@ pub fn run_game_server(
         loop {
             match event_rx.try_recv() {
                 Ok(message) => {
+                    // Looked up before the input is handled, while a departing
+                    // client still has its session, so everything logged on
+                    // its behalf, its own departure included, carries it.
+                    let span = match &message {
+                        InboundNetworkMessage::Message { peer, .. }
+                        | InboundNetworkMessage::Disconnect { peer, .. } => server
+                            .as_ref()
+                            .and_then(|s| s.peer_span(*peer))
+                            .unwrap_or_else(tracing::Span::none),
+                        _ => tracing::Span::none(),
+                    };
+                    let _entered = span.enter();
                     if let Some(input) = to_input(message, &mut latest_stats) {
                         // `handle` consumes the server so a transition can be a
                         // consuming method, which is what keeps the phases typed.

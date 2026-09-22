@@ -992,6 +992,23 @@ impl AnyServer {
         }
     }
 
+    // The span of the client behind `peer`, while it has a session.
+    pub fn peer_span(&self, peer: PeerID) -> Option<tracing::Span> {
+        self.ctx().sessions.get(&peer).map(|s| s.span.clone())
+    }
+
+    fn ctx(&self) -> &Context {
+        match self {
+            AnyServer::Idle(s) => &s.ctx,
+            AnyServer::Setup(s) => &s.ctx,
+            AnyServer::AwaitSavegame(s) => &s.ctx,
+            AnyServer::AwaitAiHost(s) => &s.ctx,
+            AnyServer::Loading(s) => &s.ctx,
+            AnyServer::InGame(s) => &s.ctx,
+            AnyServer::PostGame(s) => &s.ctx,
+        }
+    }
+
     pub fn handle(self, input: Input) -> AnyServer {
         match self {
             AnyServer::Idle(s) => s.on_input(input),
@@ -1136,8 +1153,11 @@ impl<S: PhaseMarker> Server<S> {
             });
             return;
         }
-        tracing::info!(peer = peer.0, ip = %addr, "client connected");
-        self.ctx.sessions.insert(peer, Session::new(addr));
+        let session = Session::new(peer, addr);
+        session
+            .span
+            .in_scope(|| tracing::info!(ip = %addr, "client connected"));
+        self.ctx.sessions.insert(peer, session);
 
         // The client compares its mismatch report against this SYN, so it must
         // list exactly the mods the clients run, in load order.
@@ -1210,6 +1230,7 @@ impl<S: PhaseMarker> Server<S> {
             return;
         };
         if let Some(session) = self.ctx.sessions.get_mut(&peer) {
+            session.span.record("lobby_name", username.as_str());
             session.lobby_name = Some(username);
         }
         // The empty AUTHENTICATE is the prompt the client waits for before it
@@ -1444,6 +1465,7 @@ impl<S: PhaseMarker> Server<S> {
             return Ok(());
         };
         if let Some(session) = self.ctx.sessions.get_mut(&peer) {
+            session.span.record("uuid", tracing::field::display(&uuid));
             session.uuid = Some(uuid.clone());
         }
 
@@ -1670,6 +1692,8 @@ impl<S: PhaseMarker> Server<S> {
 
         let role = if joining { Role::Syncing } else { Role::Setup };
         if let Some(session) = self.ctx.sessions.get_mut(&peer) {
+            session.span.record("client_id", client_id);
+            session.span.record("name", name.as_str());
             session.admitted = Some(Admitted {
                 client_id,
                 name: name.clone(),

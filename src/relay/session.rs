@@ -4,6 +4,7 @@
 use std::net::Ipv4Addr;
 
 use chrono::TimeDelta;
+use rusty_enet::PeerID;
 
 use crate::relay::messages::Guid;
 
@@ -21,6 +22,12 @@ pub struct Session {
     pub admitted: Option<Admitted>,
     pub mean_rtt: TimeDelta,
     pub since_last_received: TimeDelta,
+    // Entered for every input from this client, so each line logged on its
+    // behalf can be told apart from the other clients of the same game. The
+    // identity is only learned during the handshake, so the fields start
+    // empty and are recorded as they become known. The address is kept out
+    // on purpose: it is logged only when the client connects and leaves.
+    pub span: tracing::Span,
 }
 
 pub struct Admitted {
@@ -41,7 +48,17 @@ pub enum Role {
 }
 
 impl Session {
-    pub fn new(addr: Ipv4Addr) -> Self {
+    pub fn new(peer: PeerID, addr: Ipv4Addr) -> Self {
+        // Created on the game thread inside its `game` span, which makes this
+        // a child of it: every line carries the game id as well.
+        let span = tracing::info_span!(
+            "client",
+            peer = peer.0,
+            uuid = tracing::field::Empty,
+            lobby_name = tracing::field::Empty,
+            client_id = tracing::field::Empty,
+            name = tracing::field::Empty,
+        );
         Session {
             addr,
             uuid: None,
@@ -49,6 +66,7 @@ impl Session {
             admitted: None,
             mean_rtt: TimeDelta::zero(),
             since_last_received: TimeDelta::zero(),
+            span,
         }
     }
 
