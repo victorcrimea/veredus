@@ -53,6 +53,7 @@ use crate::relay::messages::SynAck;
 use crate::relay::messages::TurnSealed;
 use crate::relay::messages::WireMessage;
 use crate::relay::messages::WrongHashPlayers;
+use crate::relay::monitor::AFK_SILENCE_LIMIT;
 use crate::relay::monitor::Monitor;
 use crate::relay::monitor::PeerStats;
 use crate::relay::monitor::Warning;
@@ -271,6 +272,10 @@ pub struct Config {
     // value longer than any match anyone would play is how the policy is
     // turned off, so there is no second switch to keep in step with this one.
     pub pause_budget: TimeDelta,
+    // When set, the match is held for a player who drops or goes silent
+    // mid-match, charged to that player's pause budget, so leaving is never
+    // a way around it.
+    pub afk_pause: bool,
     // How long the game may sit with nobody ever having joined, or with
     // everybody gone, before it shuts itself down. None means never, which is
     // what keeps a standalone game running with nobody watching it.
@@ -316,6 +321,7 @@ impl Default for Config {
             server_name: "SERVER".to_string(),
             welcome_message: String::new(),
             pause_budget: pause_budget::DEFAULT_BUDGET,
+            afk_pause: true,
             idle_shutdown: None,
             lobby_host_name: String::new(),
             sidecar_dumps: false,
@@ -352,6 +358,10 @@ pub(crate) struct Context {
     next_client_id: u16,
     banned_ips: HashSet<Ipv4Addr>,
     banned_names: HashSet<String>,
+    // Players whose leaving the match does not wait for, because they were
+    // removed on purpose or gave up and are not coming back.
+    forfeited: HashSet<Guid>,
+    resigned: HashSet<i32>,
     transfers: Transfers,
     monitor: Monitor,
     pause_budget: PauseBudget,
@@ -418,6 +428,10 @@ struct CheckpointChain {
     // interval, paying for the whole match every time, so the match goes
     // without checkpoints instead.
     disabled: bool,
+    // Set while the match is held for an absent player: the turn is frozen,
+    // so a run now lands on exactly the state the returning player needs,
+    // and nobody still playing has to serialize it for them.
+    prefetch: bool,
 }
 
 struct PendingCheckpoint {
@@ -606,6 +620,40 @@ impl Context {
             return Err(PeerFault::WrongPhase);
         }
         session.uuid.clone().ok_or(PeerFault::NoSession)
+    }
+
+    // The players the match should be held for. A reclaimed slot counts
+    // until its client is back in-game, so a rejoiner cannot stall the
+    // others in sync for free, and a player whose quota is spent is let go.
+    fn afk_absent(&self) -> Vec<Guid> {
+        self.slots
+            .entries()
+            .filter(|e| e.slot != UNASSIGNED)
+            .filter(|e| !self.forfeited.contains(&e.uuid))
+            .filter(|e| !self.resigned.contains(&i32::from(e.slot)))
+            .filter(|e| self.pause_budget.remaining(&e.uuid) > TimeDelta::zero())
+            .filter(|e| {
+                let session = self
+                    .sessions
+                    .values()
+                    .find(|s| s.uuid.as_ref() == Some(&e.uuid));
+                match session {
+                    None => true,
+                    Some(s) if !e.connected || !s.is_in_game() => true,
+                    Some(s) => s.since_last_received > AFK_SILENCE_LIMIT,
+                }
+            })
+            .map(|e| e.uuid.clone())
+            .collect()
+    }
+
+    // The slot table outlives the session, so it still has a name for a
+    // player who has left.
+    fn absent_name(&self, uuid: &Guid) -> String {
+        self.slots
+            .name_of(uuid)
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid.to_string())
     }
 
     fn peer_of(&self, uuid: &Guid) -> Option<PeerID> {
@@ -1112,7 +1160,12 @@ impl<S: PhaseMarker> Server<S> {
         // disturbs the once-a-second warning cadence.
         if S::PHASE == Phase::InGame {
             let players = self.ctx.slots.connected_players();
-            let events = self.ctx.pause_budget.check(now, players);
+            let absent = if self.ctx.config.afk_pause {
+                self.ctx.afk_absent()
+            } else {
+                Vec::new()
+            };
+            let events = self.ctx.pause_budget.check(now, players, &absent);
             for event in events {
                 self.on_budget_event(event);
             }
@@ -1231,6 +1284,49 @@ impl<S: PhaseMarker> Server<S> {
             BudgetEvent::CoordinatedEnded => self
                 .ctx
                 .server_chat(None, "Pause budgets are draining again."),
+            BudgetEvent::AutoPauseStarted { uuids } => {
+                tracing::info!(absent = uuids.len(), "holding the match for absent players");
+                let relayed = WireMessage::PlayerPause(PlayerPause {
+                    guid: self.ctx.server_uuid.clone(),
+                    pause: true,
+                });
+                self.ctx.broadcast(&relayed, |s| s.is_in_game());
+                for uuid in uuids {
+                    let text = format!(
+                        "Waiting for {}. {}s of pause budget left.",
+                        self.ctx.absent_name(&uuid),
+                        self.ctx.pause_budget.remaining(&uuid).num_seconds()
+                    );
+                    self.ctx.server_chat(None, &text);
+                }
+                self.ctx.checkpoints.prefetch = true;
+            }
+            BudgetEvent::AutoPauseEnded => {
+                tracing::info!("no absent player left to wait for, resuming");
+                let relayed = WireMessage::PlayerPause(PlayerPause {
+                    guid: self.ctx.server_uuid.clone(),
+                    pause: false,
+                });
+                self.ctx.broadcast(&relayed, |s| s.is_in_game());
+                self.ctx.checkpoints.prefetch = false;
+                self.ctx.server_chat(None, "Resuming.");
+            }
+            BudgetEvent::AbsentExpired { uuid } => {
+                tracing::info!(%uuid, "absent player out of pause budget");
+                let text = format!(
+                    "{} did not return in time and is out of pause budget.",
+                    self.ctx.absent_name(&uuid)
+                );
+                self.ctx.server_chat(None, &text);
+            }
+            BudgetEvent::AbsentStatus { uuid, remaining } => {
+                let text = format!(
+                    "Waiting for {}. {}s of pause budget left.",
+                    self.ctx.absent_name(&uuid),
+                    remaining.num_seconds()
+                );
+                self.ctx.server_chat(None, &text);
+            }
         }
     }
 
@@ -1735,6 +1831,10 @@ impl<S: PhaseMarker> Server<S> {
             }
         }
 
+        if let Some(uuid) = self.ctx.uuid_of(target) {
+            self.ctx.forfeited.insert(uuid);
+        }
+
         let reason = if msg.ban {
             DisconnectReason::Banned
         } else {
@@ -2022,6 +2122,8 @@ impl Server<Idle> {
                 next_client_id: 1,
                 banned_ips: HashSet::new(),
                 banned_names: HashSet::new(),
+                forfeited: HashSet::new(),
+                resigned: HashSet::new(),
                 transfers: Transfers::default(),
                 monitor: Monitor::default(),
                 pause_budget,
@@ -2426,7 +2528,12 @@ impl Server<InGame> {
         let turn = self.ctx.turns.ready_turn();
         let base = chain.states.last().cloned();
         let last = base.as_ref().map_or(0, |b| b.turn);
-        if turn < last.saturating_add(interval) {
+        let due = if chain.prefetch {
+            turn > last
+        } else {
+            turn >= last.saturating_add(interval)
+        };
+        if !due {
             return;
         }
         let from_scratch = base.is_none();
@@ -2435,6 +2542,7 @@ impl Server<InGame> {
         };
         request.hashes = self.reference_hashes(last, turn);
         let chain = &mut self.ctx.checkpoints;
+        chain.prefetch = false;
         let id = chain.next_id;
         chain.next_id = chain.next_id.wrapping_add(1);
         chain.pending = Some(PendingCheckpoint {
@@ -2592,6 +2700,15 @@ impl Server<InGame> {
                 WireMessage::PlayerPause(PlayerPause { guid, pause: true }),
             );
         }
+        // Sent even to the player the match was held for: the next tick
+        // lifts it for everyone at once, this client included.
+        if self.ctx.pause_budget.auto_paused() {
+            let guid = self.ctx.server_uuid.clone();
+            self.ctx.send(
+                peer,
+                WireMessage::PlayerPause(PlayerPause { guid, pause: true }),
+            );
+        }
         Ok(())
     }
 
@@ -2685,6 +2802,14 @@ impl Server<InGame> {
                 tracing::debug!(?peer, slot = ?slot, claimed = msg.player, "command slot mismatch");
                 return Ok(());
             }
+        }
+
+        // Checked against the sender's own slot even with cheats on, where
+        // commands for any player are relayed, so nobody can release the
+        // match from waiting on someone else.
+        let own_slot = self.ctx.slots.slot_of(&uuid).map(i32::from) == Some(msg.player);
+        if own_slot && PlayerCommand::extract_command_type(&msg.data).as_deref() == Some("resign") {
+            self.ctx.resigned.insert(msg.player);
         }
 
         // Relayed unchanged, and the echo back to the sender is required: a

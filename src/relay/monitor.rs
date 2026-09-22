@@ -11,6 +11,10 @@ use rusty_enet::PeerID;
 pub const WARNING_INTERVAL: TimeDelta = TimeDelta::seconds(1);
 pub const SILENCE_LIMIT: TimeDelta = TimeDelta::milliseconds(2000);
 pub const BAD_RTT: TimeDelta = TimeDelta::milliseconds(400);
+// Past this a silent player is treated as away and the match is held for it,
+// long before ENet gives up on the peer. Well above SILENCE_LIMIT, so a
+// garbage-collection hitch or a slow frame never pauses anyone.
+pub const AFK_SILENCE_LIMIT: TimeDelta = TimeDelta::seconds(10);
 
 // What a session is warned about. A session is never reported both ways in
 // the same pass.

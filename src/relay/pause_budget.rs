@@ -22,6 +22,13 @@ pub enum BudgetEvent {
     Status { uuid: Guid, remaining: TimeDelta },
     CoordinatedStarted,
     CoordinatedEnded,
+    // The match is held for players who are away: gone, still syncing back
+    // in, or silent too long. Their absence is charged to the same quota a
+    // manual pause spends, so leaving is never a cheaper pause.
+    AutoPauseStarted { uuids: Vec<Guid> },
+    AutoPauseEnded,
+    AbsentExpired { uuid: Guid },
+    AbsentStatus { uuid: Guid, remaining: TimeDelta },
 }
 
 pub struct PauseBudget {
@@ -33,6 +40,7 @@ pub struct PauseBudget {
     last_check: Option<DateTime<Utc>>,
     last_status: Option<DateTime<Utc>>,
     coordinated: bool,
+    auto_paused: bool,
 }
 
 impl PauseBudget {
@@ -44,6 +52,7 @@ impl PauseBudget {
             last_check: None,
             last_status: None,
             coordinated: false,
+            auto_paused: false,
         }
     }
 
@@ -62,6 +71,10 @@ impl PauseBudget {
     // quota is left behind, because the same player may reclaim the slot.
     pub fn clear_pausing(&mut self, uuid: &Guid) {
         self.pausing.remove(uuid);
+    }
+
+    pub fn auto_paused(&self) -> bool {
+        self.auto_paused
     }
 
     pub fn pausing(&self) -> impl Iterator<Item = &Guid> {
@@ -83,10 +96,17 @@ impl PauseBudget {
         }
     }
 
-    // `players` is the count of connected players, which the slot table owns.
-    // Everything else is this module's own state, so a caller can drive a
-    // whole match by choosing the sequence of `now` it passes in.
-    pub fn check(&mut self, now: DateTime<Utc>, players: usize) -> Vec<BudgetEvent> {
+    // `players` is the count of connected players, which the slot table owns,
+    // and `absent` the players the match should wait for, which only the
+    // caller can tell. Everything else is this module's own state, so a
+    // caller can drive a whole match by choosing the sequence of `now` it
+    // passes in.
+    pub fn check(
+        &mut self,
+        now: DateTime<Utc>,
+        players: usize,
+        absent: &[Guid],
+    ) -> Vec<BudgetEvent> {
         let mut events = Vec::new();
 
         // A wall clock can step backwards, so a negative delta re-anchors and
@@ -128,14 +148,48 @@ impl PauseBudget {
             events.push(BudgetEvent::Expired { uuid });
         }
 
+        // Charged even during a coordinated pause: that freeze is an
+        // agreement among the players present, and the absent one is not
+        // party to it.
+        let mut waiting = Vec::new();
+        for uuid in absent {
+            let left = self.remaining.entry(uuid.clone()).or_insert(self.budget);
+            if *left <= TimeDelta::zero() {
+                continue;
+            }
+            *left = (*left - elapsed).max(TimeDelta::zero());
+            if *left <= TimeDelta::zero() {
+                events.push(BudgetEvent::AbsentExpired { uuid: uuid.clone() });
+            } else {
+                waiting.push(uuid.clone());
+            }
+        }
+
+        if !waiting.is_empty() && !self.auto_paused {
+            self.auto_paused = true;
+            events.push(BudgetEvent::AutoPauseStarted {
+                uuids: waiting.clone(),
+            });
+        } else if waiting.is_empty() && self.auto_paused {
+            self.auto_paused = false;
+            events.push(BudgetEvent::AutoPauseEnded);
+        }
+
+        let status_due = (!coordinated || !waiting.is_empty()) && self.status_due(now);
         // Nothing is being spent during a coordinated pause, so a countdown
         // would repeat the same number every interval for as long as it lasts.
-        if !coordinated && self.status_due(now) {
+        if !coordinated && status_due {
             for uuid in &self.pausing {
                 events.push(BudgetEvent::Status {
                     uuid: uuid.clone(),
                     remaining: self.remaining(uuid),
                 });
+            }
+        }
+        if status_due {
+            for uuid in waiting {
+                let remaining = self.remaining(&uuid);
+                events.push(BudgetEvent::AbsentStatus { uuid, remaining });
             }
         }
 

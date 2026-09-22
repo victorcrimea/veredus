@@ -104,6 +104,19 @@ impl Slots {
         }
     }
 
+    // Unlike a session lookup, this still answers for a player who has left,
+    // which is exactly who the match is waiting on.
+    pub fn name_of(&self, uuid: &Guid) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| &e.uuid == uuid)
+            .map(|e| e.name.as_str())
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = &PlayerSlot> {
+        self.entries.iter()
+    }
+
     pub fn slot_of(&self, uuid: &Guid) -> Option<i8> {
         self.entries
             .iter()
