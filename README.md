@@ -1,5 +1,9 @@
 # Veredus - 0 A.D. Dedicated Server
 
+[![CI](https://github.com/victorcrimea/veredus/actions/workflows/ci.yml/badge.svg)](https://github.com/victorcrimea/veredus/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/victorcrimea/veredus?sort=semver)](https://github.com/victorcrimea/veredus/releases)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A dedicated, headless server for [0 A.D.](https://play0ad.com/), the free and
 open-source RTS game. It runs as a network relay that forwards game traffic
 between clients and manages lobby, session, turn and match state so games can
@@ -100,14 +104,26 @@ rejoin state, checkpoint and outcome replays) runs in a spawned
 
 ## Installation
 
+### Prebuilt binary
+
+Download the latest `x86_64-unknown-linux-gnu` build from the
+[Releases page](https://github.com/victorcrimea/veredus/releases),
+verify it against the accompanying `.sha256` file, and run it - no Rust
+toolchain required:
+
+```sh
+tar xzf veredus-*-x86_64-unknown-linux-gnu.tar.gz
+cd veredus-*-x86_64-unknown-linux-gnu
+./veredus --help
+```
+
 ### Build from source
 
 ```sh
 cargo build --release
 ```
 
-The resulting binary is `target/release/veredus`. There are no prebuilt
-release archives yet.
+The resulting binary is `target/release/veredus`.
 
 ## Usage
 
