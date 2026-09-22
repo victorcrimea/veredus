@@ -16,6 +16,7 @@ use std::thread::JoinHandle;
 use uuid::Uuid;
 
 use crate::lobby::link::LobbyLink;
+use crate::metrics::GameMetrics;
 use crate::network_message::InboundNetworkMessage;
 use crate::network_message::OutboundNetworkMessage;
 use crate::relay::enet_task::run_enet_host;
@@ -144,6 +145,9 @@ impl GamePool {
         let server_thread = std::thread::spawn(move || {
             let span = tracing::info_span!("game", game_id = %server_game_id, port);
             let _guard = span.entered();
+            // Outside the unwind boundary, so a panicking game is still
+            // counted and its series are still removed when the thread ends.
+            let mut metrics = GameMetrics::new(&server_game_id, port);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_game_server(
                     event_rx,
@@ -156,6 +160,7 @@ impl GamePool {
                         ai_host_connect,
                         outcome_path,
                     },
+                    &mut metrics,
                 )
             }));
             match result {
@@ -167,6 +172,7 @@ impl GamePool {
                         .or_else(|| panic_payload.downcast_ref::<String>().cloned())
                         .unwrap_or_else(|| "non-string panic payload".to_string());
                     tracing::error!(panic = %message, "server thread panicked");
+                    metrics.ended("panicked");
                     None
                 }
             }

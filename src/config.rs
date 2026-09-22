@@ -27,6 +27,10 @@ const DEFAULT_CHECKPOINT_INTERVAL_TURNS: u32 = 600;
 // How long a pooled-lobby game may sit with nobody ever having joined, or
 // with everybody gone, before it shuts itself down and frees its account.
 const DEFAULT_IDLE_SHUTDOWN_SECS: u64 = 60;
+// Loopback by default: the endpoint names players, so exposing it further is
+// a decision for the operator, not a default.
+const DEFAULT_METRICS_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+const DEFAULT_METRICS_PORT: u16 = 9091;
 
 // Loaded without --config only when present, so a checkout with no file still
 // runs on the built-in defaults.
@@ -56,6 +60,9 @@ pub struct ServerSection {
     pub pyrogenesis_path: PathBuf,
     pub outcome_dir: PathBuf,
     pub checkpoint_interval_turns: u32,
+    // Where the Prometheus endpoint listens; port 0 turns it off.
+    pub metrics_host: IpAddr,
+    pub metrics_port: u16,
 }
 
 impl Default for ServerSection {
@@ -66,6 +73,8 @@ impl Default for ServerSection {
             pyrogenesis_path: PathBuf::new(),
             outcome_dir: PathBuf::new(),
             checkpoint_interval_turns: DEFAULT_CHECKPOINT_INTERVAL_TURNS,
+            metrics_host: DEFAULT_METRICS_HOST,
+            metrics_port: DEFAULT_METRICS_PORT,
         }
     }
 }

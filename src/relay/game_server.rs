@@ -16,10 +16,12 @@ use std::time::Duration;
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
+use rusty_enet::PeerID;
 
 use crate::lobby::link::GameToLobby;
 use crate::lobby::link::LobbyAuthToken;
 use crate::lobby::link::LobbyLink;
+use crate::metrics::GameMetrics;
 use crate::network_message::InboundNetworkMessage;
 use crate::network_message::OutboundNetworkMessage;
 use crate::relay::messages::WireMessage;
@@ -139,13 +141,18 @@ impl AiHostSlot {
             tracing::error!(
                 "sidecar: AI host cannot be spawned: no pyrogenesis or no loopback bind"
             );
+            ai_host_event("spawn_failed");
             self.exited = true;
             return;
         };
         match AiHostProcess::spawn(path, *addr.ip(), addr.port(), name) {
-            Ok(process) => self.process = Some(process),
+            Ok(process) => {
+                ai_host_event("spawned");
+                self.process = Some(process);
+            }
             Err(error) => {
                 tracing::error!(%error, "sidecar: AI host failed to spawn");
+                ai_host_event("spawn_failed");
                 self.exited = true;
             }
         }
@@ -155,11 +162,18 @@ impl AiHostSlot {
     fn take_exit(&mut self) -> bool {
         if let Some(status) = self.process.as_mut().and_then(|p| p.poll_exit()) {
             tracing::warn!(%status, "sidecar: AI host exited");
+            ai_host_event("exited");
             self.process = None;
             self.exited = true;
         }
         std::mem::take(&mut self.exited)
     }
+}
+
+fn ai_host_event(outcome: &str) {
+    crate::metrics::AI_HOST_SIDECAR_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
 }
 
 // Everything a game needs to drive pyrogenesis. `pyrogenesis_path` enables
@@ -178,7 +192,8 @@ pub struct SidecarSetup {
 // standalone mode; when present, its `auth_rx` half feeds Input::LobbyAuth and
 // its `events_tx` half is where lobby-listing effects go. A match that ran is
 // replayed once the loop ends to work out its outcome; the returned handle is
-// that replay's thread.
+// that replay's thread. `metrics` is this game's own series, kept up to date
+// from here because the FSM does no IO of its own.
 pub fn run_game_server(
     event_rx: Receiver<InboundNetworkMessage>,
     send_tx: Sender<OutboundNetworkMessage>,
@@ -186,6 +201,7 @@ pub fn run_game_server(
     config: Config,
     lobby: Option<LobbyLink>,
     sidecar: SidecarSetup,
+    metrics: &mut GameMetrics,
 ) -> Option<JoinHandle<()>> {
     let SidecarSetup {
         pyrogenesis_path,
@@ -196,6 +212,7 @@ pub fn run_game_server(
     // whole idle life in.
     let mut server = Some(AnyServer::from(Server::<Idle>::new(config).listen()));
     let mut latest_stats: Vec<PeerStats> = Vec::new();
+    let mut latest_loss: Vec<(PeerID, u32)> = Vec::new();
     let mut last_tick: DateTime<Utc> = Utc::now();
     let (dump_tx, dump_rx) = std::sync::mpsc::channel::<(u32, Option<Vec<u8>>)>();
     let (checkpoint_tx, checkpoint_rx) =
@@ -217,6 +234,7 @@ pub fn run_game_server(
         exited: false,
     };
     'game: loop {
+        let tick_start = Utc::now();
         // Drained before the ENet events, so a lobby-auth prompt is queued
         // ahead of the AUTHENTICATE it is meant to precede.
         if let Some(lobby) = &lobby {
@@ -292,7 +310,9 @@ pub fn run_game_server(
                         _ => tracing::Span::none(),
                     };
                     let _entered = span.enter();
-                    if let Some(input) = to_input(message, &mut latest_stats) {
+                    let stats_arrived = matches!(message, InboundNetworkMessage::Stats { .. });
+                    let input = to_input(message, &mut latest_stats, &mut latest_loss, metrics);
+                    if let Some(input) = input {
                         // `handle` consumes the server so a transition can be a
                         // consuming method, which is what keeps the phases typed.
                         server = Some(
@@ -302,12 +322,27 @@ pub fn run_game_server(
                                 .handle(input),
                         );
                     }
+                    // Once a second, with the socket thread's sampling, which
+                    // is as fresh as the per-client figures can be anyway.
+                    if stats_arrived && let Some(current) = server.as_ref() {
+                        metrics.observe(
+                            &current.snapshot(),
+                            &latest_stats,
+                            &latest_loss,
+                            Utc::now(),
+                        );
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // The ENet thread dropped its sender, which is how a
                     // deliberate shutdown reaches this loop.
                     tracing::info!("ENet event channel disconnected, shutting down");
+                    metrics.ended(if shutdown_requested.load(Ordering::SeqCst) {
+                        "shutdown"
+                    } else {
+                        "enet_closed"
+                    });
                     break 'game;
                 }
             }
@@ -338,31 +373,57 @@ pub fn run_game_server(
                 lobby.as_ref(),
                 &mut runs,
                 &mut ai_host,
+                metrics,
             );
             if !outcome.channel_ok {
+                metrics.ended("enet_closed");
                 break 'game;
             }
             if outcome.game_over {
                 tracing::info!("game over, ending game");
+                metrics.ended("game_over");
                 let current = server.take().expect("server is always present");
                 outcome_request = current.outcome_request();
+                observe_final(&current, &latest_stats, &latest_loss, metrics);
                 let effects = current.shutdown();
-                drain(effects, &send_tx, lobby.as_ref(), &mut runs, &mut ai_host);
+                drain(
+                    effects,
+                    &send_tx,
+                    lobby.as_ref(),
+                    &mut runs,
+                    &mut ai_host,
+                    metrics,
+                );
                 break 'game;
             }
         }
 
         if shutdown_requested.load(Ordering::SeqCst) {
             tracing::info!("shutdown requested, dropping every peer");
+            metrics.ended("shutdown");
             let current = server.take().expect("server is always present");
             outcome_request = current.outcome_request();
+            observe_final(&current, &latest_stats, &latest_loss, metrics);
             let effects = current.shutdown();
-            drain(effects, &send_tx, lobby.as_ref(), &mut runs, &mut ai_host);
+            drain(
+                effects,
+                &send_tx,
+                lobby.as_ref(),
+                &mut runs,
+                &mut ai_host,
+                metrics,
+            );
             break 'game;
         }
 
+        metrics.tick(Utc::now().signed_duration_since(tick_start));
         std::thread::sleep(POLL_INTERVAL);
     }
+
+    if let Some(current) = server.as_ref() {
+        observe_final(current, &latest_stats, &latest_loss, metrics);
+    }
+    metrics.finish(Utc::now());
 
     // Before the final outcome, so no progress write can land after it.
     runs.checkpoint_slot.stop();
@@ -376,10 +437,18 @@ pub fn run_game_server(
 
 // Stats are cached rather than fed straight in, so the FSM sees timing only on
 // a tick and stays independent of how often the socket thread samples.
-fn to_input(message: InboundNetworkMessage, latest_stats: &mut Vec<PeerStats>) -> Option<Input> {
+fn to_input(
+    message: InboundNetworkMessage,
+    latest_stats: &mut Vec<PeerStats>,
+    latest_loss: &mut Vec<(PeerID, u32)>,
+    metrics: &mut GameMetrics,
+) -> Option<Input> {
     match message {
         InboundNetworkMessage::Connect { peer, addr } => match addr {
-            IpAddr::V4(addr) => Some(Input::Connected { peer, addr }),
+            IpAddr::V4(addr) => {
+                metrics.connected();
+                Some(Input::Connected { peer, addr })
+            }
             // The stock client is IPv4 only, and the ban list is keyed by v4.
             IpAddr::V6(addr) => {
                 tracing::warn!(?peer, %addr, "ignoring IPv6 peer");
@@ -391,18 +460,30 @@ fn to_input(message: InboundNetworkMessage, latest_stats: &mut Vec<PeerStats>) -
         // got a session, is still logged with its address.
         InboundNetworkMessage::Disconnect { peer, addr, reason } => {
             tracing::info!(peer = peer.0, ip = %addr, enet_reason = reason, "client disconnected");
+            metrics.disconnected();
             Some(Input::Disconnected { peer })
         }
         InboundNetworkMessage::Message { peer, data } => match WireMessage::from_bytes(&data) {
-            Ok(msg) => Some(Input::Received { peer, msg }),
+            Ok(msg) => {
+                metrics.message_received(msg.name());
+                Some(Input::Received { peer, msg })
+            }
             // One bad packet is dropped and the connection stays open.
             Err(error) => {
                 tracing::debug!(?peer, %error, bytes = data.len(), "undecodable packet dropped");
+                metrics.undecodable();
                 None
             }
         },
-        InboundNetworkMessage::Stats { stats } => {
+        InboundNetworkMessage::Stats {
+            stats,
+            packet_loss,
+            bytes_received,
+            bytes_sent,
+        } => {
             *latest_stats = stats;
+            *latest_loss = packet_loss;
+            metrics.bytes(bytes_received, bytes_sent);
             None
         }
     }
@@ -420,6 +501,7 @@ fn drain(
     lobby: Option<&LobbyLink>,
     runs: &mut OneShotRuns,
     ai_host: &mut AiHostSlot,
+    metrics: &mut GameMetrics,
 ) -> DrainOutcome {
     let mut outcome = DrainOutcome {
         channel_ok: true,
@@ -432,14 +514,20 @@ fn drain(
                 peer,
                 data: msg.to_bytes(),
             },
-            Effect::Disconnect { peer, reason } => OutboundNetworkMessage::Disconnect {
-                peer,
-                reason: reason as u32,
-            },
-            Effect::DisconnectNow { peer, reason } => OutboundNetworkMessage::DisconnectNow {
-                peer,
-                reason: reason as u32,
-            },
+            Effect::Disconnect { peer, reason } => {
+                metrics.disconnect_sent(reason.name());
+                OutboundNetworkMessage::Disconnect {
+                    peer,
+                    reason: reason as u32,
+                }
+            }
+            Effect::DisconnectNow { peer, reason } => {
+                metrics.disconnect_sent(reason.name());
+                OutboundNetworkMessage::DisconnectNow {
+                    peer,
+                    reason: reason as u32,
+                }
+            }
             Effect::LobbyListing {
                 host_username,
                 nbp,
@@ -475,6 +563,9 @@ fn drain(
                     && checkpoint == Some(id)
                 {
                     tracing::info!(turn, "match outcome resolved");
+                    crate::metrics::MATCH_OUTCOME_TOTAL
+                        .with_label_values(&["checkpoint"])
+                        .inc();
                     if let Some(path) = &runs.outcome_path {
                         write_outcome(path, turn, true, &json);
                     }
@@ -679,13 +770,16 @@ fn spawn_outcome(
             Ok(Ok(resolved)) => resolved,
             Ok(Err(error)) => {
                 tracing::warn!(%error, "sidecar: match outcome replay failed");
+                match_outcome("failed");
                 return;
             }
             Err(_) => {
                 tracing::warn!("sidecar: match outcome replay panicked");
+                match_outcome("failed");
                 return;
             }
         };
+        match_outcome("replay");
         tracing::info!(
             turn,
             time_elapsed_ms = result.time_elapsed,
@@ -696,6 +790,23 @@ fn spawn_outcome(
             write_outcome(&path, turn, true, &json);
         }
     })
+}
+
+fn match_outcome(outcome: &str) {
+    crate::metrics::MATCH_OUTCOME_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+// The last figures before the game lets go of the FSM, so counters bumped
+// since the previous once-a-second report are not lost.
+fn observe_final(
+    server: &AnyServer,
+    stats: &[PeerStats],
+    loss: &[(PeerID, u32)],
+    metrics: &mut GameMetrics,
+) {
+    metrics.observe(&server.snapshot(), stats, loss, Utc::now());
 }
 
 // Written aside and renamed into place, so whoever watches the directory

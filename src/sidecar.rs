@@ -367,6 +367,15 @@ fn supervise_ai_host(
         run_seconds = usage.run_seconds,
         "sidecar: AI host ended"
     );
+    // Only a stop the game asked for counts as a success: the AI host is
+    // meant to run until then.
+    crate::metrics::sidecar_run(
+        "ai_host",
+        stopped,
+        usage.cpu_seconds,
+        usage.run_seconds,
+        usage.peak_rss_bytes,
+    );
     if !stopped {
         let _ = exit_tx.send(status);
     }
@@ -784,10 +793,18 @@ fn run_logged(
         tracing::debug!(step, "sidecar: {line}");
     }
     let usage = watch.usage;
+    let ok = status.as_ref().is_ok_and(|s| s.success());
+    crate::metrics::sidecar_run(
+        step,
+        ok,
+        usage.cpu_seconds,
+        usage.run_seconds,
+        usage.peak_rss_bytes,
+    );
     tracing::info!(
         step,
         pid,
-        ok = status.as_ref().is_ok_and(|s| s.success()),
+        ok,
         cpu_seconds = usage.cpu_seconds,
         peak_rss_bytes = usage.peak_rss_bytes,
         run_seconds = usage.run_seconds,

@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod game_pool;
 pub mod lobby;
+pub mod metrics;
 pub mod network_message;
 pub mod relay;
 pub mod sidecar;

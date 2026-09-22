@@ -25,9 +25,16 @@ pub enum InboundNetworkMessage {
         data: Vec<u8>,
     },
     // Peer timing is only reachable from the thread that owns the host, so it
-    // is sampled there and carried over rather than looked up on demand.
+    // is sampled there and carried over rather than looked up on demand. The
+    // packet loss and the byte totals only feed metrics, which is why they
+    // travel beside the timing rather than inside it.
     Stats {
         stats: Vec<PeerStats>,
+        // ENet's own scale, where PEER_PACKET_LOSS_SCALE means every packet.
+        packet_loss: Vec<(PeerID, u32)>,
+        // Host-wide totals since the socket opened, wrapping at u32.
+        bytes_received: u32,
+        bytes_sent: u32,
     },
 }
 

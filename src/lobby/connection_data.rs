@@ -71,6 +71,12 @@ async fn reply(client: &mut Client, to: Jid, id: String, payload: Element) {
     let _ = client.send_stanza(result.into()).await;
 }
 
+fn connection_data_outcome(outcome: &str) {
+    crate::metrics::LOBBY_CONNECTION_DATA_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
 // Checks run in PROTOCOL.md Sec. 17.4 order. `failures` is the per-assignment
 // counter the account task owns: it is cleared whenever a game ends, because
 // the ban is scoped to one assignment, not to the account's whole lifetime.
@@ -83,12 +89,14 @@ pub async fn handle(
     public_ip: &str,
 ) {
     let Some((assignment, failures)) = assigned else {
+        connection_data_outcome("no_game");
         reply(client, from, id, error_reply("not_server")).await;
         return;
     };
 
     let username = from.node().map(|n| n.to_string()).unwrap_or_default();
     if failures.get(&username).copied().unwrap_or(0) >= MAX_FAILURES {
+        connection_data_outcome("banned");
         reply(client, from, id, error_reply("banned")).await;
         return;
     }
@@ -106,6 +114,7 @@ pub async fn handle(
         Ok(expected) => expected,
         Err(error) => {
             tracing::error!(%error, "connection-data password hash failed");
+            connection_data_outcome("error");
             reply(client, from, id, error_reply("invalid_password")).await;
             return;
         }
@@ -113,10 +122,12 @@ pub async fn handle(
 
     if expected != client_password {
         *failures.entry(username).or_insert(0) += 1;
+        connection_data_outcome("wrong_password");
         reply(client, from, id, error_reply("invalid_password")).await;
         return;
     }
 
     failures.remove(&username);
+    connection_data_outcome("ok");
     reply(client, from, id, response_reply(public_ip, assignment.port)).await;
 }

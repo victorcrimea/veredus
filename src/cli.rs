@@ -52,6 +52,12 @@ struct Args {
     /// [default: 600]
     #[arg(long)]
     checkpoint_interval_turns: Option<u32>,
+    /// Bind address of the Prometheus /metrics endpoint [default: 127.0.0.1]
+    #[arg(long)]
+    metrics_host: Option<IpAddr>,
+    /// Port of the Prometheus /metrics endpoint; 0 disables it [default: 9091]
+    #[arg(long)]
+    metrics_port: Option<u16>,
 }
 
 pub enum Command {
@@ -93,6 +99,12 @@ pub fn parse_args() -> Result<Command, String> {
     }
     if let Some(turns) = args.checkpoint_interval_turns {
         config.server.checkpoint_interval_turns = turns;
+    }
+    if let Some(host) = args.metrics_host {
+        config.server.metrics_host = host;
+    }
+    if let Some(port) = args.metrics_port {
+        config.server.metrics_port = port;
     }
 
     let lobby = match args.lobby_config {

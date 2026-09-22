@@ -25,7 +25,18 @@ use veredus::relay::password;
 use veredus::relay::server_fsm::Config;
 
 // Default directive when neither the environment nor the config file sets one.
-const DEFAULT_LOG_DIRECTIVES: &str = "info";
+// Rocket logs every request and its launch banner at info through `log`,
+// which tracing has already claimed by the time Rocket starts, so its own
+// log_level setting cannot quiet it; only a directive here can.
+const DEFAULT_LOG_DIRECTIVES: &str = "info,rocket=error,_=error,hyper=error";
+
+#[rocket::get("/metrics")]
+fn metrics_route() -> (rocket::http::ContentType, String) {
+    (
+        rocket::http::ContentType::new("text", "plain"),
+        veredus::metrics::encode(),
+    )
+}
 
 #[tokio::main]
 async fn main() {
@@ -56,6 +67,8 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer().with_filter(stdout_filter))
         .with(build_loki_layer(&config.log).map(|layer| layer.with_filter(loki_filter)))
         .init();
+
+    serve_metrics(config.server.metrics_host, config.server.metrics_port);
 
     let mut pool = GamePool::new(config.server.host);
     let pyrogenesis_path = config.server.pyrogenesis_path();
@@ -151,6 +164,35 @@ fn build_loki_layer(log: &LogSection) -> Option<tracing_loki::Layer> {
     Some(layer)
 }
 
+// The endpoint is a side show: failing to bind it is reported and the relay
+// keeps serving games without it.
+fn serve_metrics(host: std::net::IpAddr, port: u16) {
+    if port == 0 {
+        tracing::info!("metrics endpoint disabled");
+        return;
+    }
+    veredus::metrics::init();
+    // Rocket would otherwise take Ctrl+C and SIGTERM for itself: SIGTERM
+    // would then stop only the endpoint instead of the process, and the game
+    // pool must be the one that decides how the process winds down.
+    let figment = rocket::Config::figment()
+        .merge(("address", host))
+        .merge(("port", port))
+        .merge(("shutdown.ctrlc", false))
+        .merge(("shutdown.signals", Vec::<String>::new()))
+        .merge(("cli_colors", false));
+    tokio::spawn(async move {
+        let launched = rocket::custom(figment)
+            .mount("/", rocket::routes![metrics_route])
+            .launch()
+            .await;
+        if let Err(error) = launched {
+            tracing::error!(%error, %host, port, "metrics endpoint failed");
+        }
+    });
+    tracing::info!(%host, port, "metrics endpoint listening on /metrics");
+}
+
 async fn run_standalone(
     pool: &mut GamePool,
     port: u16,
@@ -222,12 +264,14 @@ async fn run_pool_lobby_mode(
             } => {
                 if active_senders.contains(&sender) {
                     tracing::debug!(account, %sender, "ignoring duplicate hostme");
+                    hostme_outcome("duplicate_sender");
                     continue;
                 }
                 // Every idle account in the room reports the same hostme, so a
                 // busy one is simply skipped and the next report is tried.
                 if !lobby_mgr.reserve(account) {
                     tracing::debug!(account, %sender, "hostme reached a busy lobby account");
+                    hostme_outcome("account_busy");
                     continue;
                 }
 
@@ -246,6 +290,7 @@ async fn run_pool_lobby_mode(
                     Ok(password_hash) => password_hash,
                     Err(error) => {
                         tracing::error!(account, %error, "game password hash failed");
+                        hostme_outcome("failed");
                         lobby_mgr.release(account);
                         continue;
                     }
@@ -282,15 +327,18 @@ async fn run_pool_lobby_mode(
                             // this game ended. The account stays reserved because it
                             // can no longer host anything.
                             tracing::error!(account, game_id = %game_id, "lobby account unusable, dropping its game");
+                            hostme_outcome("failed");
                             tokio::task::block_in_place(|| pool.destroy_game(game_id));
                             continue;
                         }
+                        hostme_outcome("hosted");
                         active_senders.insert(sender.clone());
                         account_sender.insert(account, sender);
                         account_game.insert(account, game_id);
                     }
                     Err(error) => {
                         tracing::error!(account, %error, "failed to create game for hostme");
+                        hostme_outcome("failed");
                         lobby_mgr.release(account);
                     }
                 }
@@ -312,4 +360,10 @@ async fn run_pool_lobby_mode(
 
     lobby_mgr.shutdown().await;
     tracing::info!("lobby event loop ended, XMPP accounts shut down");
+}
+
+fn hostme_outcome(outcome: &str) {
+    veredus::metrics::LOBBY_HOSTME_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
 }

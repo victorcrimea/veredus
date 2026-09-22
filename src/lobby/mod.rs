@@ -187,6 +187,7 @@ impl LobbyManager {
             });
         }
 
+        crate::metrics::LOBBY_ACCOUNTS.set(self.accounts.len() as i64);
         main_rx
     }
 
@@ -198,6 +199,7 @@ impl LobbyManager {
         match self.accounts.get_mut(account) {
             Some(slot) if !slot.in_use => {
                 slot.in_use = true;
+                crate::metrics::LOBBY_ACCOUNTS_BUSY.inc();
                 true
             }
             _ => false,
@@ -239,7 +241,10 @@ impl LobbyManager {
     // an account that was never assigned just ignores the message.
     pub fn release(&mut self, account: usize) {
         if let Some(slot) = self.accounts.get_mut(account) {
-            slot.in_use = false;
+            // Release is also sent to accounts that were never reserved.
+            if std::mem::replace(&mut slot.in_use, false) {
+                crate::metrics::LOBBY_ACCOUNTS_BUSY.dec();
+            }
             // Best effort: the task already drops its assignment when the
             // game's channel closes, so a lost Release changes nothing.
             let _ = slot.control_tx.try_send(AccountControl::Release);
@@ -534,10 +539,14 @@ async fn run_account(
                 event = client.next() => {
                     let Some(event) = event else {
                         tracing::warn!("lobby XMPP stream ended");
+                        crate::metrics::LOBBY_STREAM_ENDED_TOTAL.inc();
                         break 'connection false;
                     };
                     if let Event::Online { bound_jid: online_jid, resumed } = event {
                         tracing::info!(bound_jid = %online_jid, resumed, "lobby account online");
+                        crate::metrics::LOBBY_SESSIONS_TOTAL
+                            .with_label_values(&[if resumed { "true" } else { "false" }])
+                            .inc();
                         bound_jid = Some(online_jid.clone());
                         let presence = build_muc_presence(&config.muc_room, &online_jid);
                         let _ = client.send_stanza(presence.into()).await;

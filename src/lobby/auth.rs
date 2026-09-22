@@ -28,6 +28,7 @@ pub async fn handle(
         && let Some(username) = from.node().map(|n| n.to_string())
         && let Some(tx) = auth_tx
     {
+        crate::metrics::LOBBY_AUTH_TOTAL.inc();
         let _ = tx.send(LobbyAuthToken { username, token });
     }
 

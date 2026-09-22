@@ -175,10 +175,17 @@ pub fn run_enet_host(
                     )),
                 })
                 .collect();
-            if event_tx
-                .send(InboundNetworkMessage::Stats { stats })
-                .is_err()
-            {
+            let packet_loss = host
+                .connected_peers()
+                .map(|peer| (peer.id(), peer.packet_loss()))
+                .collect();
+            let stats = InboundNetworkMessage::Stats {
+                stats,
+                packet_loss,
+                bytes_received: host.total_received_data(),
+                bytes_sent: host.total_sent_data(),
+            };
+            if event_tx.send(stats).is_err() {
                 tracing::error!("failed to forward peer stats to server thread");
                 break 'outer;
             }

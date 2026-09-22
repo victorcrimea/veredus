@@ -246,6 +246,29 @@ pub enum DisconnectReason {
     SimulationOrModMismatch = 17,
 }
 
+impl DisconnectReason {
+    // A fixed label per reason, so a metric series can be named after it
+    // without allocating.
+    pub fn name(self) -> &'static str {
+        match self {
+            DisconnectReason::ServerShuttingDown => "ServerShuttingDown",
+            DisconnectReason::GameVersionMismatch => "GameVersionMismatch",
+            DisconnectReason::ServerLoading => "ServerLoading",
+            DisconnectReason::MatchInProgress => "MatchInProgress",
+            DisconnectReason::Kicked => "Kicked",
+            DisconnectReason::Banned => "Banned",
+            DisconnectReason::NameInUse => "NameInUse",
+            DisconnectReason::ServerFull => "ServerFull",
+            DisconnectReason::LobbyAuthFailed => "LobbyAuthFailed",
+            DisconnectReason::NoUuid => "NoUuid",
+            DisconnectReason::OutOfSequenceTurnSeal => "OutOfSequenceTurnSeal",
+            DisconnectReason::OutOfSequenceStateHash => "OutOfSequenceStateHash",
+            DisconnectReason::Refused => "Refused",
+            DisconnectReason::SimulationOrModMismatch => "SimulationOrModMismatch",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub enabled_mods: Vec<EnabledMod>,
@@ -367,6 +390,35 @@ pub enum Phase {
     PostGame,
 }
 
+// Running totals of events only the FSM can see. Kept as plain numbers so
+// the IO side can turn them into metrics without the FSM doing any IO.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Counters {
+    // Turns whose hashes disagreed among the players.
+    pub hash_mismatches: u64,
+    // Turns on which one delayed observer disagreed with the agreed hash.
+    pub observer_hash_mismatches: u64,
+    // Snapshots handed to joiners, by where they came from.
+    pub join_from_checkpoint: u64,
+    pub join_from_dump: u64,
+    pub join_from_client: u64,
+}
+
+// A read-only view of one game for the IO side to report.
+pub struct GameSnapshot {
+    pub phase: Phase,
+    pub sessions: usize,
+    pub players: usize,
+    pub paused: usize,
+    pub ready_turn: u32,
+    // How far the delayed observer feed trails live; None when observers
+    // watch live.
+    pub feed_lag: Option<u32>,
+    // Every admitted client by the name it plays under.
+    pub clients: Vec<(PeerID, String)>,
+    pub counters: Counters,
+}
+
 pub(crate) struct Context {
     config: Config,
     sessions: HashMap<PeerID, Session>,
@@ -412,6 +464,7 @@ pub(crate) struct Context {
     // (Sec. 17.3). None until the controller has sent one; a decode failure
     // keeps whatever was last decoded rather than clearing it.
     lobby_map: Option<LobbyMap>,
+    counters: Counters,
     effects: Vec<Effect>,
 }
 
@@ -813,8 +866,14 @@ impl Context {
             player_names: names,
         });
         match mismatch.recipient {
-            Some(peer) => self.send(peer, msg),
-            None => self.broadcast(&msg, |s| s.is_in_game()),
+            Some(peer) => {
+                self.counters.observer_hash_mismatches += 1;
+                self.send(peer, msg);
+            }
+            None => {
+                self.counters.hash_mismatches += 1;
+                self.broadcast(&msg, |s| s.is_in_game());
+            }
         }
     }
 }
@@ -995,6 +1054,36 @@ impl AnyServer {
     // The span of the client behind `peer`, while it has a session.
     pub fn peer_span(&self, peer: PeerID) -> Option<tracing::Span> {
         self.ctx().sessions.get(&peer).map(|s| s.span.clone())
+    }
+
+    pub fn snapshot(&self) -> GameSnapshot {
+        let phase = match self {
+            // Listening is the setup phase as far as any client can tell.
+            AnyServer::Idle(_) => Phase::Setup,
+            AnyServer::Setup(_) => Setup::PHASE,
+            AnyServer::AwaitSavegame(_) => AwaitSavegame::PHASE,
+            AnyServer::AwaitAiHost(_) => AwaitAiHost::PHASE,
+            AnyServer::Loading(_) => Loading::PHASE,
+            AnyServer::InGame(_) => InGame::PHASE,
+            AnyServer::PostGame(_) => PostGame::PHASE,
+        };
+        let ctx = self.ctx();
+        let ready_turn = ctx.turns.ready_turn();
+        GameSnapshot {
+            phase,
+            sessions: ctx.sessions.len(),
+            players: ctx.slots.connected_players(),
+            paused: ctx.pause_budget.pausing().count(),
+            ready_turn,
+            feed_lag: (ctx.config.observer_delay_turns > 0)
+                .then(|| ready_turn.saturating_sub(ctx.feed.head())),
+            clients: ctx
+                .sessions
+                .iter()
+                .filter_map(|(p, s)| Some((*p, s.name()?.to_string())))
+                .collect(),
+            counters: ctx.counters,
+        }
     }
 
     fn ctx(&self) -> &Context {
@@ -1820,6 +1909,7 @@ impl<S: PhaseMarker> Server<S> {
                 turn = base.turn,
                 "join served from a sidecar checkpoint"
             );
+            self.ctx.counters.join_from_checkpoint += 1;
             self.deliver_snapshot(joiner, base.state, base.turn);
             return;
         }
@@ -2255,6 +2345,7 @@ impl Server<Idle> {
                 ai_host_name: format!("AI host {}", &Guid::new().0[..8]),
                 ai_host: None,
                 lobby_map: None,
+                counters: Counters::default(),
                 effects: Vec::new(),
             },
             st: Idle,
@@ -2835,6 +2926,7 @@ impl<S: MatchPhase> Server<S> {
             let Some(snapshot) = self.ctx.join_snapshot.clone() else {
                 return Ok(());
             };
+            self.ctx.counters.join_from_client += 1;
             self.deliver_snapshot(joiner, snapshot, bound);
         }
         Ok(())
@@ -2860,6 +2952,7 @@ impl<S: MatchPhase> Server<S> {
                         .get(&joiner)
                         .is_some_and(|s| s.is_syncing());
                     if still_syncing {
+                        self.ctx.counters.join_from_dump += 1;
                         self.deliver_snapshot(joiner, snapshot.clone(), turn);
                     }
                 }
