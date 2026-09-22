@@ -75,6 +75,13 @@ impl Slots {
         }
     }
 
+    // Setup never hands a slot back, so whoever left before the start left
+    // for good: kept, they would be waited for as AFK, counted as absent
+    // players, and their slot number reclaimable by name.
+    pub fn purge_disconnected(&mut self) {
+        self.entries.retain(|e| e.connected);
+    }
+
     // Any slot value is accepted and the status is untouched; the engine, not
     // the relay, decides what a slot number means.
     pub fn assign(&mut self, slot: i8, uuid: &Guid) {

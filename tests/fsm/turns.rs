@@ -407,11 +407,12 @@ fn desync_latches_comparison_off_until_the_desynced_peer_leaves() {
         "an outstanding desync must suppress comparison entirely, got {effects:?}"
     );
 
-    // Bob leaves. Comparison resumes and immediately catches the turn 2
-    // mismatch that was latched off, this time between Alice and Carol.
+    // Bob leaves. Comparison resumes, but only for turns reported from now
+    // on: the turn 2 hashes arrived while latched and were never kept, or a
+    // desynced player that plays on would grow them for the whole match.
     let effects = h.enet_confirms_disconnect(bob);
-    assert_eq!(
-        wrong_hash_players(&effects),
-        vec![vec!["Carol".to_string()]]
+    assert!(
+        wrong_hash_players(&effects).is_empty(),
+        "hashes reported while latched must not be compared later, got {effects:?}"
     );
 }

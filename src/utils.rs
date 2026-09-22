@@ -44,7 +44,7 @@ pub fn hex_dump(data: &[u8]) -> String {
 }
 pub fn read_wide_string(buffer: &[u8], start_pos: usize) -> Result<(String, usize), ParseError> {
     let mut pos = start_pos;
-    let mut out = String::new();
+    let mut units = Vec::new();
 
     loop {
         if buffer.len() < pos + 2 {
@@ -60,31 +60,24 @@ pub fn read_wide_string(buffer: &[u8], start_pos: usize) -> Result<(String, usiz
             break; // null terminator found
         }
 
-        let ch = if (0xD800..=0xDFFF).contains(&unit) {
-            '\u{FFFD}'
-        } else {
-            char::from_u32(unit as u32).unwrap_or('\u{FFFD}')
-        };
-
-        out.push(ch);
+        units.push(unit);
     }
+
+    // Decoded as pairs rather than unit by unit, so a character outside the
+    // BMP survives the relay's decode and re-encode of chat and names. Only a
+    // lone surrogate, which no text can be rebuilt from, is replaced.
+    let out = char::decode_utf16(units)
+        .map(|r| r.unwrap_or('\u{FFFD}'))
+        .collect();
 
     Ok((out, pos))
 }
 pub fn write_wide_string(s: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len() * 2 + 2);
 
-    for ch in s.chars() {
-        // characters above U+FFFF become replacement character
-        let unit: u16 = if (ch as u32) <= 0xFFFF {
-            ch as u16
-        } else {
-            0xFFFD
-        };
-
-        // big-endian
-        out.push((unit >> 8) as u8);
-        out.push((unit & 0xFF) as u8);
+    // big-endian
+    for unit in s.encode_utf16() {
+        out.extend_from_slice(&unit.to_be_bytes());
     }
 
     // null terminator
