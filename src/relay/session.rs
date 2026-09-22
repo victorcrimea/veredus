@@ -22,6 +22,9 @@ pub struct Session {
     pub admitted: Option<Admitted>,
     pub mean_rtt: TimeDelta,
     pub since_last_received: TimeDelta,
+    // Join sources that already failed this client, so re-sourcing does not
+    // pick a live but unresponsive one again.
+    pub tried_sources: Vec<PeerID>,
     // Entered for every input from this client, so each line logged on its
     // behalf can be told apart from the other clients of the same game. The
     // identity is only learned during the handshake, so the fields start
@@ -66,6 +69,7 @@ impl Session {
             admitted: None,
             mean_rtt: TimeDelta::zero(),
             since_last_received: TimeDelta::zero(),
+            tried_sources: Vec::new(),
             span,
         }
     }

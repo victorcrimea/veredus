@@ -143,6 +143,7 @@ pub struct GameSection {
     pub pause_budget_secs: u64,
     pub afk_pause: bool,
     pub post_game_linger_secs: u64,
+    pub join_source_stall_secs: u64,
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
     pub enabled_mods: Vec<ModEntry>,
@@ -169,6 +170,9 @@ impl Default for GameSection {
             pause_budget_secs: config.pause_budget.num_seconds().max(0) as u64,
             afk_pause: config.afk_pause,
             post_game_linger_secs: config.post_game_linger.num_seconds().max(0) as u64,
+            join_source_stall_secs: config
+                .join_source_stall
+                .map_or(0, |d| d.num_seconds().max(0) as u64),
             buddies,
             enabled_mods: config
                 .enabled_mods
@@ -210,6 +214,8 @@ impl GameSection {
             pause_budget: secs_to_delta(self.pause_budget_secs),
             afk_pause: self.afk_pause,
             post_game_linger: secs_to_delta(self.post_game_linger_secs),
+            join_source_stall: (self.join_source_stall_secs != 0)
+                .then(|| secs_to_delta(self.join_source_stall_secs)),
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
             checkpoint_interval_turns,
