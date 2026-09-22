@@ -1334,10 +1334,18 @@ impl<S: PhaseMarker> Server<S> {
             tracing::debug!(%username, "lobby auth token matches no session");
             return;
         };
-        if let Some(session) = self.ctx.sessions.get_mut(&peer) {
-            session.span.record("lobby_name", username.as_str());
-            session.lobby_name = Some(username);
+        let Some(session) = self.ctx.sessions.get_mut(&peer) else {
+            return;
+        };
+        // An admitted session's UUID is public in PLAYER_SLOTS, so any lobby
+        // user could name it; before admission only the client knows it, and
+        // its own IQ is the first one.
+        if session.admitted.is_some() || session.lobby_name.is_some() {
+            tracing::debug!(%username, "lobby auth token names an already authenticated session");
+            return;
         }
+        session.span.record("lobby_name", username.as_str());
+        session.lobby_name = Some(username);
         // The empty AUTHENTICATE is the prompt the client waits for before it
         // sends its real credentials.
         self.ctx.send(

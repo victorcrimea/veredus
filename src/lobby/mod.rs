@@ -29,6 +29,7 @@ use tokio_xmpp::connect::ServerConnector;
 use tokio_xmpp::connect::StartTlsServerConnector;
 use tokio_xmpp::minidom::Element;
 use tokio_xmpp::parsers::iq::Iq;
+use tokio_xmpp::parsers::jid::BareJid;
 use tokio_xmpp::parsers::jid::Jid;
 use tokio_xmpp::parsers::message::Message as XmppMessage;
 use tokio_xmpp::parsers::message::MessageType;
@@ -136,7 +137,7 @@ impl LobbyManager {
 
     // Spawns one tokio task per account, staggered by index. Must be called
     // from within a tokio context.
-    pub fn start(&mut self) -> mpsc::Receiver<LobbyEvent> {
+    pub fn start(&mut self) -> mpsc::UnboundedReceiver<LobbyEvent> {
         let _ = tokio_xmpp::rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         let bot_jid: Jid =
@@ -144,8 +145,13 @@ impl LobbyManager {
                 panic!("invalid bot_jid '{}': {error:?}", self.config.bot_jid)
             });
 
+        let muc_bare: BareJid = self.config.muc_room.parse().unwrap_or_else(|error| {
+            panic!("invalid muc_room '{}': {error:?}", self.config.muc_room)
+        });
+
         let account_config = AccountConfig {
             muc_room: self.config.muc_room.clone(),
+            muc_bare,
             bot_jid,
             public_ip: self.config.public_ip.clone(),
             server_name: self.config.server_name.clone(),
@@ -156,7 +162,9 @@ impl LobbyManager {
             .min(RECONNECT_JITTER_MAX),
         };
 
-        let (main_tx, main_rx) = mpsc::channel::<LobbyEvent>(32);
+        // Unbounded so an account task never blocks on a busy main loop: it
+        // would stop answering pings and the IQs of the game it hosts.
+        let (main_tx, main_rx) = mpsc::unbounded_channel::<LobbyEvent>();
 
         for (idx, creds) in self.config.accounts.iter().enumerate() {
             let (control_tx, control_rx) = mpsc::channel::<AccountControl>(16);
@@ -270,6 +278,7 @@ impl LobbyManager {
 #[derive(Clone)]
 struct AccountConfig {
     muc_room: String,
+    muc_bare: BareJid,
     bot_jid: Jid,
     public_ip: String,
     server_name: String,
@@ -427,7 +436,7 @@ async fn run_account(
     creds: XmppCredentials,
     config: AccountConfig,
     mut control_rx: mpsc::Receiver<AccountControl>,
-    main_tx: mpsc::Sender<LobbyEvent>,
+    main_tx: mpsc::UnboundedSender<LobbyEvent>,
 ) {
     // Generated once per task, not per connection: clients salt the game
     // password with the full JID (PROTOCOL.md Sec. 18), so it must stay
@@ -485,9 +494,15 @@ async fn run_account(
                         None => std::future::pending().await,
                     }
                 } => {
-                    match (game_event, bound_jid.as_ref()) {
-                        (Some(GameToLobby::Listing { host_username, nbp, players, map, mods }), Some(host_jid)) => {
-                            let host_jid = host_jid.to_string();
+                    // State is kept even while a replacement client is not
+                    // online yet, and only the sending waits: its first
+                    // session is never resumed, so `resend` lists the game
+                    // from this state once it is online.
+                    match game_event {
+                        Some(GameToLobby::Listing { host_username, nbp, players, map, mods }) => {
+                            // The resource is fixed for the task, so the
+                            // requested JID is what the session will be bound to.
+                            let host_jid = bound_jid.as_ref().unwrap_or(&jid).to_string();
                             registration.offer(gamelist::register_attrs(gamelist::RegisterAttrs {
                                 server_name: &config.server_name,
                                 mods: &mods,
@@ -499,22 +514,25 @@ async fn run_account(
                                 map: map.as_ref(),
                             }));
                         }
-                        (Some(GameToLobby::Started { nbp, players }), Some(_)) => {
-                            // The bot expects the final register before changestate,
-                            // so a listing still inside its window goes out now.
-                            registration.flush(&mut client, &config).await;
-                            send_gamelist(&mut client, &config, gamelist::changestate(nbp, &players)).await;
+                        Some(GameToLobby::Started { nbp, players }) => {
+                            if bound_jid.is_some() {
+                                // The bot expects the final register before changestate,
+                                // so a listing still inside its window goes out now.
+                                registration.flush(&mut client, &config).await;
+                                send_gamelist(&mut client, &config, gamelist::changestate(nbp, &players)).await;
+                            }
                             registration.started = Some((nbp, players));
                         }
-                        (Some(GameToLobby::Ended), Some(_)) => {
+                        Some(GameToLobby::Ended) => {
                             registration.clear();
-                            send_unregister(&mut client, &config).await;
+                            if bound_jid.is_some() {
+                                send_unregister(&mut client, &config).await;
+                            }
                             if let Some(a) = assigned.as_mut() {
                                 a.unlisted = true;
                             }
                         }
-                        (Some(_), None) => {}
-                        (None, _) => {
+                        None => {
                             // The game thread dropped its sender: the match ended.
                             let unlisted = assigned.as_ref().is_some_and(|a| a.unlisted);
                             assigned = None;
@@ -522,7 +540,7 @@ async fn run_account(
                             if bound_jid.is_some() && !unlisted {
                                 send_unregister(&mut client, &config).await;
                             }
-                            let _ = main_tx.send(LobbyEvent::GameEnded { account }).await;
+                            let _ = main_tx.send(LobbyEvent::GameEnded { account });
                         }
                     }
                 }
@@ -533,7 +551,12 @@ async fn run_account(
                         None => std::future::pending().await,
                     }
                 } => {
-                    registration.flush(&mut client, &config).await;
+                    if bound_jid.is_some() {
+                        registration.flush(&mut client, &config).await;
+                    } else {
+                        // `pending` stays for `resend` once the client is online.
+                        registration.debounce = None;
+                    }
                 }
 
                 event = client.next() => {
@@ -599,12 +622,12 @@ async fn handle_stanza(
     bound_jid: Option<&Jid>,
     assigned: &mut Option<Assigned>,
     account: usize,
-    main_tx: &mpsc::Sender<LobbyEvent>,
+    main_tx: &mpsc::UnboundedSender<LobbyEvent>,
 ) {
     match stanza {
         Stanza::Iq(iq) => handle_iq(iq, client, config, assigned).await,
         Stanza::Message(msg) => {
-            handle_muc_message(msg, bound_jid, assigned, account, main_tx).await
+            handle_muc_message(msg, config, bound_jid, assigned, account, main_tx)
         }
         Stanza::Presence(_) => {}
     }
@@ -657,14 +680,21 @@ async fn handle_iq(
 // Only a MUC groupchat "hostme" with no game already assigned turns into a
 // `HostRequested` event. Every outcome, including a failure, is logged only:
 // MUC chat replies stay suppressed (not allowed).
-async fn handle_muc_message(
+fn handle_muc_message(
     msg: XmppMessage,
+    config: &AccountConfig,
     bound_jid: Option<&Jid>,
     assigned: &Option<Assigned>,
     account: usize,
-    main_tx: &mpsc::Sender<LobbyEvent>,
+    main_tx: &mpsc::UnboundedSender<LobbyEvent>,
 ) {
     if msg.type_ != MessageType::Groupchat {
+        return;
+    }
+    // A groupchat-typed message sent straight to our JID would otherwise let
+    // its sender pick any resource as the host name, a new one per message.
+    if msg.from.as_ref().map(|jid| jid.to_bare()).as_ref() != Some(&config.muc_bare) {
+        tracing::debug!(from = ?msg.from, "ignoring groupchat not from the MUC room");
         return;
     }
     // A stanza tagged with delayed delivery is MUC history replayed after a
@@ -695,13 +725,11 @@ async fn handle_muc_message(
         .map(|r| r.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     tracing::info!(%sender, "received hostme");
-    let _ = main_tx
-        .send(LobbyEvent::HostRequested {
-            account,
-            sender,
-            host_jid: host_jid.to_string(),
-        })
-        .await;
+    let _ = main_tx.send(LobbyEvent::HostRequested {
+        account,
+        sender,
+        host_jid: host_jid.to_string(),
+    });
 }
 
 async fn send_gamelist(client: &mut Client, config: &AccountConfig, query: Element) {
