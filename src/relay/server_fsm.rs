@@ -332,6 +332,11 @@ pub struct Config {
     // How long a decided match keeps running for the players who stay to
     // watch or chat before the game shuts down.
     pub post_game_linger: TimeDelta,
+    // How long a client serializing a snapshot for a joiner may go without
+    // sending anything before the joiner is re-sourced elsewhere. It spans
+    // one gap, not the whole transfer, so the first gap has to cover the
+    // source serializing the match. None waits forever.
+    pub join_source_stall: Option<TimeDelta>,
 }
 
 impl Default for Config {
@@ -363,6 +368,7 @@ impl Default for Config {
             hosted_ai: false,
             checkpoint_interval_turns: 0,
             post_game_linger: TimeDelta::minutes(5),
+            join_source_stall: Some(TimeDelta::seconds(30)),
         }
     }
 }
@@ -1267,9 +1273,12 @@ impl<S: PhaseMarker> Server<S> {
         let Some(session) = self.ctx.sessions.remove(&peer) else {
             return;
         };
-        self.ctx.transfers.forget(peer);
+        let orphaned = self.ctx.transfers.forget(peer);
         self.ctx.turns.forget(peer);
         self.ctx.feed.forget(peer);
+        for joiner in orphaned {
+            self.retry_join(joiner, peer);
+        }
         if let Some(dump) = self.ctx.dump.as_mut() {
             dump.waiting.retain(|p| *p != peer);
             if dump.waiting.is_empty() {
@@ -1348,6 +1357,13 @@ impl<S: PhaseMarker> Server<S> {
 
         if self.idle_shutdown_due(now) {
             self.ctx.effects.push(Effect::GameOver);
+        }
+
+        if let Some(limit) = self.ctx.config.join_source_stall {
+            for (source, joiner) in self.ctx.transfers.stalled(now, limit) {
+                tracing::info!(?source, ?joiner, "join source stalled");
+                self.retry_join(joiner, source);
+            }
         }
 
         // Before the warning gate, on its own anchor: the budget is charged
@@ -1920,13 +1936,21 @@ impl<S: PhaseMarker> Server<S> {
         if allow_dump && joiner_delayed && self.request_state_dump(joiner, self.ctx.feed.head()) {
             return;
         }
+        let tried = self
+            .ctx
+            .sessions
+            .get(&joiner)
+            .map(|s| s.tried_sources.clone())
+            .unwrap_or_default();
         let mut candidates: Vec<(PeerID, bool, bool, chrono::TimeDelta)> = self
             .ctx
             .sessions
             .iter()
             // The AI host's state carries a live AI registration, which would
             // start the joiner computing the AI too.
-            .filter(|(p, s)| **p != joiner && s.is_in_game() && !self.ctx.is_ai_host(**p))
+            .filter(|(p, s)| {
+                **p != joiner && s.is_in_game() && !self.ctx.is_ai_host(**p) && !tried.contains(*p)
+            })
             .map(|(p, s)| {
                 let other_feed = self.ctx.turns.is_delayed(*p) != joiner_delayed;
                 (
@@ -1961,6 +1985,26 @@ impl<S: PhaseMarker> Server<S> {
                 request_id,
             }),
         );
+    }
+
+    // The protocol gives a source no way to refuse or fail a request, so a
+    // joiner whose source left, overran or went quiet would wait forever.
+    // Each retry rules out one more source, so this ends at a dump or a
+    // MatchInProgress once no client is left to try.
+    fn retry_join(&mut self, joiner: PeerID, failed: PeerID) {
+        let Some(session) = self.ctx.sessions.get_mut(&joiner) else {
+            return;
+        };
+        if !session.is_syncing() {
+            return;
+        }
+        session.tried_sources.push(failed);
+        tracing::info!(
+            ?joiner,
+            ?failed,
+            "join source lost, fetching the snapshot again"
+        );
+        self.start_snapshot_fetch(joiner, true);
     }
 
     // Hands a snapshot to one joiner: a delayed joiner waits on the feed
@@ -2145,11 +2189,14 @@ impl<S: PhaseMarker> Server<S> {
             }),
         );
 
-        match self
-            .ctx
-            .transfers
-            .on_chunk(peer, msg.request_id, &msg.data)?
+        let purpose = self.ctx.transfers.purpose(peer, msg.request_id);
+        let done = self.ctx.transfers.on_chunk(peer, msg.request_id, &msg.data);
+        if let (Err(PeerFault::TransferOverrun), Some(Purpose::JoinSnapshot { joiner })) =
+            (&done, purpose)
         {
+            self.retry_join(joiner, peer);
+        }
+        match done? {
             Some((Purpose::JoinSnapshot { joiner }, bytes)) => {
                 Ok(Some(TransferDone::JoinSnapshot {
                     joiner,

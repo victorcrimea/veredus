@@ -7,6 +7,7 @@ mod admission;
 mod afk;
 mod handshake;
 mod join;
+mod join_source;
 mod match_end;
 mod observer_feed;
 mod pause;
