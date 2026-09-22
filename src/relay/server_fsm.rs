@@ -3082,6 +3082,26 @@ impl<S: MatchPhase> Server<S> {
 
     fn on_player_command(&mut self, peer: PeerID, msg: PlayerCommand) -> Result<(), PeerFault> {
         let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
+
+        // A player blocks release, so its next unsealed turn is at most
+        // COMMAND_DELAY past the ready turn and never at or before it. Anything
+        // else is a turn every client has already run or one that would stretch
+        // the join replay and the sidecar replays by that far; stored, it would
+        // desync every replay and could end the match on a resign no client
+        // ever executes.
+        let ready_turn = self.ctx.turns.ready_turn();
+        if msg.turn <= ready_turn || msg.turn - ready_turn > COMMAND_DELAY {
+            // Silently, like the slot mismatch below: a stock client never
+            // sends this, and a disconnect would only invite a reconnect.
+            tracing::debug!(
+                ?peer,
+                turn = msg.turn,
+                ready_turn,
+                "command turn out of range"
+            );
+            return Ok(());
+        }
+
         let ai_player = self.ctx.is_ai_host(peer)
             && self
                 .ctx
