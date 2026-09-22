@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Baseline warnings are tolerated (see CLAUDE.md); this only needs to
+      # not fail outright, new warnings are caught in code review.
+      - name: Clippy
+        run: cargo clippy --message-format=short --all-targets
+
+      - name: Build
+        run: cargo build --release --message-format=short
+
+      - name: Test
+        run: cargo test --message-format=short
