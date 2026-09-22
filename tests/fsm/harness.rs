@@ -75,6 +75,11 @@ fn clone_effect(effect: &Effect) -> Effect {
         Effect::CancelStateDump { id } => Effect::CancelStateDump { id: *id },
         Effect::SpawnAiHost { name } => Effect::SpawnAiHost { name: name.clone() },
         Effect::StopAiHost => Effect::StopAiHost,
+        Effect::Checkpoint { id, turn, request } => Effect::Checkpoint {
+            id: *id,
+            turn: *turn,
+            request: request.clone(),
+        },
     }
 }
 

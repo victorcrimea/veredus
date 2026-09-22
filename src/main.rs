@@ -48,7 +48,14 @@ async fn main() {
 
     match mode.lobby_config {
         Some(path) => {
-            run_pool_lobby_mode(&mut pool, path, mode.pyrogenesis_path, mode.outcome_dir).await
+            run_pool_lobby_mode(
+                &mut pool,
+                path,
+                mode.pyrogenesis_path,
+                mode.outcome_dir,
+                mode.checkpoint_interval_turns,
+            )
+            .await
         }
         None => {
             run_standalone(
@@ -56,6 +63,7 @@ async fn main() {
                 mode.port,
                 mode.pyrogenesis_path,
                 mode.outcome_dir,
+                mode.checkpoint_interval_turns,
             )
             .await
         }
@@ -109,6 +117,7 @@ async fn run_standalone(
     port: u16,
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
+    checkpoint_interval_turns: u32,
 ) {
     let (game_id, port) = pool
         .create_game(GameConfig {
@@ -116,6 +125,7 @@ async fn run_standalone(
             server: Config {
                 sidecar_dumps: pyrogenesis_path.is_some(),
                 hosted_ai: pyrogenesis_path.is_some(),
+                checkpoint_interval_turns,
                 ..Config::default()
             },
             lobby: None,
@@ -135,6 +145,7 @@ async fn run_pool_lobby_mode(
     config_path: PathBuf,
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
+    checkpoint_interval_turns: u32,
 ) {
     let config_data = std::fs::read_to_string(&config_path).unwrap_or_else(|error| {
         eprintln!(
@@ -225,6 +236,7 @@ async fn run_pool_lobby_mode(
                     lobby_host_name: sender.clone(),
                     sidecar_dumps: pyrogenesis_path.is_some(),
                     hosted_ai: pyrogenesis_path.is_some(),
+                    checkpoint_interval_turns,
                     ..Config::default()
                 };
 

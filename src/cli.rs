@@ -9,6 +9,10 @@ use clap::Parser;
 // 0x5073, the port stock clients dial unless they are told otherwise.
 const DEFAULT_PORT: u16 = 20595;
 const DEFAULT_HOST: &str = "0.0.0.0";
+// Two minutes of play at the default 200 ms turn: long enough that a run's
+// fixed cost (start, map load, deserialize) stays small next to the turns it
+// replays, short enough that a joiner never catches up for long.
+const DEFAULT_CHECKPOINT_INTERVAL_TURNS: u32 = 600;
 
 #[derive(Parser)]
 #[command(name = "veredus", about = "0 A.D. relay server", version)]
@@ -33,6 +37,11 @@ struct Args {
     /// --pyrogenesis-path, which replays the match to work the outcome out
     #[arg(long)]
     outcome_dir: Option<PathBuf>,
+    /// Turns between two sidecar checkpoints, each resumed from the last;
+    /// joiners are served the newest one and the outcome file follows the
+    /// match while it runs. 0 disables them. Needs --pyrogenesis-path
+    #[arg(long, default_value_t = DEFAULT_CHECKPOINT_INTERVAL_TURNS)]
+    checkpoint_interval_turns: u32,
 }
 
 pub struct RunMode {
@@ -41,6 +50,7 @@ pub struct RunMode {
     pub lobby_config: Option<PathBuf>,
     pub pyrogenesis_path: Option<PathBuf>,
     pub outcome_dir: Option<PathBuf>,
+    pub checkpoint_interval_turns: u32,
 }
 
 pub fn parse_args() -> RunMode {
@@ -51,5 +61,6 @@ pub fn parse_args() -> RunMode {
         lobby_config: args.lobby_config,
         pyrogenesis_path: args.pyrogenesis_path,
         outcome_dir: args.outcome_dir,
+        checkpoint_interval_turns: args.checkpoint_interval_turns,
     }
 }

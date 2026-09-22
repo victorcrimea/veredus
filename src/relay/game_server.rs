@@ -70,6 +70,42 @@ impl Drop for DumpSlot {
     }
 }
 
+// The one in-flight checkpoint run, if any. Unlike a dump it also writes the
+// match's progress to the outcome file, so the game joins it before the final
+// outcome is replayed: a progress line landing after the final one would
+// replace it. Dropping it only trips the flag, for the panic path.
+#[derive(Default)]
+struct CheckpointSlot {
+    cancel: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CheckpointSlot {
+    fn stop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for CheckpointSlot {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+}
+
+// The one-shot runs this game can have in flight, with the channels their
+// workers answer on. Owned by the game thread for its whole life.
+struct OneShotRuns {
+    pyrogenesis_path: Option<PathBuf>,
+    outcome_path: Option<PathBuf>,
+    dump_tx: Sender<(u32, Option<Vec<u8>>)>,
+    dump_slot: DumpSlot,
+    checkpoint_tx: Sender<(u32, Option<Vec<u8>>)>,
+    checkpoint_slot: CheckpointSlot,
+}
+
 // The hosted-AI process for this game, if one is running. It lives on this
 // thread so that every return from the game loop, and a panic caught by the
 // pool, drops it and with it kills the engine.
@@ -150,7 +186,15 @@ pub fn run_game_server(
     let mut latest_stats: Vec<PeerStats> = Vec::new();
     let mut last_tick: DateTime<Utc> = Utc::now();
     let (dump_tx, dump_rx) = std::sync::mpsc::channel::<(u32, Option<Vec<u8>>)>();
-    let mut dump_slot = DumpSlot::default();
+    let (checkpoint_tx, checkpoint_rx) = std::sync::mpsc::channel::<(u32, Option<Vec<u8>>)>();
+    let mut runs = OneShotRuns {
+        pyrogenesis_path: pyrogenesis_path.clone(),
+        outcome_path,
+        dump_tx,
+        dump_slot: DumpSlot::default(),
+        checkpoint_tx,
+        checkpoint_slot: CheckpointSlot::default(),
+    };
     let mut outcome_request: Option<DumpRequest> = None;
     let mut ai_host = AiHostSlot {
         pyrogenesis_path: pyrogenesis_path.clone(),
@@ -195,6 +239,15 @@ pub fn run_game_server(
                     .take()
                     .expect("server is always present")
                     .handle(Input::StateDumped { id, state }),
+            );
+        }
+
+        while let Ok((id, state)) = checkpoint_rx.try_recv() {
+            server = Some(
+                server
+                    .take()
+                    .expect("server is always present")
+                    .handle(Input::Checkpointed { id, state }),
             );
         }
 
@@ -245,9 +298,7 @@ pub fn run_game_server(
                 current.take_effects(),
                 &send_tx,
                 lobby.as_ref(),
-                pyrogenesis_path.as_ref(),
-                &dump_tx,
-                &mut dump_slot,
+                &mut runs,
                 &mut ai_host,
             );
             if !outcome.channel_ok {
@@ -258,15 +309,7 @@ pub fn run_game_server(
                 let current = server.take().expect("server is always present");
                 outcome_request = current.outcome_request();
                 let effects = current.shutdown();
-                drain(
-                    effects,
-                    &send_tx,
-                    lobby.as_ref(),
-                    pyrogenesis_path.as_ref(),
-                    &dump_tx,
-                    &mut dump_slot,
-                    &mut ai_host,
-                );
+                drain(effects, &send_tx, lobby.as_ref(), &mut runs, &mut ai_host);
                 break 'game;
             }
         }
@@ -276,26 +319,21 @@ pub fn run_game_server(
             let current = server.take().expect("server is always present");
             outcome_request = current.outcome_request();
             let effects = current.shutdown();
-            drain(
-                effects,
-                &send_tx,
-                lobby.as_ref(),
-                pyrogenesis_path.as_ref(),
-                &dump_tx,
-                &mut dump_slot,
-                &mut ai_host,
-            );
+            drain(effects, &send_tx, lobby.as_ref(), &mut runs, &mut ai_host);
             break 'game;
         }
 
         std::thread::sleep(POLL_INTERVAL);
     }
 
+    // Before the final outcome, so no progress write can land after it.
+    runs.checkpoint_slot.stop();
+
     // The two shutdown paths consume the server, so they read the record
     // first; every other way out leaves it in place.
     let request = outcome_request.or_else(|| server.as_ref()?.outcome_request())?;
     let path = pyrogenesis_path?;
-    Some(spawn_outcome(path, request, outcome_path))
+    Some(spawn_outcome(path, request, runs.outcome_path.take()))
 }
 
 // Stats are cached rather than fed straight in, so the FSM sees timing only on
@@ -339,9 +377,7 @@ fn drain(
     effects: Vec<Effect>,
     send_tx: &Sender<OutboundNetworkMessage>,
     lobby: Option<&LobbyLink>,
-    pyrogenesis_path: Option<&PathBuf>,
-    dump_tx: &Sender<(u32, Option<Vec<u8>>)>,
-    dump_slot: &mut DumpSlot,
+    runs: &mut OneShotRuns,
     ai_host: &mut AiHostSlot,
 ) -> DrainOutcome {
     let mut outcome = DrainOutcome {
@@ -392,12 +428,23 @@ fn drain(
                 continue;
             }
             Effect::StateDump { id, turn, request } => {
-                let cancel = dump_slot.start(id);
-                spawn_dump(pyrogenesis_path, dump_tx, id, turn, request, cancel);
+                let cancel = runs.dump_slot.start(id);
+                spawn_dump(
+                    runs.pyrogenesis_path.as_ref(),
+                    &runs.dump_tx,
+                    id,
+                    turn,
+                    request,
+                    cancel,
+                );
                 continue;
             }
             Effect::CancelStateDump { id } => {
-                dump_slot.cancel(id);
+                runs.dump_slot.cancel(id);
+                continue;
+            }
+            Effect::Checkpoint { id, turn, request } => {
+                spawn_checkpoint(runs, id, turn, request);
                 continue;
             }
             Effect::SpawnAiHost { name } => {
@@ -469,6 +516,77 @@ fn spawn_dump(
     });
 }
 
+// A checkpoint runs on its own thread for the same reason a dump does. On
+// success it records the match's progress in the outcome file, marked as not
+// final, and hands the state back to the FSM over `tx`.
+fn spawn_checkpoint(runs: &mut OneShotRuns, id: u32, turn: u32, request: DumpRequest) {
+    // Read here, on the game thread, for the same reasons as in spawn_dump.
+    let now = chrono::Utc::now();
+    let span = tracing::Span::current();
+    let Some(path) = runs.pyrogenesis_path.clone() else {
+        let _ = runs.checkpoint_tx.send((id, None));
+        return;
+    };
+    // The FSM runs one checkpoint at a time, so a previous worker has
+    // already answered and is at most finishing its cleanup.
+    if let Some(previous) = runs.checkpoint_slot.handle.take() {
+        let _ = previous.join();
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    runs.checkpoint_slot.cancel = Arc::clone(&cancel);
+    let tx = runs.checkpoint_tx.clone();
+    let outcome_path = runs.outcome_path.clone();
+    let from = request.first_turn();
+    runs.checkpoint_slot.handle = Some(std::thread::spawn(move || {
+        let _guard = span.entered();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir =
+                std::env::temp_dir().join(format!("veredus-checkpoint-{}", uuid::Uuid::new_v4()));
+            let result = crate::sidecar::checkpoint(&path, &dir, turn, &request, now, &cancel);
+            let _ = std::fs::remove_dir_all(&dir);
+            result
+        }));
+        let state = match outcome {
+            Ok(Ok((bytes, result, json))) => {
+                tracing::info!(
+                    from,
+                    turn,
+                    bytes = bytes.len(),
+                    time_elapsed_ms = result.time_elapsed,
+                    players = ?player_summary(&result),
+                    "sidecar: checkpoint ready"
+                );
+                if let Some(path) = outcome_path
+                    && !cancel.load(Ordering::SeqCst)
+                {
+                    write_outcome(&path, turn, false, &json);
+                }
+                Some(bytes)
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(from, turn, %error, "sidecar: checkpoint failed");
+                None
+            }
+            Err(_) => {
+                tracing::warn!(from, turn, "sidecar: checkpoint panicked");
+                None
+            }
+        };
+        let _ = tx.send((id, state));
+    }));
+}
+
+// Only names and states: the full result carries every player's statistics
+// for the whole match and belongs in the file, not a log.
+fn player_summary(result: &crate::sidecar::ReplayResult) -> Vec<(usize, &str, &str)> {
+    result
+        .player_states
+        .iter()
+        .enumerate()
+        .map(|(id, p)| (id, p.name.as_deref().unwrap_or(""), p.state.as_str()))
+        .collect()
+}
+
 // The outcome replay runs the whole match, which can take minutes, so it gets
 // a thread of its own and the game thread returns at once. Nothing can cancel
 // it but the process exiting.
@@ -482,8 +600,9 @@ fn spawn_outcome(
     let span = tracing::Span::current();
     std::thread::spawn(move || {
         let _guard = span.entered();
-        let turns = request.turn_lengths.len();
-        tracing::info!(turns, "sidecar: replaying match for its outcome");
+        let from = request.first_turn();
+        let turn = request.last_turn();
+        tracing::info!(from, turn, "sidecar: replaying match for its outcome");
         let never = AtomicBool::new(false);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let dir =
@@ -504,28 +623,25 @@ fn spawn_outcome(
                 return;
             }
         };
-        // Only names and states: the full result carries every player's
-        // statistics for the whole match and belongs in the file, not a log.
-        let players: Vec<(usize, &str, &str)> = result
-            .player_states
-            .iter()
-            .enumerate()
-            .map(|(id, p)| (id, p.name.as_deref().unwrap_or(""), p.state.as_str()))
-            .collect();
         tracing::info!(
+            turn,
             time_elapsed_ms = result.time_elapsed,
-            ?players,
+            players = ?player_summary(&result),
             "match outcome resolved"
         );
         if let Some(path) = outcome_path {
-            write_outcome(&path, &json);
+            write_outcome(&path, turn, true, &json);
         }
     })
 }
 
 // Written aside and renamed into place, so whoever watches the directory
-// never reads half a result.
-fn write_outcome(path: &std::path::Path, json: &str) {
+// never reads half a result. The engine's result is wrapped with the turn it
+// describes and whether the match is over, since checkpoints rewrite the same
+// file while the match runs. `result` is already JSON, so it is embedded
+// as is rather than parsed and serialized again.
+fn write_outcome(path: &std::path::Path, turn: u32, is_final: bool, result: &str) {
+    let json = format!(r#"{{"turn":{turn},"final":{is_final},"result":{result}}}"#);
     if let Some(parent) = path.parent()
         && let Err(error) = std::fs::create_dir_all(parent)
     {

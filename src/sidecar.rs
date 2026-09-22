@@ -6,8 +6,10 @@ use std::io::Read;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
@@ -55,15 +57,27 @@ const AI_HOST_LOG_POLLS: u64 = 600;
 // before it is killed outright.
 const TERM_GRACE_POLLS: u64 = 60;
 
+// A state a replay can resume from instead of turn 0: the wire turn it was
+// dumped at and the dump itself, in the same compressed, turn-prefixed format
+// a client sends. Shared, because the same checkpoint is both handed to
+// joiners and written out for the next replay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaseState {
+    pub turn: u32,
+    pub state: Arc<Vec<u8>>,
+}
+
 // Everything the one-shot replay needs to rebuild the state at turn T:
 // the frozen settings, the engine version the clients run, the mods in load
-// order, the turn lengths for wire turns 1..=T and the commands for the same
-// turns, in order. Plain data so it can ride inside an Effect.
+// order, the turn lengths for the wire turns after the base (or 1..=T when
+// there is none) and the commands for the same turns, in order. Plain data
+// so it can ride inside an Effect.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DumpRequest {
     pub init_attributes: Vec<u8>,
     pub engine_version: String,
     pub mods: Vec<EnabledMod>,
+    pub base: Option<BaseState>,
     pub turn_lengths: Vec<u16>,
     pub commands: Vec<PlayerCommand>,
     // The players' agreed hash per wire turn, in turn order. The replay checks
@@ -71,6 +85,18 @@ pub struct DumpRequest {
     // different build from the clients. Left empty for a dump, which would
     // otherwise pay for a full state hash every 20 turns for nothing.
     pub hashes: Vec<(u32, Vec<u8>)>,
+}
+
+impl DumpRequest {
+    // The wire turn the replay starts after.
+    pub fn first_turn(&self) -> u32 {
+        self.base.as_ref().map_or(0, |b| b.turn)
+    }
+
+    // The wire turn the replay ends on.
+    pub fn last_turn(&self) -> u32 {
+        self.first_turn() + self.turn_lengths.len() as u32
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +128,8 @@ pub enum SidecarError {
     NoResult,
     #[error("sidecar replay result is not valid JSON: {0}")]
     ResultJson(#[source] serde_json::Error),
+    #[error("sidecar replay diverged from the live match ({0} hash mismatches)")]
+    Diverged(usize),
 }
 
 // What the replay reports once the last turn has run. Only the fields the
@@ -397,25 +425,56 @@ pub fn dump_state(
     if turn < 1 {
         return Err(SidecarError::NoTurn);
     }
-    std::fs::create_dir_all(dir).map_err(|error| SidecarError::Io {
-        context: format!("creating {}", dir.display()),
-        error,
-    })?;
+    // Nothing to replay: the base already is the state at that turn.
+    if let Some(base) = request.base.as_ref().filter(|b| b.turn == turn) {
+        return Ok(base.state.to_vec());
+    }
+    let mut cmd = prepare_replay(pyrogenesis, dir, request, now, cancel)?;
+    let dump_path = add_dump_args(&mut cmd, dir, turn);
+    let output = run_logged(&mut cmd, "dump", STEP_TIMEOUT, cancel)?;
+    if !output.status.success() {
+        return Err(SidecarError::Status {
+            step: "dump",
+            status: output.status,
+        });
+    }
+    read_dump(&dump_path)
+}
 
-    let decoded = decode_commands(pyrogenesis, dir, &request.commands, cancel)?;
-    let commands_txt = dir.join("commands.txt");
-    write_commands_txt(&commands_txt, request, &decoded, now)?;
-
-    // The replay labels the block executed to reach wire turn N as N-1, since
-    // wire turn 0 never gets its own step, so the state at wire turn N is the
-    // state after that block runs.
-    let turn_label = turn - 1;
-    let dump_path = dir.join("state.bin");
-    run_dump_cli(pyrogenesis, &commands_txt, turn_label, &dump_path, cancel)?;
-    std::fs::read(&dump_path).map_err(|error| SidecarError::Io {
-        context: format!("reading {}", dump_path.display()),
-        error,
-    })
+// One link of the rolling chain: resumes from the request's base, replays
+// through wire turn `turn` checking itself against the players' hashes, and
+// returns the state there together with what the engine makes of the match
+// so far. A mismatch fails the link, because a diverged state would be
+// carried into every later one and handed to joiners.
+pub fn checkpoint(
+    pyrogenesis: &Path,
+    dir: &Path,
+    turn: u32,
+    request: &DumpRequest,
+    now: DateTime<Utc>,
+    cancel: &AtomicBool,
+) -> Result<(Vec<u8>, ReplayResult, String), SidecarError> {
+    if turn <= request.first_turn() {
+        return Err(SidecarError::NoTurn);
+    }
+    let mut cmd = prepare_replay(pyrogenesis, dir, request, now, cancel)?;
+    // Quick hashes are skipped by default, and they are most of what the
+    // players agreed on.
+    cmd.arg("-hashtest-quick=true");
+    let dump_path = add_dump_args(&mut cmd, dir, turn);
+    let output = run_logged(&mut cmd, "checkpoint", STEP_TIMEOUT, cancel)?;
+    if !output.status.success() {
+        return Err(SidecarError::Status {
+            step: "checkpoint",
+            status: output.status,
+        });
+    }
+    let mismatch_count = count_mismatches(&output);
+    if mismatch_count > 0 {
+        return Err(SidecarError::Diverged(mismatch_count));
+    }
+    let (result, json) = parse_result(&output)?;
+    Ok((read_dump(&dump_path)?, result, json))
 }
 
 // Replays the whole recorded match through a one-shot pyrogenesis and
@@ -428,6 +487,41 @@ pub fn resolve_outcome(
     now: DateTime<Utc>,
     cancel: &AtomicBool,
 ) -> Result<(ReplayResult, String), SidecarError> {
+    let mut cmd = prepare_replay(pyrogenesis, dir, request, now, cancel)?;
+    // Quick hashes are skipped by default, and they are most of what the
+    // players agreed on.
+    cmd.arg("-hashtest-quick=true");
+    let output = run_logged(&mut cmd, "outcome", OUTCOME_TIMEOUT, cancel)?;
+    if !output.status.success() {
+        return Err(SidecarError::Status {
+            step: "outcome",
+            status: output.status,
+        });
+    }
+
+    let mismatch_count = count_mismatches(&output);
+    if mismatch_count > 0 {
+        // The outcome is still reported, but it may not be the match that
+        // was played: the replay drifted from what the players agreed on.
+        tracing::warn!(
+            mismatch_count,
+            "sidecar: outcome replay diverged from the live match"
+        );
+    }
+    parse_result(&output)
+}
+
+// Decodes the request's commands, writes the replay file and the base state
+// next to it, and returns the engine invocation that replays them. Only the
+// turns after the base are decoded, so a chained run costs its own chunk and
+// not the whole match.
+fn prepare_replay(
+    pyrogenesis: &Path,
+    dir: &Path,
+    request: &DumpRequest,
+    now: DateTime<Utc>,
+    cancel: &AtomicBool,
+) -> Result<Command, SidecarError> {
     std::fs::create_dir_all(dir).map_err(|error| SidecarError::Io {
         context: format!("creating {}", dir.display()),
         error,
@@ -438,34 +532,49 @@ pub fn resolve_outcome(
     write_commands_txt(&commands_txt, request, &decoded, now)?;
 
     let mut cmd = Command::new(pyrogenesis);
-    // Quick hashes are skipped by default, and they are most of what the
-    // players agreed on.
-    cmd.arg(format!("-replay={}", commands_txt.display()))
-        .arg("-hashtest-quick=true");
-    let output = run_logged(&mut cmd, "outcome", OUTCOME_TIMEOUT, cancel)?;
-    if !output.status.success() {
-        return Err(SidecarError::Status {
-            step: "outcome",
-            status: output.status,
-        });
+    cmd.arg(format!("-replay={}", commands_txt.display()));
+    if let Some(base) = &request.base {
+        let base_path = dir.join("base.bin");
+        std::fs::write(&base_path, base.state.as_slice()).map_err(|error| SidecarError::Io {
+            context: format!("writing {}", base_path.display()),
+            error,
+        })?;
+        cmd.arg(format!("-replay-initial-state={}", base_path.display()));
     }
+    Ok(cmd)
+}
 
+// The replay labels the block executed to reach wire turn N as N-1, since
+// wire turn 0 never gets its own step, so the state at wire turn N is the
+// state after that block runs.
+fn add_dump_args(cmd: &mut Command, dir: &Path, turn: u32) -> PathBuf {
+    let dump_path = dir.join("state.bin");
+    cmd.arg(format!("-dump-state-at-turn={}", turn - 1))
+        .arg(format!("-dump-state-out={}", dump_path.display()));
+    dump_path
+}
+
+fn read_dump(dump_path: &Path) -> Result<Vec<u8>, SidecarError> {
+    std::fs::read(dump_path).map_err(|error| SidecarError::Io {
+        context: format!("reading {}", dump_path.display()),
+        error,
+    })
+}
+
+// The replay reports a hash it disagrees with on either stream, depending on
+// where the engine's logger sends it.
+fn count_mismatches(output: &std::process::Output) -> usize {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let mismatch_count = stdout
+    stdout
         .lines()
         .chain(stderr.lines())
         .filter(|line| line.contains("MISMATCH"))
-        .count();
-    if mismatch_count > 0 {
-        // The outcome is still reported, but it may not be the match that
-        // was played: the replay drifted from what the players agreed on.
-        tracing::warn!(
-            mismatch_count,
-            "sidecar: outcome replay diverged from the live match"
-        );
-    }
+        .count()
+}
 
+fn parse_result(output: &std::process::Output) -> Result<(ReplayResult, String), SidecarError> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout
         .lines()
         .find_map(|line| line.strip_prefix(REPLAY_RESULT_PREFIX))
@@ -550,8 +659,9 @@ fn write_commands_txt(
     // single pass over the turns plus a single pass over each list.
     let mut idx = 0;
     let mut hash_idx = 0;
+    let first_turn = request.first_turn();
     for (index, length) in request.turn_lengths.iter().enumerate() {
-        let wire_turn = index as u32 + 1;
+        let wire_turn = first_turn + index as u32 + 1;
         writeln!(out, "turn {} {length}", wire_turn - 1).map_err(|error| SidecarError::Io {
             context: format!("writing {}", path.display()),
             error,
@@ -633,27 +743,6 @@ pub(crate) fn mod_pathname(name: &str) -> Option<&'static str> {
     }
 }
 
-fn run_dump_cli(
-    pyrogenesis: &Path,
-    commands_txt: &Path,
-    turn_label: u32,
-    dump_path: &Path,
-    cancel: &AtomicBool,
-) -> Result<(), SidecarError> {
-    let mut cmd = Command::new(pyrogenesis);
-    cmd.arg(format!("-replay={}", commands_txt.display()))
-        .arg(format!("-dump-state-at-turn={turn_label}"))
-        .arg(format!("-dump-state-out={}", dump_path.display()));
-    let output = run_logged(&mut cmd, "dump", STEP_TIMEOUT, cancel)?;
-    if !output.status.success() {
-        return Err(SidecarError::Status {
-            step: "dump",
-            status: output.status,
-        });
-    }
-    Ok(())
-}
-
 // Runs the child with its pipes drained on reader threads, so a chatty engine
 // can never block on a full pipe buffer, and polls it to completion. The
 // child's output and its cost are folded into the log, so a slow invocation
@@ -664,7 +753,10 @@ fn run_logged(
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> Result<std::process::Output, SidecarError> {
-    cmd.stdout(std::process::Stdio::piped())
+    // A failed engine assertion waits on stdin for what to do next; inherited
+    // from a relay on a terminal, the step would sit there until it times out.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     guard_orphan(cmd);
     let mut child = cmd.spawn().map_err(|error| SidecarError::Io {

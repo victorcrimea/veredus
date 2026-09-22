@@ -72,6 +72,7 @@ use crate::relay::slots::UNASSIGNED;
 use crate::relay::turn::INITIAL_READY_TURN;
 use crate::relay::turn::MatchLog;
 use crate::relay::turn::TurnManager;
+use crate::sidecar::BaseState;
 use crate::sidecar::DumpRequest;
 
 const SYN_CHALLENGE: u32 = 0x5073013F;
@@ -141,6 +142,12 @@ pub enum Input {
     // The AI host process could not be spawned or has exited, from the IO
     // side, which is the only place that can see the child.
     AiHostExited,
+    // A finished link of the rolling checkpoint chain. None means the run
+    // failed or diverged. The id plays the same role as in StateDumped.
+    Checkpointed {
+        id: u32,
+        state: Option<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -198,6 +205,15 @@ pub enum Effect {
     },
     // The AI host is no longer wanted; the IO side kills and reaps it.
     StopAiHost,
+    // A one-shot pyrogenesis run should advance the rolling checkpoint chain
+    // to `turn`, resuming from the request's base. The IO side also records
+    // the match's progress from the same run, and answers with
+    // Input::Checkpointed.
+    Checkpoint {
+        id: u32,
+        turn: u32,
+        request: DumpRequest,
+    },
 }
 
 // Values travel as the ENet disconnect `data` word; only the number reaches the client.
@@ -269,6 +285,12 @@ pub struct Config {
     // When set, a match whose settings have AI slots gets a pyrogenesis AI
     // host that plays them, so no stock client has to compute the AI.
     pub hosted_ai: bool,
+    // How many released turns a match runs between two sidecar checkpoints.
+    // Each one resumes from the last, so a joiner is served a recent state
+    // without anyone serializing for it, the outcome is followed while the
+    // match runs, and no replay ever starts from turn 0 again. 0 turns them
+    // off; they also need sidecar_dumps.
+    pub checkpoint_interval_turns: u32,
 }
 
 impl Default for Config {
@@ -297,6 +319,7 @@ impl Default for Config {
             lobby_host_name: String::new(),
             sidecar_dumps: false,
             hosted_ai: false,
+            checkpoint_interval_turns: 0,
         }
     }
 }
@@ -341,6 +364,7 @@ pub(crate) struct Context {
     // share its cost.
     dump: Option<PendingDump>,
     next_dump_id: u32,
+    checkpoints: CheckpointChain,
     // Both fed only by Input::Tick.now (A2). created_at is set on the first
     // tick; empty_since only once the game has held a player and lost every
     // one again.
@@ -374,6 +398,41 @@ struct PendingDump {
     id: u32,
     turn: u32,
     waiting: Vec<PeerID>,
+}
+
+// The rolling checkpoint chain: the states already built, ascending by turn,
+// and the one run that extends it, if any. Only the newest state at or before
+// the delayed feed and the ones after it are kept, since nothing ever asks
+// for an older one.
+#[derive(Default)]
+struct CheckpointChain {
+    states: Vec<BaseState>,
+    pending: Option<PendingCheckpoint>,
+    next_id: u32,
+    // Consecutive failed runs that resumed from a checkpoint. A bad state
+    // would fail every run after it, so enough of them drop the chain and
+    // the next run starts over from turn 0.
+    failures: u8,
+    // Set when a run from turn 0 fails. It would fail again at the next
+    // interval, paying for the whole match every time, so the match goes
+    // without checkpoints instead.
+    disabled: bool,
+}
+
+struct PendingCheckpoint {
+    id: u32,
+    turn: u32,
+    from_scratch: bool,
+}
+
+// Two in a row is not a one-off: a run that times out on a loaded host has
+// already been retried once from the same base.
+const CHECKPOINT_FAILURE_LIMIT: u8 = 2;
+
+impl CheckpointChain {
+    fn at_or_before(&self, turn: u32) -> Option<&BaseState> {
+        self.states.iter().rev().find(|b| b.turn <= turn)
+    }
 }
 
 // What a completed inbound transfer was for. The payload of a join snapshot
@@ -874,6 +933,7 @@ impl<S: PhaseMarker> Server<S> {
             // Only the in-game phase waits on dumps; everywhere else the
             // result arrives for a game that has moved on.
             Input::StateDumped { .. } => {}
+            Input::Checkpointed { .. } => {}
             // Only a held start acts on this; once the match runs, the AI
             // host's departure is handled when its connection drops.
             Input::AiHostExited => tracing::info!("sidecar: AI host process exited"),
@@ -1492,22 +1552,30 @@ impl<S: PhaseMarker> Server<S> {
     }
 
     // Everything a one-shot replay needs to rebuild the match through wire
-    // turn `turn`. None before the settings are frozen.
+    // turn `turn`, resuming from the newest checkpoint that is not past it.
+    // None before the settings are frozen.
     fn match_record(&self, turn: u32) -> Option<DumpRequest> {
+        let base = self.ctx.checkpoints.at_or_before(turn).cloned();
+        self.match_record_from(base, turn)
+    }
+
+    fn match_record_from(&self, base: Option<BaseState>, turn: u32) -> Option<DumpRequest> {
         let settings = self.st.settings()?;
         let default_length = settings.turn_length_ms as u16;
+        let first = base.as_ref().map_or(0, |b| b.turn);
         let mut turn_lengths = Vec::new();
-        for t in 1..=turn {
+        for t in first + 1..=turn {
             turn_lengths.push(self.ctx.log.turn_length(t).unwrap_or(default_length));
         }
         let mut commands = Vec::new();
-        for t in 1..=turn {
+        for t in first + 1..=turn {
             commands.extend(self.ctx.log.commands_for(t).iter().cloned());
         }
         Some(DumpRequest {
             init_attributes: settings.json.clone(),
             engine_version: SIMULATION_VERSION.to_string(),
             mods: self.ctx.config.enabled_mods.clone(),
+            base,
             turn_lengths,
             commands,
             hashes: Vec::new(),
@@ -1523,11 +1591,28 @@ impl<S: PhaseMarker> Server<S> {
     // start watching without interrupting a player; a live joiner uses the
     // sidecar only when no client can serve it. `allow_dump` is false on the
     // retry after a failed dump, so one failure cannot loop back here.
+    // A checkpoint beats all of them: it is already built, so the joiner
+    // starts at once and no player stalls to serialize for it. A delayed
+    // joiner needs one its feed has already passed.
     fn start_snapshot_fetch(&mut self, joiner: PeerID, allow_dump: bool) {
         let joiner_delayed = self
             .ctx
             .uuid_of(joiner)
             .is_some_and(|u| self.ctx.is_delayed_observer(&u));
+        let newest_usable = if joiner_delayed {
+            self.ctx.feed.head()
+        } else {
+            u32::MAX
+        };
+        if let Some(base) = self.ctx.checkpoints.at_or_before(newest_usable).cloned() {
+            tracing::info!(
+                ?joiner,
+                turn = base.turn,
+                "join served from a sidecar checkpoint"
+            );
+            self.deliver_snapshot(joiner, base.state, base.turn);
+            return;
+        }
         if allow_dump && joiner_delayed && self.request_state_dump(joiner, self.ctx.feed.head()) {
             return;
         }
@@ -1572,6 +1657,31 @@ impl<S: PhaseMarker> Server<S> {
                 request_id,
             }),
         );
+    }
+
+    // Hands a snapshot to one joiner: a delayed joiner waits on the feed
+    // until its state is due, everyone else loads straight away. A live
+    // joiner downloads from the shared cache, so its snapshot always goes
+    // there, even one older than live: any snapshot turn is valid, because
+    // the join replay catches the joiner up from wherever it loads.
+    fn deliver_snapshot(&mut self, joiner: PeerID, snapshot: Arc<Vec<u8>>, bound: u32) {
+        let Some(settings) = self.st.settings() else {
+            return;
+        };
+        let join = Join {
+            init_attributes: settings.json.clone(),
+        };
+        let joiner_delayed = self
+            .ctx
+            .uuid_of(joiner)
+            .is_some_and(|u| self.ctx.is_delayed_observer(&u));
+        if joiner_delayed {
+            self.ctx.feed.hold_join(joiner, bound, join, snapshot);
+            self.ctx.advance_feed();
+        } else {
+            self.ctx.join_snapshot = Some(snapshot);
+            self.ctx.send(joiner, WireMessage::Join(join));
+        }
     }
 
     fn on_chat(&mut self, peer: PeerID, msg: Chat) -> Result<(), PeerFault> {
@@ -1920,6 +2030,7 @@ impl Server<Idle> {
                 join_snapshot: None,
                 dump: None,
                 next_dump_id: 0,
+                checkpoints: CheckpointChain::default(),
                 created_at: None,
                 empty_since: None,
                 ai_host_name: format!("AI host {}", &Guid::new().0[..8]),
@@ -2275,19 +2386,108 @@ impl Server<InGame> {
             return None;
         }
         let mut request = self.match_record(turn)?;
-        request.hashes = (1..=turn)
-            .filter_map(|t| self.ctx.turns.reference(t).map(|hash| (t, hash.to_vec())))
-            .collect();
+        request.hashes = self.reference_hashes(request.first_turn(), turn);
         Some(request)
+    }
+
+    // The players' agreed hashes for the wire turns after `after`, through
+    // `through`, for a replay to check itself against.
+    fn reference_hashes(&self, after: u32, through: u32) -> Vec<(u32, Vec<u8>)> {
+        (after + 1..=through)
+            .filter_map(|t| self.ctx.turns.reference(t).map(|hash| (t, hash.to_vec())))
+            .collect()
     }
 
     fn on_input(mut self, input: Input) -> AnyServer {
         match input {
             Input::Received { peer, msg } => self.on_message(peer, msg),
             Input::StateDumped { id, state } => self.on_state_dumped(id, state),
+            Input::Checkpointed { id, state } => self.on_checkpointed(id, state),
             other => self.on_common_input(other),
         }
+        self.maybe_checkpoint();
         self.into()
+    }
+
+    // Starts the next link once the match has run a whole interval past the
+    // last one. At most one run is in flight, so a run slower than the
+    // interval just makes the next chunk longer instead of queueing more.
+    fn maybe_checkpoint(&mut self) {
+        let interval = self.ctx.config.checkpoint_interval_turns;
+        let chain = &self.ctx.checkpoints;
+        if !self.ctx.config.sidecar_dumps
+            || interval == 0
+            || chain.disabled
+            || chain.pending.is_some()
+        {
+            return;
+        }
+        let turn = self.ctx.turns.ready_turn();
+        let base = chain.states.last().cloned();
+        let last = base.as_ref().map_or(0, |b| b.turn);
+        if turn < last.saturating_add(interval) {
+            return;
+        }
+        let from_scratch = base.is_none();
+        let Some(mut request) = self.match_record_from(base, turn) else {
+            return;
+        };
+        request.hashes = self.reference_hashes(last, turn);
+        let chain = &mut self.ctx.checkpoints;
+        let id = chain.next_id;
+        chain.next_id = chain.next_id.wrapping_add(1);
+        chain.pending = Some(PendingCheckpoint {
+            id,
+            turn,
+            from_scratch,
+        });
+        tracing::debug!(from = last, turn, "sidecar: requesting checkpoint");
+        self.ctx
+            .effects
+            .push(Effect::Checkpoint { id, turn, request });
+    }
+
+    fn on_checkpointed(&mut self, id: u32, state: Option<Vec<u8>>) {
+        let chain = &mut self.ctx.checkpoints;
+        if chain.pending.as_ref().is_none_or(|p| p.id != id) {
+            return;
+        }
+        let pending = chain.pending.take().expect("pending was just checked");
+        let Some(bytes) = state else {
+            if pending.from_scratch {
+                tracing::warn!(
+                    turn = pending.turn,
+                    "sidecar: checkpoint from turn 0 failed, no more checkpoints this match"
+                );
+                chain.disabled = true;
+                return;
+            }
+            chain.failures += 1;
+            if chain.failures >= CHECKPOINT_FAILURE_LIMIT {
+                tracing::warn!(
+                    turn = pending.turn,
+                    "sidecar: checkpoints keep failing, rebuilding the chain from turn 0"
+                );
+                chain.states.clear();
+                chain.failures = 0;
+            }
+            return;
+        };
+        chain.failures = 0;
+        chain.states.push(BaseState {
+            turn: pending.turn,
+            state: Arc::new(bytes),
+        });
+        let head = self.ctx.feed.head();
+        let chain = &mut self.ctx.checkpoints;
+        if let Some(keep_from) = chain.states.iter().rposition(|b| b.turn <= head) {
+            chain.states.drain(..keep_from);
+        }
+        tracing::info!(
+            turn = pending.turn,
+            kept = chain.states.len(),
+            "sidecar: checkpoint stored"
+        );
     }
 
     fn on_message(&mut self, peer: PeerID, msg: WireMessage) {
@@ -2327,28 +2527,6 @@ impl Server<InGame> {
             self.deliver_snapshot(joiner, snapshot, bound);
         }
         Ok(())
-    }
-
-    // Hands a snapshot to one joiner: a delayed joiner waits on the feed
-    // until its state is due, everyone else loads straight away. A live
-    // joiner downloads from the shared cache, so its snapshot always goes
-    // there, even one older than live: any snapshot turn is valid, because
-    // the join replay catches the joiner up from wherever it loads.
-    fn deliver_snapshot(&mut self, joiner: PeerID, snapshot: Arc<Vec<u8>>, bound: u32) {
-        let join = Join {
-            init_attributes: self.st.settings.json.clone(),
-        };
-        let joiner_delayed = self
-            .ctx
-            .uuid_of(joiner)
-            .is_some_and(|u| self.ctx.is_delayed_observer(&u));
-        if joiner_delayed {
-            self.ctx.feed.hold_join(joiner, bound, join, snapshot);
-            self.ctx.advance_feed();
-        } else {
-            self.ctx.join_snapshot = Some(snapshot);
-            self.ctx.send(joiner, WireMessage::Join(join));
-        }
     }
 
     fn on_state_dumped(&mut self, id: u32, state: Option<Vec<u8>>) {
