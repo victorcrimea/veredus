@@ -75,19 +75,5 @@ impl AuthenticateResult {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_authenticate_result() {
-        let msg = AuthenticateResult {
-            code: AuthenticateResultCode::Ok,
-            host_id: 1,
-            is_controller: true,
-            message: "Welcome".to_string(),
-        };
-        let bytes = msg.to_bytes();
-        let decoded = AuthenticateResult::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, msg);
-    }
-}
+#[path = "../../../tests/unit/relay/messages/authenticate_result.rs"]
+mod tests;

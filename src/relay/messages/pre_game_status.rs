@@ -59,17 +59,5 @@ impl PreGameStatus {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_ready() {
-        let msg = PreGameStatus {
-            guid: Guid("abc123".to_string()),
-            status: 1,
-        };
-        let bytes = msg.to_bytes();
-        let decoded = PreGameStatus::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, msg);
-    }
-}
+#[path = "../../../tests/unit/relay/messages/pre_game_status.rs"]
+mod tests;

@@ -59,17 +59,5 @@ impl MapPlayerIdToSlot {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_assign_player() {
-        let msg = MapPlayerIdToSlot {
-            player_id: 2,
-            guid: Guid("abc123".to_string()),
-        };
-        let bytes = msg.to_bytes();
-        let decoded = MapPlayerIdToSlot::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, msg);
-    }
-}
+#[path = "../../../tests/unit/relay/messages/map_player_id_to_slot.rs"]
+mod tests;

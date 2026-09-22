@@ -59,17 +59,5 @@ impl PlayerPause {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roundtrip_client_paused() {
-        let msg = PlayerPause {
-            guid: Guid("abc123".to_string()),
-            pause: true,
-        };
-        let bytes = msg.to_bytes();
-        let decoded = PlayerPause::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, msg);
-    }
-}
+#[path = "../../../tests/unit/relay/messages/player_pause.rs"]
+mod tests;
