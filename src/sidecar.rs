@@ -571,14 +571,23 @@ fn read_dump(dump_path: &Path) -> Result<Vec<u8>, SidecarError> {
 }
 
 // The replay reports a hash it disagrees with on either stream, depending on
-// where the engine's logger sends it.
+// where the engine's logger sends it. A player may name themselves
+// "MISMATCH", which then appears verbatim inside the REPLAY_RESULT line's
+// player states, so matching is anchored to the engine's own line format
+// rather than a bare substring search.
 fn count_mismatches(output: &std::process::Output) -> usize {
+    const MISMATCH_PREFIXES: [&str; 2] = ["hash MISMATCH (", "hash-quick MISMATCH ("];
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     stdout
         .lines()
         .chain(stderr.lines())
-        .filter(|line| line.contains("MISMATCH"))
+        .filter(|line| !line.starts_with(REPLAY_RESULT_PREFIX))
+        .filter(|line| {
+            MISMATCH_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
         .count()
 }
 
