@@ -107,6 +107,8 @@ pub fn parse_args() -> Result<Command, String> {
         config.server.metrics_port = port;
     }
 
+    config.validate()?;
+
     let lobby = match args.lobby_config {
         Some(path) => Some(load_lobby_json(&path)?),
         None if config.lobby.enabled => Some(config.lobby.to_lobby_config()?),

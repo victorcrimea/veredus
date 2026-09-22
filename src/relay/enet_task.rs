@@ -18,7 +18,7 @@ use crate::network_message::OutboundNetworkMessage;
 use crate::relay::monitor::PeerStats;
 
 // Deliberately above the stock server's 41-peer cap so more observers fit.
-const PEER_LIMIT: usize = 200;
+pub const PEER_LIMIT: usize = 200;
 // Every message rides one reliable channel, so ordering is guaranteed.
 const CHANNEL_LIMIT: usize = 1;
 // Stock clients declare this MTU; a host that negotiates a different one is
