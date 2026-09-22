@@ -114,7 +114,7 @@ impl PlayerCommand {
                     return None;
                 }
             } else {
-                pos = skip_script_val(data, pos)?;
+                pos = skip_script_val(data, pos, 0)?;
             }
         }
 
@@ -177,8 +177,17 @@ pub(crate) fn read_script_string(data: &[u8], pos: &mut usize) -> Option<(String
     }
 }
 
+// Commands come from any player and this runs on the game thread. A stack
+// overflow aborts the whole process, which catch_unwind cannot stop, so a
+// deeply nested packet must be refused before it recurses that far. Real
+// commands nest only a few levels.
+const MAX_SKIP_DEPTH: usize = 64;
+
 /// Skip over a ScriptVal without fully parsing it.
-pub(crate) fn skip_script_val(data: &[u8], mut pos: usize) -> Option<usize> {
+pub(crate) fn skip_script_val(data: &[u8], mut pos: usize, depth: usize) -> Option<usize> {
+    if depth > MAX_SKIP_DEPTH {
+        return None;
+    }
     let tag = *data.get(pos)?;
     pos += 1;
 
@@ -210,7 +219,7 @@ pub(crate) fn skip_script_val(data: &[u8], mut pos: usize) -> Option<usize> {
             let num_props = read_u32(data, &mut pos)?;
             for _ in 0..num_props {
                 let (_, _) = read_script_string(data, &mut pos)?;
-                pos = skip_script_val(data, pos)?;
+                pos = skip_script_val(data, pos, depth + 1)?;
             }
             Some(pos)
         }
@@ -220,7 +229,7 @@ pub(crate) fn skip_script_val(data: &[u8], mut pos: usize) -> Option<usize> {
             let num_props = read_u32(data, &mut pos)?;
             for _ in 0..num_props {
                 let (_, _) = read_script_string(data, &mut pos)?;
-                pos = skip_script_val(data, pos)?;
+                pos = skip_script_val(data, pos, depth + 1)?;
             }
             Some(pos)
         }
@@ -232,7 +241,7 @@ pub(crate) fn skip_script_val(data: &[u8], mut pos: usize) -> Option<usize> {
             let num_props = read_u32(data, &mut pos)?;
             for _ in 0..num_props {
                 let (_, _) = read_script_string(data, &mut pos)?;
-                pos = skip_script_val(data, pos)?;
+                pos = skip_script_val(data, pos, depth + 1)?;
             }
             Some(pos)
         }
@@ -242,7 +251,7 @@ pub(crate) fn skip_script_val(data: &[u8], mut pos: usize) -> Option<usize> {
                 return None;
             }
             pos += 1 + 4 + 4;
-            pos = skip_script_val(data, pos)?;
+            pos = skip_script_val(data, pos, depth + 1)?;
             Some(pos)
         }
         SCRIPT_TYPE_ARRAY_BUFFER => {
@@ -257,8 +266,8 @@ pub(crate) fn skip_script_val(data: &[u8], mut pos: usize) -> Option<usize> {
             // u32 size + (ScriptVal key + ScriptVal value) * size
             let size = read_u32(data, &mut pos)?;
             for _ in 0..size {
-                pos = skip_script_val(data, pos)?; // key
-                pos = skip_script_val(data, pos)?; // value
+                pos = skip_script_val(data, pos, depth + 1)?; // key
+                pos = skip_script_val(data, pos, depth + 1)?; // value
             }
             Some(pos)
         }
@@ -266,7 +275,7 @@ pub(crate) fn skip_script_val(data: &[u8], mut pos: usize) -> Option<usize> {
             // u32 size + ScriptVal * size
             let size = read_u32(data, &mut pos)?;
             for _ in 0..size {
-                pos = skip_script_val(data, pos)?;
+                pos = skip_script_val(data, pos, depth + 1)?;
             }
             Some(pos)
         }
