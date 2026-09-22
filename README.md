@@ -239,8 +239,6 @@ connect, disconnect and refused-connection lines.
 
 - [PROTOCOL.md](PROTOCOL.md) - the wire protocol, message layouts and lobby
   IQ formats. Normative for anything on the wire; never guess a field.
-- [AGENTS.md](AGENTS.md) - contributor rules, the threading model and
-  invariants, and the module-by-module code map.
 
 ## License
 
