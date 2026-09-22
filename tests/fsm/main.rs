@@ -5,6 +5,7 @@ mod harness;
 
 mod admission;
 mod afk;
+mod flood;
 mod handshake;
 mod join;
 mod join_source;

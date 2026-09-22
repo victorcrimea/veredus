@@ -37,6 +37,12 @@ pub struct PauseBudget {
     // bounded by the pausers rather than by every session the match saw.
     remaining: HashMap<Guid, TimeDelta>,
     budget: TimeDelta,
+    // What a pause costs however soon it is lifted. The drain alone charges
+    // only the time a pause was held, so toggling at packet rate would cost
+    // nothing while every pause still puts a chat line on everyone's screen.
+    min_charge: TimeDelta,
+    // When each current pause began, as the newest tick time known here.
+    paused_at: HashMap<Guid, DateTime<Utc>>,
     last_check: Option<DateTime<Utc>>,
     last_status: Option<DateTime<Utc>>,
     coordinated: bool,
@@ -44,11 +50,13 @@ pub struct PauseBudget {
 }
 
 impl PauseBudget {
-    pub fn new(budget: TimeDelta) -> Self {
+    pub fn new(budget: TimeDelta, min_charge: TimeDelta) -> Self {
         Self {
             pausing: HashSet::new(),
             remaining: HashMap::new(),
             budget,
+            min_charge,
+            paused_at: HashMap::new(),
             last_check: None,
             last_status: None,
             coordinated: false,
@@ -60,9 +68,31 @@ impl PauseBudget {
     // whether the message is worth relaying.
     pub fn set_pausing(&mut self, uuid: &Guid, pausing: bool) -> bool {
         if pausing {
-            self.pausing.insert(uuid.clone())
+            let inserted = self.pausing.insert(uuid.clone());
+            if inserted && let Some(now) = self.last_check {
+                self.paused_at.insert(uuid.clone(), now);
+            }
+            inserted
         } else {
-            self.pausing.remove(uuid)
+            let removed = self.pausing.remove(uuid);
+            if removed {
+                self.charge_shortfall(uuid);
+            }
+            removed
+        }
+    }
+
+    // Charges what the drain has not yet taken of the minimum, so a pause
+    // held longer than the minimum costs exactly its length.
+    fn charge_shortfall(&mut self, uuid: &Guid) {
+        let (Some(start), Some(now)) = (self.paused_at.remove(uuid), self.last_check) else {
+            return;
+        };
+        let held = now.signed_duration_since(start).max(TimeDelta::zero());
+        let shortfall = self.min_charge - held;
+        if shortfall > TimeDelta::zero() {
+            let left = self.remaining.entry(uuid.clone()).or_insert(self.budget);
+            *left = (*left - shortfall).max(TimeDelta::zero());
         }
     }
 
@@ -70,7 +100,10 @@ impl PauseBudget {
     // that pauses and then leaves never gets an unpause on the wire. Its
     // quota is left behind, because the same player may reclaim the slot.
     pub fn clear_pausing(&mut self, uuid: &Guid) {
-        self.pausing.remove(uuid);
+        // Charged like an unpause, or leaving would be the free way to toggle.
+        if self.pausing.remove(uuid) {
+            self.charge_shortfall(uuid);
+        }
     }
 
     pub fn auto_paused(&self) -> bool {
@@ -145,6 +178,7 @@ impl PauseBudget {
             .collect();
         for uuid in spent {
             self.pausing.remove(&uuid);
+            self.paused_at.remove(&uuid);
             events.push(BudgetEvent::Expired { uuid });
         }
 
@@ -216,3 +250,7 @@ impl PauseBudget {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/relay/pause_budget.rs"]
+mod tests;

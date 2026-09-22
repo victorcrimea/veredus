@@ -63,6 +63,8 @@ use crate::relay::password;
 use crate::relay::pause_budget;
 use crate::relay::pause_budget::BudgetEvent;
 use crate::relay::pause_budget::PauseBudget;
+use crate::relay::rate_limit::Limits;
+use crate::relay::rate_limit::Verdict;
 use crate::relay::script_value;
 use crate::relay::session::Admitted;
 use crate::relay::session::Role;
@@ -354,6 +356,24 @@ pub struct Config {
     // back for everyone. It must cover a large map on a slow machine. None
     // waits forever.
     pub loading_timeout: Option<TimeDelta>,
+    // Per-peer limits on what is fanned out to every session. A stock client
+    // stays far below all of them; without them one peer can multiply its own
+    // bandwidth by the session count and grow the match log without bound.
+    // A rate of 0 turns that bucket off, and a cap of 0 that cap.
+    pub chat_per_sec: u32,
+    pub chat_burst: u32,
+    pub chat_max_chars: usize,
+    pub flare_per_sec: u32,
+    pub flare_burst: u32,
+    // Counted per turn a command is scheduled for, because that is what the
+    // match log and every replay of it grow by.
+    pub commands_per_turn: u32,
+    pub command_bytes_per_turn: usize,
+    // What a pause costs however soon it is lifted.
+    pub pause_min_charge: TimeDelta,
+    // How many times its limit a peer may send before it is disconnected
+    // rather than merely dropped. 0 never disconnects.
+    pub flood_kick_multiple: u32,
 }
 
 impl Default for Config {
@@ -389,6 +409,15 @@ impl Default for Config {
             handshake_timeout: Some(TimeDelta::seconds(30)),
             max_pending_per_ip: 4,
             loading_timeout: Some(TimeDelta::minutes(5)),
+            chat_per_sec: 2,
+            chat_burst: 10,
+            chat_max_chars: 1024,
+            flare_per_sec: 1,
+            flare_burst: 5,
+            commands_per_turn: 32,
+            command_bytes_per_turn: 16 * 1024,
+            pause_min_charge: TimeDelta::seconds(5),
+            flood_kick_multiple: 4,
         }
     }
 }
@@ -477,6 +506,9 @@ pub(crate) struct Context {
     // one again.
     created_at: Option<DateTime<Utc>>,
     empty_since: Option<DateTime<Utc>>,
+    // The newest Input::Tick.now, so a handler can refill a rate limit
+    // without reading the clock (A2).
+    now: Option<DateTime<Utc>>,
     // The name the AI host authenticates under. Fixed per game, and only
     // honoured from loopback while an AI host is expected, so a remote client
     // that copies it off the slot list gains nothing.
@@ -730,6 +762,28 @@ impl Context {
             return Err(PeerFault::WrongPhase);
         }
         session.uuid.clone().ok_or(PeerFault::NoSession)
+    }
+
+    // Going over is dropped quietly: a stock client never gets there, and
+    // telling the peer would only help a flooder pace itself. Only carrying
+    // on far past the limit costs the connection.
+    fn within_limit(
+        &mut self,
+        peer: PeerID,
+        kind: &'static str,
+        charge: impl FnOnce(&mut Limits, Option<DateTime<Utc>>, u32) -> Verdict,
+    ) -> Result<bool, PeerFault> {
+        let now = self.now;
+        let kick_multiple = self.config.flood_kick_multiple;
+        let session = self.sessions.get_mut(&peer).ok_or(PeerFault::NoSession)?;
+        match charge(&mut session.limits, now, kick_multiple) {
+            Verdict::Pass => Ok(true),
+            Verdict::Drop => {
+                tracing::debug!(?peer, kind, "over rate limit, dropped");
+                Ok(false)
+            }
+            Verdict::Kick => Err(PeerFault::Flooding),
+        }
     }
 
     // The players the match should be held for. A reclaimed slot counts
@@ -1291,7 +1345,7 @@ impl<S: PhaseMarker> Server<S> {
                 return;
             }
         }
-        let session = Session::new(peer, addr);
+        let session = Session::new(peer, addr, Limits::new(&self.ctx.config));
         session
             .span
             .in_scope(|| tracing::info!(ip = %addr, "client connected"));
@@ -1395,6 +1449,7 @@ impl<S: PhaseMarker> Server<S> {
     }
 
     fn on_tick(&mut self, now: DateTime<Utc>, stats: Vec<PeerStats>) {
+        self.ctx.now = Some(now);
         for sample in &stats {
             if let Some(session) = self.ctx.sessions.get_mut(&sample.peer) {
                 session.mean_rtt = sample.mean_rtt;
@@ -2141,6 +2196,17 @@ impl<S: PhaseMarker> Server<S> {
     fn on_chat(&mut self, peer: PeerID, msg: Chat) -> Result<(), PeerFault> {
         // A joiner still pulling its snapshot receives chat but cannot send it.
         let uuid = self.ctx.speaker(peer, |s| s.is_setup() || s.is_in_game())?;
+        let max_chars = self.ctx.config.chat_max_chars;
+        if max_chars != 0 && msg.message.chars().count() > max_chars {
+            tracing::debug!(?peer, "chat message too long, dropped");
+            return Ok(());
+        }
+        if !self
+            .ctx
+            .within_limit(peer, "chat", |l, now, k| l.chat.take(now, k))?
+        {
+            return Ok(());
+        }
         let receivers = msg.receivers;
         // The relayed copy carries an empty receiver list, and the sender's
         // claimed UUID is replaced so it cannot speak as anyone else.
@@ -2481,7 +2547,7 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
 
 impl Server<Idle> {
     pub fn new(config: Config) -> Self {
-        let pause_budget = PauseBudget::new(config.pause_budget);
+        let pause_budget = PauseBudget::new(config.pause_budget, config.pause_min_charge);
         let delay = config.observer_delay_turns;
         Server {
             ctx: Context {
@@ -2507,6 +2573,7 @@ impl Server<Idle> {
                 checkpoints: CheckpointChain::default(),
                 created_at: None,
                 empty_since: None,
+                now: None,
                 ai_host_name: format!("AI host {}", &Guid::new().0[..8]),
                 ai_host: None,
                 lobby_map: None,
@@ -3265,7 +3332,11 @@ impl<S: MatchPhase> Server<S> {
                 return Ok(());
             }
 
-            self.ctx.pause_budget.set_pausing(&uuid, true);
+            // Already paused: a repeat would only replay the chat line to
+            // everyone without costing another minimum charge.
+            if !self.ctx.pause_budget.set_pausing(&uuid, true) {
+                return Ok(());
+            }
             let relayed = WireMessage::PlayerPause(PlayerPause {
                 guid: uuid.clone(),
                 pause: true,
@@ -3285,7 +3356,11 @@ impl<S: MatchPhase> Server<S> {
             return Ok(());
         }
 
-        self.ctx.pause_budget.set_pausing(&uuid, false);
+        // A repeated unpause changes nothing, and relaying it anyway would be a
+        // free broadcast.
+        if !self.ctx.pause_budget.set_pausing(&uuid, false) {
+            return Ok(());
+        }
         let relayed = WireMessage::PlayerPause(PlayerPause {
             guid: uuid,
             pause: false,
@@ -3315,6 +3390,20 @@ impl<S: MatchPhase> Server<S> {
                 "command turn out of range"
             );
             return Ok(());
+        }
+
+        // The AI host is our own process, and it plays every AI slot at once.
+        if !self.ctx.is_ai_host(peer) {
+            let max_count = self.ctx.config.commands_per_turn;
+            let max_bytes = self.ctx.config.command_bytes_per_turn;
+            let bytes = msg.data.len();
+            let within = self.ctx.within_limit(peer, "command", |l, _, k| {
+                l.commands
+                    .charge(msg.turn, bytes, ready_turn, max_count, max_bytes, k)
+            })?;
+            if !within {
+                return Ok(());
+            }
         }
 
         let ai_player = self.ctx.is_ai_host(peer)
@@ -3359,6 +3448,12 @@ impl<S: MatchPhase> Server<S> {
 
     fn on_flare(&mut self, peer: PeerID, msg: Flare) -> Result<(), PeerFault> {
         let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
+        if !self
+            .ctx
+            .within_limit(peer, "flare", |l, now, k| l.flare.take(now, k))?
+        {
+            return Ok(());
+        }
         let flare = Flare { guid: uuid, ..msg };
         self.ctx.broadcast_live(&WireMessage::Flare(flare.clone()));
 

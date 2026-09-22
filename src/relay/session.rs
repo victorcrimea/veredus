@@ -9,6 +9,7 @@ use chrono::Utc;
 use rusty_enet::PeerID;
 
 use crate::relay::messages::Guid;
+use crate::relay::rate_limit::Limits;
 
 // The protocol describes six session phases, but says they are behaviour
 // classes rather than a data structure and warns against mirroring them as an
@@ -37,6 +38,7 @@ pub struct Session {
     // empty and are recorded as they become known. The address is kept out
     // on purpose: it is logged only when the client connects and leaves.
     pub span: tracing::Span,
+    pub limits: Limits,
 }
 
 pub struct Admitted {
@@ -57,7 +59,7 @@ pub enum Role {
 }
 
 impl Session {
-    pub fn new(peer: PeerID, addr: Ipv4Addr) -> Self {
+    pub fn new(peer: PeerID, addr: Ipv4Addr, limits: Limits) -> Self {
         // Created on the game thread inside its `game` span, which makes this
         // a child of it: every line carries the game id as well.
         let span = tracing::info_span!(
@@ -78,6 +80,7 @@ impl Session {
             tried_sources: Vec::new(),
             pending_since: None,
             span,
+            limits,
         }
     }
 

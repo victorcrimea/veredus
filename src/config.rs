@@ -172,6 +172,15 @@ pub struct GameSection {
     pub handshake_timeout_secs: u64,
     pub max_pending_per_ip: usize,
     pub loading_timeout_secs: u64,
+    pub chat_per_sec: u32,
+    pub chat_burst: u32,
+    pub chat_max_chars: usize,
+    pub flare_per_sec: u32,
+    pub flare_burst: u32,
+    pub commands_per_turn: u32,
+    pub command_bytes_per_turn: usize,
+    pub pause_min_charge_secs: u64,
+    pub flood_kick_multiple: u32,
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
     pub enabled_mods: Vec<ModEntry>,
@@ -208,6 +217,15 @@ impl Default for GameSection {
             loading_timeout_secs: config
                 .loading_timeout
                 .map_or(0, |d| d.num_seconds().max(0) as u64),
+            chat_per_sec: config.chat_per_sec,
+            chat_burst: config.chat_burst,
+            chat_max_chars: config.chat_max_chars,
+            flare_per_sec: config.flare_per_sec,
+            flare_burst: config.flare_burst,
+            commands_per_turn: config.commands_per_turn,
+            command_bytes_per_turn: config.command_bytes_per_turn,
+            pause_min_charge_secs: config.pause_min_charge.num_seconds().max(0) as u64,
+            flood_kick_multiple: config.flood_kick_multiple,
             buddies,
             enabled_mods: config
                 .enabled_mods
@@ -256,6 +274,15 @@ impl GameSection {
             max_pending_per_ip: self.max_pending_per_ip,
             loading_timeout: (self.loading_timeout_secs != 0)
                 .then(|| secs_to_delta(self.loading_timeout_secs)),
+            chat_per_sec: self.chat_per_sec,
+            chat_burst: self.chat_burst,
+            chat_max_chars: self.chat_max_chars,
+            flare_per_sec: self.flare_per_sec,
+            flare_burst: self.flare_burst,
+            commands_per_turn: self.commands_per_turn,
+            command_bytes_per_turn: self.command_bytes_per_turn,
+            pause_min_charge: secs_to_delta(self.pause_min_charge_secs),
+            flood_kick_multiple: self.flood_kick_multiple,
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
             checkpoint_interval_turns,
@@ -402,6 +429,18 @@ impl FileConfig {
                 self.game.max_sessions
             ));
         }
+        // A bucket that holds nothing drops every message, which is not what
+        // a rate that is switched on means.
+        if self.game.chat_per_sec != 0 && self.game.chat_burst == 0 {
+            return Err(
+                "[game] chat_burst must be at least 1 when chat_per_sec is set".to_string(),
+            );
+        }
+        if self.game.flare_per_sec != 0 && self.game.flare_burst == 0 {
+            return Err(
+                "[game] flare_burst must be at least 1 when flare_per_sec is set".to_string(),
+            );
+        }
         if self.server.enet_max_packet_bytes < DEFAULT_ENET_MAX_PACKET_BYTES {
             return Err(format!(
                 "[server] enet_max_packet_bytes must be at least {DEFAULT_ENET_MAX_PACKET_BYTES}, got {}",
@@ -441,3 +480,7 @@ fn secs_to_delta(secs: u64) -> TimeDelta {
         .and_then(TimeDelta::try_seconds)
         .unwrap_or(TimeDelta::MAX)
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/config.rs"]
+mod tests;

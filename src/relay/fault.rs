@@ -35,6 +35,8 @@ pub enum PeerFault {
     StateHashOutOfSequence { got: u32, want: u32 },
     #[error("gamestate transfer exceeds declared length")]
     TransferOverrun,
+    #[error("kept sending far past its rate limit")]
+    Flooding,
 }
 
 impl PeerFault {
@@ -48,6 +50,9 @@ impl PeerFault {
             PeerFault::StateHashOutOfSequence { .. } => {
                 Some(DisconnectReason::OutOfSequenceStateHash)
             }
+            // The protocol has no code for flooding; Kicked is what the
+            // client shows for being removed over its own behaviour.
+            PeerFault::Flooding => Some(DisconnectReason::Kicked),
             PeerFault::NoSession
             | PeerFault::NotController
             | PeerFault::WrongPhase
@@ -56,3 +61,7 @@ impl PeerFault {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/relay/fault.rs"]
+mod tests;
