@@ -53,10 +53,14 @@ fn clone_effect(effect: &Effect) -> Effect {
             host_username,
             nbp,
             players,
+            map,
+            mods,
         } => Effect::LobbyListing {
             host_username: host_username.clone(),
             nbp: *nbp,
             players: players.clone(),
+            map: map.clone(),
+            mods: mods.clone(),
         },
         Effect::LobbyStarted { nbp, players } => Effect::LobbyStarted {
             nbp: *nbp,

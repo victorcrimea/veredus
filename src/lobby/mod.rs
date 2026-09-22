@@ -132,7 +132,6 @@ impl LobbyManager {
             bot_jid,
             public_ip: self.config.public_ip.clone(),
             server_name: self.config.server_name.clone(),
-            engine_version: self.config.engine_version.clone(),
             has_password: !self.config.game_password.is_empty(),
         };
 
@@ -248,7 +247,6 @@ struct AccountConfig {
     bot_jid: Jid,
     public_ip: String,
     server_name: String,
-    engine_version: String,
     has_password: bool,
 }
 
@@ -379,16 +377,17 @@ async fn run_account(
                     }
                 } => {
                     match (game_event, bound_jid.as_ref()) {
-                        (Some(GameToLobby::Listing { host_username, nbp, players }), Some(host_jid)) => {
+                        (Some(GameToLobby::Listing { host_username, nbp, players, map, mods }), Some(host_jid)) => {
                             let host_jid = host_jid.to_string();
                             registration.offer(gamelist::register_attrs(gamelist::RegisterAttrs {
                                 server_name: &config.server_name,
-                                engine_version: &config.engine_version,
+                                mods: &mods,
                                 host_username: &host_username,
                                 host_jid: &host_jid,
                                 nbp,
                                 players: &players,
                                 has_password: config.has_password,
+                                map: map.as_ref(),
                             }));
                         }
                         (Some(GameToLobby::Started { nbp, players }), Some(_)) => {

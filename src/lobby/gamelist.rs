@@ -10,11 +10,16 @@ use tokio_xmpp::minidom::Element;
 use tokio_xmpp::minidom::rxml::Namespace as RxmlNamespace;
 use tokio_xmpp::minidom::rxml::NcName;
 
+use crate::lobby::link::LobbyMap;
+use crate::relay::messages::EnabledMod;
+use crate::sidecar::mod_pathname;
+
 pub const NS_GAMELIST: &str = "jabber:iq:gamelist";
 
-// The server tracks no real map settings (script-value decoding is
-// unimplemented, Sec. 20.2), so every listing advertises the same skirmish
-// map. F27 is where this becomes the controller's actual GAME_SETTINGS.
+// A hostme game is listed as soon as an account is assigned, before the
+// controller has sent any GAME_SETTINGS (Sec. 5), so there is a moment with
+// nothing real to advertise. These placeholders fill that moment; the first
+// GAME_SETTINGS from the controller replaces them (see LobbyMap).
 const FIXED_MAP_NAME: &str = "maps/skirmishes/alpine_valleys_2p";
 const FIXED_NICE_MAP_NAME: &str = "Alpine Valleys (2)";
 const FIXED_MAP_SIZE: &str = "0";
@@ -69,28 +74,38 @@ pub fn unregister() -> Element {
         .build()
 }
 
-// The shape the stock lobby client expects for the `mods` attribute. Real
-// per-mod versions would come from the controller's handshake, which the
-// relay does not track per game (Sec. 20.2), so every listing advertises the
-// single mod the server itself was configured with.
-fn mods_json(engine_version: &str) -> String {
-    let mods = serde_json::json!([{
-        "mod": "public",
-        "name": "0ad",
-        "version": engine_version,
-        "ignoreInCompatibilityChecks": false,
-    }]);
-    mods.to_string()
+// The shape the stock lobby client expects for the `mods` attribute. Built
+// from Config::enabled_mods, the list admission enforces against every
+// client's SYN reply, so this is provably what everyone in the game runs.
+fn mods_json(mods: &[EnabledMod]) -> String {
+    let mods: Vec<_> = mods
+        .iter()
+        .map(|m| match mod_pathname(&m.name) {
+            Some(pathname) => serde_json::json!({
+                "mod": pathname,
+                "name": m.name,
+                "version": m.version,
+                "ignoreInCompatibilityChecks": false,
+            }),
+            None => serde_json::json!({
+                "name": m.name,
+                "version": m.version,
+                "ignoreInCompatibilityChecks": false,
+            }),
+        })
+        .collect();
+    serde_json::Value::Array(mods).to_string()
 }
 
 pub struct RegisterAttrs<'a> {
     pub server_name: &'a str,
-    pub engine_version: &'a str,
+    pub mods: &'a [EnabledMod],
     pub host_username: &'a str,
     pub host_jid: &'a str,
     pub nbp: u32,
     pub players: &'a str,
     pub has_password: bool,
+    pub map: Option<&'a LobbyMap>,
 }
 
 pub fn register_attrs(attrs: RegisterAttrs<'_>) -> HashMap<String, String> {
@@ -101,20 +116,35 @@ pub fn register_attrs(attrs: RegisterAttrs<'_>) -> HashMap<String, String> {
     // game bot stores it verbatim rather than filling it in.
     out.insert("hostJID".to_string(), attrs.host_jid.to_string());
     out.insert("nbp".to_string(), attrs.nbp.to_string());
-    out.insert("maxnbp".to_string(), FIXED_MAX_PLAYERS.to_string());
     out.insert("players".to_string(), attrs.players.to_string());
     out.insert(
         "hasPassword".to_string(),
         if attrs.has_password { "true" } else { "" }.to_string(),
     );
-    out.insert("mods".to_string(), mods_json(attrs.engine_version));
-    out.insert("mapName".to_string(), FIXED_MAP_NAME.to_string());
-    out.insert("niceMapName".to_string(), FIXED_NICE_MAP_NAME.to_string());
-    out.insert("mapSize".to_string(), FIXED_MAP_SIZE.to_string());
-    out.insert("mapType".to_string(), FIXED_MAP_TYPE.to_string());
-    out.insert(
-        "victoryConditions".to_string(),
-        FIXED_VICTORY_CONDITIONS.to_string(),
-    );
+    out.insert("mods".to_string(), mods_json(attrs.mods));
+    match attrs.map {
+        Some(map) => {
+            out.insert("mapName".to_string(), map.map_name.clone());
+            out.insert("niceMapName".to_string(), map.nice_map_name.clone());
+            out.insert("mapSize".to_string(), map.map_size.clone());
+            out.insert("mapType".to_string(), map.map_type.clone());
+            out.insert(
+                "victoryConditions".to_string(),
+                map.victory_conditions.clone(),
+            );
+            out.insert("maxnbp".to_string(), map.max_players.to_string());
+        }
+        None => {
+            out.insert("mapName".to_string(), FIXED_MAP_NAME.to_string());
+            out.insert("niceMapName".to_string(), FIXED_NICE_MAP_NAME.to_string());
+            out.insert("mapSize".to_string(), FIXED_MAP_SIZE.to_string());
+            out.insert("mapType".to_string(), FIXED_MAP_TYPE.to_string());
+            out.insert(
+                "victoryConditions".to_string(),
+                FIXED_VICTORY_CONDITIONS.to_string(),
+            );
+            out.insert("maxnbp".to_string(), FIXED_MAX_PLAYERS.to_string());
+        }
+    }
     out
 }

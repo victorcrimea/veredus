@@ -11,6 +11,7 @@ use chrono::TimeDelta;
 use chrono::Utc;
 use rusty_enet::PeerID;
 
+use crate::lobby::link::LobbyMap;
 use crate::relay::auth;
 use crate::relay::auth::LateObserverPolicy;
 use crate::relay::fault::PeerFault;
@@ -61,6 +62,7 @@ use crate::relay::password;
 use crate::relay::pause_budget;
 use crate::relay::pause_budget::BudgetEvent;
 use crate::relay::pause_budget::PauseBudget;
+use crate::relay::script_value;
 use crate::relay::session::Admitted;
 use crate::relay::session::Role;
 use crate::relay::session::Session;
@@ -163,6 +165,8 @@ pub enum Effect {
         host_username: String,
         nbp: u32,
         players: String,
+        map: Option<LobbyMap>,
+        mods: Vec<EnabledMod>,
     },
     // Sec. 17.3: sent once, right after the last LobbyListing before a match
     // starts.
@@ -349,6 +353,10 @@ pub(crate) struct Context {
     // Present from the moment a hosted-AI start is requested until the AI
     // host is gone.
     ai_host: Option<AiHost>,
+    // The controller's latest GAME_SETTINGS, decoded for the lobby listing
+    // (Sec. 17.3). None until the controller has sent one; a decode failure
+    // keeps whatever was last decoded rather than clearing it.
+    lobby_map: Option<LobbyMap>,
     effects: Vec<Effect>,
 }
 
@@ -458,6 +466,8 @@ impl Context {
             host_username,
             nbp,
             players,
+            map: self.lobby_map.clone(),
+            mods: self.config.enabled_mods.clone(),
         });
     }
 
@@ -1758,8 +1768,19 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
 
     fn on_game_settings(&mut self, peer: PeerID, msg: GameSettings) -> Result<(), PeerFault> {
         self.ctx.require_controller(peer)?;
-        // Relayed verbatim, controller included. The bytes are a script value
-        // the server has no reason to decode.
+        // Decoded only for the lobby listing (Sec. 17.3, A6); relay stays
+        // verbatim and content is never validated (Sec. 10.2), so a decode
+        // failure here must not become a peer fault.
+        match script_value::decode(&msg.data).map(|v| LobbyMap::from_settings(&v)) {
+            Ok(Some(map)) if Some(&map) != self.ctx.lobby_map.as_ref() => {
+                self.ctx.lobby_map = Some(map);
+                self.ctx.push_lobby_listing();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "GAME_SETTINGS did not decode for the lobby listing");
+            }
+        }
         let relayed = WireMessage::GameSettings(msg);
         self.ctx.broadcast(&relayed, |s| s.is_setup());
         Ok(())
@@ -1903,6 +1924,7 @@ impl Server<Idle> {
                 empty_since: None,
                 ai_host_name: format!("AI host {}", &Guid::new().0[..8]),
                 ai_host: None,
+                lobby_map: None,
                 effects: Vec::new(),
             },
             st: Idle,

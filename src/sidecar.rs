@@ -623,8 +623,10 @@ fn build_start_json(request: &DumpRequest, now: DateTime<Utc>) -> Result<String,
 }
 
 // The wire carries only a mod name and version, never the folder the engine
-// mounts, so the one mod this server runs maps back to its folder here.
-fn mod_pathname(name: &str) -> Option<&'static str> {
+// mounts, so the one mod this server runs maps back to its folder here. Also
+// used by the lobby's `mods` attribute (Sec. 17.3), which needs the same
+// mapping for the same reason.
+pub(crate) fn mod_pathname(name: &str) -> Option<&'static str> {
     match name {
         "0ad" => Some("public"),
         _ => None,

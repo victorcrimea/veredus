@@ -11,6 +11,7 @@ pub mod monitor;
 pub mod observer_feed;
 pub mod password;
 pub mod pause_budget;
+pub mod script_value;
 pub mod server_fsm;
 pub mod session;
 pub mod slots;

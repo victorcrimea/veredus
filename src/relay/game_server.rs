@@ -367,12 +367,16 @@ fn drain(
                 host_username,
                 nbp,
                 players,
+                map,
+                mods,
             } => {
                 if let Some(lobby) = lobby {
                     let _ = lobby.events_tx.send(GameToLobby::Listing {
                         host_username,
                         nbp,
                         players,
+                        map,
+                        mods,
                     });
                 }
                 continue;
