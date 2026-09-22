@@ -4,8 +4,14 @@
 mod harness;
 
 mod admission;
+mod afk;
 mod handshake;
 mod join;
+mod match_end;
+mod observer_feed;
 mod pause;
+mod relay;
 mod setup_start;
+mod transfer;
 mod turns;
+mod warnings;

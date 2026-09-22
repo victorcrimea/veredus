@@ -18,10 +18,16 @@ use veredus::relay::messages::Authenticate;
 use veredus::relay::messages::AuthenticateResult;
 use veredus::relay::messages::AuthenticateResultCode;
 use veredus::relay::messages::Guid;
+use veredus::relay::messages::LoadedGame;
 use veredus::relay::messages::MapPlayerIdToSlot;
+use veredus::relay::messages::PlayerCommand;
+use veredus::relay::messages::PreGameStatus;
+use veredus::relay::messages::StartSettings;
 use veredus::relay::messages::Syn;
 use veredus::relay::messages::SynAck;
+use veredus::relay::messages::TurnSealed;
 use veredus::relay::messages::WireMessage;
+use veredus::relay::monitor::PeerStats;
 use veredus::relay::server_fsm::AnyServer;
 use veredus::relay::server_fsm::Config;
 use veredus::relay::server_fsm::DisconnectReason;
@@ -86,6 +92,8 @@ fn clone_effect(effect: &Effect) -> Effect {
     }
 }
 
+pub const READY: u8 = 1;
+
 pub struct Harness {
     server: Option<AnyServer>,
     pub now: DateTime<Utc>,
@@ -129,11 +137,14 @@ impl Harness {
     }
 
     pub fn tick_at(&mut self, now: DateTime<Utc>) -> Vec<Effect> {
+        self.tick_with_stats(now, Vec::new())
+    }
+
+    // Peer timing only ever reaches the FSM on a tick, so warnings and the
+    // AFK hold are driven through here.
+    pub fn tick_with_stats(&mut self, now: DateTime<Utc>, stats: Vec<PeerStats>) -> Vec<Effect> {
         self.now = now;
-        self.input(Input::Tick {
-            now,
-            stats: Vec::new(),
-        })
+        self.input(Input::Tick { now, stats })
     }
 
     // No test may call Utc::now() or sleep (4.3); this is how time moves.
@@ -141,7 +152,7 @@ impl Harness {
         self.tick_at(self.now + delta)
     }
 
-    fn addr_for(peer: PeerID) -> Ipv4Addr {
+    pub fn addr_for(peer: PeerID) -> Ipv4Addr {
         let id = u32::try_from(peer.0).unwrap_or(u32::MAX);
         Ipv4Addr::from(0x0A00_0000u32.wrapping_add(id))
     }
@@ -272,6 +283,65 @@ impl Harness {
         self.input(Input::Disconnected { peer })
     }
 
+    // Consumes the harness, because AnyServer::shutdown consumes the server.
+    pub fn shutdown(mut self) -> Vec<Effect> {
+        self.server
+            .take()
+            .expect("harness server missing")
+            .shutdown()
+    }
+
+    // Admits each named entry in order (the first becomes controller),
+    // assigns the slots that are asked for and leaves the rest as observers,
+    // marks everyone ready, starts with `init_attributes` and drives
+    // everyone through LOADED_GAME, so the server ends up InGame.
+    pub fn start_match(
+        &mut self,
+        spec: &[(&str, Option<i8>)],
+        init_attributes: &[u8],
+    ) -> Vec<(PeerID, Guid)> {
+        let controller = PeerID(1);
+        let mut players = Vec::new();
+        for (i, (name, slot)) in spec.iter().enumerate() {
+            let peer = PeerID(1 + i);
+            let guid = self.admit(peer, name);
+            if let Some(slot) = slot {
+                self.map_player_id_to_slot(controller, *slot, &guid);
+            }
+            players.push((peer, guid));
+        }
+        for (peer, guid) in &players {
+            self.input(Input::Received {
+                peer: *peer,
+                msg: WireMessage::PreGameStatus(PreGameStatus {
+                    guid: guid.clone(),
+                    status: READY,
+                }),
+            });
+        }
+        self.input(Input::Received {
+            peer: controller,
+            msg: WireMessage::StartSettings(StartSettings {
+                init_attributes: init_attributes.to_vec(),
+            }),
+        });
+        assert!(
+            matches!(self.server(), AnyServer::Loading(_)),
+            "start_match: START_SETTINGS did not move the server into Loading"
+        );
+        for (peer, _) in &players {
+            self.input(Input::Received {
+                peer: *peer,
+                msg: WireMessage::LoadedGame(LoadedGame { current_turn: 0 }),
+            });
+        }
+        assert!(
+            matches!(self.server(), AnyServer::InGame(_)),
+            "start_match: loading did not finish into InGame"
+        );
+        players
+    }
+
     pub fn log(&self) -> &[Effect] {
         &self.log
     }
@@ -335,4 +405,54 @@ pub fn expect_send<T>(
         found.len()
     );
     found.pop()
+}
+
+pub fn turn_sealed(peer: PeerID, turn: u32) -> Input {
+    Input::Received {
+        peer,
+        msg: WireMessage::TurnSealed(TurnSealed {
+            turn,
+            turn_length: 200,
+        }),
+    }
+}
+
+// Every server chat line in `effects` addressed to `peer`, in order.
+pub fn chats_to(effects: &[Effect], peer: PeerID) -> Vec<String> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Send {
+                peer: p,
+                msg: WireMessage::Chat(c),
+            } if *p == peer => Some(c.message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+// A PLAYER_COMMAND payload for `{type: "resign"}` in the structured-clone
+// layout: OBJECT tag, one property, a Latin-1 key and a Latin-1 string value,
+// every length a little-endian u32. Checked against the relay's own reader,
+// so an encoding slip fails here rather than as a match that never ends.
+pub fn resign_data() -> Vec<u8> {
+    const OBJECT: u8 = 0x03;
+    const STRING: u8 = 0x04;
+    const LATIN1: u8 = 1;
+    let latin1 = |data: &mut Vec<u8>, text: &str| {
+        data.push(LATIN1);
+        data.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        data.extend_from_slice(text.as_bytes());
+    };
+    let mut data = vec![OBJECT];
+    data.extend_from_slice(&1u32.to_le_bytes());
+    latin1(&mut data, "type");
+    data.push(STRING);
+    latin1(&mut data, "resign");
+    assert_eq!(
+        PlayerCommand::extract_command_type(&data).as_deref(),
+        Some("resign"),
+        "resign_data does not decode as a resign command"
+    );
+    data
 }
