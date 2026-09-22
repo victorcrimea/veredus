@@ -8,9 +8,13 @@ pub mod link;
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures::stream::StreamExt;
+use sasl::common::ChannelBinding;
 use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
@@ -18,7 +22,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
 use tokio_xmpp::Client;
+use tokio_xmpp::Event;
 use tokio_xmpp::Stanza;
+use tokio_xmpp::connect::DnsConfig;
+use tokio_xmpp::connect::ServerConnector;
+use tokio_xmpp::connect::StartTlsServerConnector;
 use tokio_xmpp::minidom::Element;
 use tokio_xmpp::parsers::iq::Iq;
 use tokio_xmpp::parsers::jid::Jid;
@@ -27,6 +35,8 @@ use tokio_xmpp::parsers::message::MessageType;
 use tokio_xmpp::parsers::muc::Muc;
 use tokio_xmpp::parsers::presence::Presence;
 use tokio_xmpp::parsers::presence::Type as PresenceType;
+use tokio_xmpp::xmlstream::PendingFeaturesRecv;
+use tokio_xmpp::xmlstream::Timeouts;
 use tracing::Instrument;
 
 use crate::lobby::connection_data::Assignment;
@@ -36,8 +46,15 @@ use crate::lobby::link::LobbyAuthToken;
 // Spread out so the lobby server's TCP accept queue never sees every account
 // connect in the same instant.
 const ACCOUNT_SPAWN_STAGGER_MS: u64 = 1500;
-// Backoff and jitter belong to F4; this is a fixed retry.
+// A dropped connection is retried by tokio-xmpp's own reconnector, with its
+// own backoff. This delay only paces restarting a client whose stream ended
+// for good, which is rare enough that a fixed value does.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+// tokio-xmpp retries a dropped connection at once and then backs off in
+// lockstep, so a lobby server restart would see every account at the same
+// instants. Each attempt is delayed by a random share of the startup stagger's
+// window instead, capped at tokio-xmpp's own longest backoff step.
+const RECONNECT_JITTER_MAX: Duration = Duration::from_secs(30);
 // A burst of slot changes (a player joining, picking a civ, readying up) should
 // cost the game bot one register, not one per change.
 const REGISTER_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -133,6 +150,10 @@ impl LobbyManager {
             public_ip: self.config.public_ip.clone(),
             server_name: self.config.server_name.clone(),
             has_password: !self.config.game_password.is_empty(),
+            reconnect_spread: Duration::from_millis(
+                self.config.accounts.len() as u64 * ACCOUNT_SPAWN_STAGGER_MS,
+            )
+            .min(RECONNECT_JITTER_MAX),
         };
 
         let (main_tx, main_rx) = mpsc::channel::<LobbyEvent>(32);
@@ -248,6 +269,61 @@ struct AccountConfig {
     public_ip: String,
     server_name: String,
     has_password: bool,
+    reconnect_spread: Duration,
+}
+
+// Wraps the connector `Client::new` would use. tokio-xmpp calls `connect`
+// once for the first connection and again for every reconnect attempt, and
+// never tells the caller the stream dropped, so this is the one place that
+// can both spread reconnects out and log that they happen.
+#[derive(Debug, Clone)]
+struct JitteredConnector {
+    inner: StartTlsServerConnector,
+    spread: Duration,
+    // Shared by the clones tokio-xmpp makes per attempt.
+    reconnecting: Arc<AtomicBool>,
+}
+
+impl JitteredConnector {
+    fn new(jid: &Jid, spread: Duration) -> Self {
+        Self {
+            inner: StartTlsServerConnector::from(DnsConfig::srv_default_client(
+                jid.domain().as_ref(),
+            )),
+            spread,
+            reconnecting: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl ServerConnector for JitteredConnector {
+    type Stream = <StartTlsServerConnector as ServerConnector>::Stream;
+
+    async fn connect(
+        &self,
+        jid: &Jid,
+        ns: &'static str,
+        timeouts: Timeouts,
+    ) -> Result<(PendingFeaturesRecv<Self::Stream>, ChannelBinding), tokio_xmpp::Error> {
+        // The first connection was already spaced out by the startup stagger.
+        if self.reconnecting.swap(true, Ordering::Relaxed) {
+            let delay = reconnect_jitter(self.spread);
+            tracing::info!(delay_ms = delay.as_millis() as u64, "reconnecting to lobby");
+            tokio::time::sleep(delay).await;
+        }
+        self.inner.connect(jid, ns, timeouts).await
+    }
+}
+
+// Uniform in [0, spread). A v4 uuid is the only randomness source already
+// among the dependencies.
+fn reconnect_jitter(spread: Duration) -> Duration {
+    let spread_ms = spread.as_millis();
+    if spread_ms == 0 {
+        return Duration::ZERO;
+    }
+    let ms = uuid::Uuid::new_v4().as_u128() % spread_ms;
+    Duration::from_millis(ms as u64)
 }
 
 // What this account knows about the game it currently hosts.
@@ -270,6 +346,9 @@ struct Registration {
     last_sent: Option<HashMap<String, String>>,
     pending: Option<HashMap<String, String>>,
     debounce: Option<Pin<Box<Sleep>>>,
+    // The last changestate sent, kept because a match in progress sends no
+    // further listings that could restore it after a reconnect.
+    started: Option<(u32, String)>,
 }
 
 impl Registration {
@@ -300,6 +379,22 @@ impl Registration {
         send_gamelist(client, config, gamelist::register(&attrs)).await;
         self.last_sent = Some(attrs);
     }
+
+    // The bot deletes a host's game when its session leaves the MUC, so a new
+    // session has to list it again, newest attributes first. Changestate goes
+    // after the register because a register resets the bot's state to "init".
+    async fn resend(&mut self, client: &mut Client, config: &AccountConfig) {
+        self.debounce = None;
+        let Some(attrs) = self.pending.take().or_else(|| self.last_sent.take()) else {
+            return;
+        };
+        tracing::info!("re-registering the game after a new lobby session");
+        send_gamelist(client, config, gamelist::register(&attrs)).await;
+        self.last_sent = Some(attrs);
+        if let Some((nbp, players)) = &self.started {
+            send_gamelist(client, config, gamelist::changestate(*nbp, players)).await;
+        }
+    }
 }
 
 fn build_muc_presence(muc_room: &str, bound_jid: &Jid) -> Presence {
@@ -318,8 +413,10 @@ fn build_muc_presence(muc_room: &str, bound_jid: &Jid) -> Presence {
     presence
 }
 
-// Main loop for one lobby account. Reconnects on stream end with a fixed
-// delay (F4 owns backoff and jitter).
+// Main loop for one lobby account. A dropped connection never surfaces here:
+// tokio-xmpp reconnects on its own and reports only the new session, as
+// another Online event. The outer loop only replaces a client whose stream
+// ended for good.
 async fn run_account(
     account: usize,
     creds: XmppCredentials,
@@ -345,10 +442,13 @@ async fn run_account(
 
     loop {
         tracing::info!("connecting to lobby");
-        let mut client = Client::new(jid.clone(), login_password.clone());
+        let mut client = Client::new_with_connector(
+            jid.clone(),
+            login_password.clone(),
+            JitteredConnector::new(&jid, config.reconnect_spread),
+            Timeouts::default(),
+        );
         let mut bound_jid: Option<Jid> = None;
-        // The bot dropped this account's game when the old stream went away.
-        registration.clear();
 
         let shutdown = 'connection: loop {
             tokio::select! {
@@ -399,6 +499,7 @@ async fn run_account(
                             // so a listing still inside its window goes out now.
                             registration.flush(&mut client, &config).await;
                             send_gamelist(&mut client, &config, gamelist::changestate(nbp, &players)).await;
+                            registration.started = Some((nbp, players));
                         }
                         (Some(GameToLobby::Ended), Some(_)) => {
                             registration.clear();
@@ -435,12 +536,16 @@ async fn run_account(
                         tracing::warn!("lobby XMPP stream ended");
                         break 'connection false;
                     };
-                    if event.is_online() {
-                        let online_jid = event.get_jid().cloned().unwrap_or_else(|| jid.clone());
-                        tracing::info!(bound_jid = %online_jid, "lobby account online");
+                    if let Event::Online { bound_jid: online_jid, resumed } = event {
+                        tracing::info!(bound_jid = %online_jid, resumed, "lobby account online");
                         bound_jid = Some(online_jid.clone());
                         let presence = build_muc_presence(&config.muc_room, &online_jid);
                         let _ = client.send_stanza(presence.into()).await;
+                        // A resumed session never left the MUC, so the bot
+                        // still has the game.
+                        if !resumed {
+                            registration.resend(&mut client, &config).await;
+                        }
                     } else if let Some(stanza) = event.into_stanza() {
                         handle_stanza(
                             stanza,
