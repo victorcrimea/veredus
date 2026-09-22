@@ -82,9 +82,30 @@ impl GamePool {
         }
     }
 
-    fn allocate_port(&self) -> Option<u16> {
+    // Every free port is tried in turn rather than just the first: one held
+    // by another process would otherwise fail every allocation after it.
+    fn bind_free_port(&self) -> Result<(u16, std::net::UdpSocket), String> {
         let (start, end) = PORT_RANGE;
-        (start..=end).find(|port| !self.used_ports.contains(port))
+        for port in (start..=end).filter(|port| !self.used_ports.contains(port)) {
+            let bind_addr = SocketAddr::new(self.bind_ip, port);
+            match std::net::UdpSocket::bind(bind_addr) {
+                Ok(socket) => return Ok((port, socket)),
+                Err(error) => {
+                    tracing::debug!(%bind_addr, %error, "port unavailable, trying the next")
+                }
+            }
+        }
+        Err(format!("no bindable port in {start}..={end}"))
+    }
+
+    // True once the game's server thread has returned, whether the match
+    // ended, the game went idle or it panicked. The game still has to be
+    // destroyed to free its port.
+    pub fn is_finished(&self, game_id: &GameId) -> bool {
+        self.games
+            .get(game_id)
+            .and_then(|handle| handle.server_thread.as_ref())
+            .is_some_and(|thread| thread.is_finished())
     }
 
     pub fn create_game(&mut self, config: GameConfig) -> Result<(GameId, u16), String> {
@@ -95,29 +116,26 @@ impl GamePool {
             pyrogenesis_path,
             outcome_dir,
         } = config;
-        let port = match port {
+        // Bound here rather than in the ENet thread: a bind failure has to reach
+        // the caller as an error, not a panic in a thread nobody joins until
+        // shutdown.
+        let (port, socket) = match port {
             Some(port) => {
                 if self.used_ports.contains(&port) {
                     return Err(format!("port {port} is already in use"));
                 }
-                port
+                let bind_addr = SocketAddr::new(self.bind_ip, port);
+                let socket = std::net::UdpSocket::bind(bind_addr)
+                    .map_err(|error| format!("failed to bind {bind_addr}: {error}"))?;
+                (port, socket)
             }
-            None => self
-                .allocate_port()
-                .ok_or_else(|| "no free port in range".to_string())?,
+            None => self.bind_free_port()?,
         };
 
-        let bind_addr = SocketAddr::new(self.bind_ip, port);
         // The AI host runs on this machine and is only recognised from
         // loopback, so a socket bound elsewhere cannot host one.
         let ai_host_connect = (self.bind_ip.is_unspecified() || self.bind_ip.is_loopback())
             .then(|| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-
-        // Bound here rather than in the ENet thread: a bind failure has to reach
-        // the caller as an error, not a panic in a thread nobody joins until
-        // shutdown.
-        let socket = std::net::UdpSocket::bind(bind_addr)
-            .map_err(|error| format!("failed to bind {bind_addr}: {error}"))?;
 
         let game_id = GameId(Uuid::now_v7());
         let outcome_path = outcome_dir.map(|dir| dir.join(format!("{game_id}.json")));

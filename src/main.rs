@@ -78,13 +78,14 @@ async fn main() {
         config.server.checkpoint_interval_turns,
     );
 
-    match mode.lobby {
+    let result = match mode.lobby {
         Some(lobby_config) => {
             let base = Config {
                 idle_shutdown: Some(config.lobby.idle_shutdown()),
                 ..base
             };
-            run_pool_lobby_mode(&mut pool, lobby_config, base, pyrogenesis_path, outcome_dir).await
+            run_pool_lobby_mode(&mut pool, lobby_config, base, pyrogenesis_path, outcome_dir).await;
+            Ok(())
         }
         None => {
             run_standalone(
@@ -93,9 +94,55 @@ async fn main() {
                 base,
                 pyrogenesis_path,
                 outcome_dir,
+                config.server.exit_after_game,
             )
             .await
         }
+    };
+
+    // Dropping the pool stops every game and then waits for their outcome
+    // replays, which can take many minutes. An operator who does not want to
+    // wait signals again; the replays' pyrogenesis processes die with us.
+    let wind_down = tokio::task::spawn_blocking(move || drop(pool));
+    tokio::select! {
+        _ = wind_down => {}
+        signal = shutdown_signal() => {
+            tracing::warn!(signal, "second shutdown signal, abandoning pending outcome replays");
+            std::process::exit(1);
+        }
+    }
+
+    if let Err(error) = result {
+        tracing::error!(%error, "standalone game could not be hosted");
+        std::process::exit(1);
+    }
+}
+
+// systemd and docker stop a service with SIGTERM, so waiting on Ctrl+C alone
+// would let them kill the process without any game shutting down. Returns
+// the name of the signal that arrived.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        match terminate {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = terminate.recv() => "SIGTERM",
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot listen for SIGTERM, only Ctrl+C stops the server cleanly");
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl+C"
     }
 }
 
@@ -193,27 +240,59 @@ fn serve_metrics(host: std::net::IpAddr, port: u16) {
     tracing::info!(%host, port, "metrics endpoint listening on /metrics");
 }
 
+// Hosts one game after another on the same port, or only one when
+// `exit_after_game` hands restarting over to a supervisor.
 async fn run_standalone(
     pool: &mut GamePool,
     port: u16,
     server_config: Config,
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
-) {
-    let (game_id, port) = pool
-        .create_game(GameConfig {
+    exit_after_game: bool,
+) -> Result<(), String> {
+    // One future for the whole run, so a signal that arrives between two
+    // games is not missed.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    loop {
+        let (game_id, port) = pool.create_game(GameConfig {
             port: Some(port),
-            server: server_config,
+            server: server_config.clone(),
             lobby: None,
-            pyrogenesis_path,
-            outcome_dir,
-        })
-        .expect("Failed to create initial game");
+            pyrogenesis_path: pyrogenesis_path.clone(),
+            outcome_dir: outcome_dir.clone(),
+        })?;
+        tracing::info!(game_id = %game_id, port, "game running");
 
-    tracing::info!(game_id = %game_id, port, "game running");
+        // A standalone game has no lobby link to report its end over, so its
+        // thread is watched instead.
+        let mut poll = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                signal = &mut shutdown => {
+                    tracing::info!(signal, "shutting down");
+                    // Returning drops the pool, which stops both threads of
+                    // every game.
+                    return Ok(());
+                }
+                _ = poll.tick() => {
+                    if pool.is_finished(&game_id) {
+                        break;
+                    }
+                }
+            }
+        }
 
-    // Returning drops the pool, which stops both threads of every game.
-    tokio::signal::ctrl_c().await.ok();
+        // destroy_game joins both of the game's OS threads, so it must not
+        // block the async runtime's worker thread.
+        tokio::task::block_in_place(|| pool.destroy_game(game_id));
+        if exit_after_game {
+            tracing::info!("game ended, exiting as configured");
+            return Ok(());
+        }
+        tracing::info!("game ended, hosting a fresh one");
+    }
 }
 
 async fn run_pool_lobby_mode(
@@ -244,14 +323,19 @@ async fn run_pool_lobby_mode(
     let mut account_sender: HashMap<usize, String> = HashMap::new();
     let mut account_game: HashMap<usize, GameId> = HashMap::new();
 
+    // One future for the whole loop, so a signal that arrives while an event
+    // is being handled is not missed.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
     loop {
         let event = tokio::select! {
             event = events.recv() => match event {
                 Some(event) => event,
                 None => break,
             },
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Ctrl+C received, shutting down");
+            signal = &mut shutdown => {
+                tracing::info!(signal, "shutting down");
                 break;
             }
         };

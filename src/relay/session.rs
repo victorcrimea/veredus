@@ -3,7 +3,9 @@
 
 use std::net::Ipv4Addr;
 
+use chrono::DateTime;
 use chrono::TimeDelta;
+use chrono::Utc;
 use rusty_enet::PeerID;
 
 use crate::relay::messages::Guid;
@@ -25,6 +27,10 @@ pub struct Session {
     // Join sources that already failed this client, so re-sourcing does not
     // pick a live but unresponsive one again.
     pub tried_sources: Vec<PeerID>,
+    // When the handshake timeout started counting for this session. It is
+    // set on the first tick after connecting, since that is where the FSM
+    // learns the time.
+    pub pending_since: Option<DateTime<Utc>>,
     // Entered for every input from this client, so each line logged on its
     // behalf can be told apart from the other clients of the same game. The
     // identity is only learned during the handshake, so the fields start
@@ -70,6 +76,7 @@ impl Session {
             mean_rtt: TimeDelta::zero(),
             since_last_received: TimeDelta::zero(),
             tried_sources: Vec::new(),
+            pending_since: None,
             span,
         }
     }

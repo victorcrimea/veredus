@@ -15,6 +15,7 @@ use serde::Serialize;
 use crate::lobby::LobbyConfig;
 use crate::lobby::XmppCredentials;
 use crate::relay::auth::LateObserverPolicy;
+use crate::relay::enet_task::PEER_LIMIT;
 use crate::relay::messages::EnabledMod;
 use crate::relay::server_fsm::Config;
 
@@ -63,6 +64,9 @@ pub struct ServerSection {
     // Where the Prometheus endpoint listens; port 0 turns it off.
     pub metrics_host: IpAddr,
     pub metrics_port: u16,
+    // Standalone mode only: stop the process once its game ends instead of
+    // hosting a fresh one on the same port, for a supervisor that restarts it.
+    pub exit_after_game: bool,
 }
 
 impl Default for ServerSection {
@@ -75,6 +79,7 @@ impl Default for ServerSection {
             checkpoint_interval_turns: DEFAULT_CHECKPOINT_INTERVAL_TURNS,
             metrics_host: DEFAULT_METRICS_HOST,
             metrics_port: DEFAULT_METRICS_PORT,
+            exit_after_game: false,
         }
     }
 }
@@ -129,7 +134,7 @@ pub struct ModEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GameSection {
-    pub turn_length_ms: u32,
+    pub turn_length_ms: u16,
     pub server_name: String,
     pub welcome_message: String,
     pub controller_secret: String,
@@ -144,6 +149,9 @@ pub struct GameSection {
     pub afk_pause: bool,
     pub post_game_linger_secs: u64,
     pub join_source_stall_secs: u64,
+    pub handshake_timeout_secs: u64,
+    pub max_pending_per_ip: usize,
+    pub loading_timeout_secs: u64,
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
     pub enabled_mods: Vec<ModEntry>,
@@ -172,6 +180,13 @@ impl Default for GameSection {
             post_game_linger_secs: config.post_game_linger.num_seconds().max(0) as u64,
             join_source_stall_secs: config
                 .join_source_stall
+                .map_or(0, |d| d.num_seconds().max(0) as u64),
+            handshake_timeout_secs: config
+                .handshake_timeout
+                .map_or(0, |d| d.num_seconds().max(0) as u64),
+            max_pending_per_ip: config.max_pending_per_ip,
+            loading_timeout_secs: config
+                .loading_timeout
                 .map_or(0, |d| d.num_seconds().max(0) as u64),
             buddies,
             enabled_mods: config
@@ -216,6 +231,11 @@ impl GameSection {
             post_game_linger: secs_to_delta(self.post_game_linger_secs),
             join_source_stall: (self.join_source_stall_secs != 0)
                 .then(|| secs_to_delta(self.join_source_stall_secs)),
+            handshake_timeout: (self.handshake_timeout_secs != 0)
+                .then(|| secs_to_delta(self.handshake_timeout_secs)),
+            max_pending_per_ip: self.max_pending_per_ip,
+            loading_timeout: (self.loading_timeout_secs != 0)
+                .then(|| secs_to_delta(self.loading_timeout_secs)),
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
             checkpoint_interval_turns,
@@ -343,6 +363,26 @@ impl FileConfig {
         };
         toml::from_str(&data)
             .map_err(|error| format!("failed to parse config '{}': {error}", path.display()))
+    }
+
+    // Run on the merged result, so a command line flag cannot slip a value
+    // past it either.
+    pub fn validate(&self) -> Result<(), String> {
+        // A zero-length turn would release turns as fast as the tick loop
+        // runs, and the clients would simulate none of them in real time.
+        if self.game.turn_length_ms == 0 {
+            return Err("[game] turn_length_ms must be at least 1".to_string());
+        }
+        // The arriving session counts against the cap, so 1 refuses everyone,
+        // and above the ENet peer limit no peer is left over to tell a client
+        // the server is full.
+        if !(2..=PEER_LIMIT).contains(&self.game.max_sessions) {
+            return Err(format!(
+                "[game] max_sessions must be between 2 and {PEER_LIMIT}, got {}",
+                self.game.max_sessions
+            ));
+        }
+        Ok(())
     }
 
     pub fn write_default(path: &Path) -> Result<(), String> {

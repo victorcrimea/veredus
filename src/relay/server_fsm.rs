@@ -273,7 +273,7 @@ impl DisconnectReason {
 pub struct Config {
     pub enabled_mods: Vec<EnabledMod>,
     pub lobby_mode: bool,
-    pub turn_length_ms: u32,
+    pub turn_length_ms: u16,
     // The stored hash H, not a plaintext password. Empty means an open server,
     // which is the only thing direct-IP clients can join.
     pub server_password_hash: String,
@@ -340,6 +340,20 @@ pub struct Config {
     // one gap, not the whole transfer, so the first gap has to cover the
     // source serializing the match. None waits forever.
     pub join_source_stall: Option<TimeDelta>,
+    // How long a connected peer may take to be admitted before it is dropped.
+    // Without it a peer that never finishes the handshake holds a session,
+    // and with it a share of max_sessions, for as long as ENet keeps it
+    // alive. None waits forever.
+    pub handshake_timeout: Option<TimeDelta>,
+    // How many peers from one address may be connected but not yet admitted
+    // at once, so a single host cannot fill the game with half-open
+    // handshakes before the timeout reaps them. 0 means no cap.
+    pub max_pending_per_ip: usize,
+    // How long the loading screen may last before whoever is still on it is
+    // dropped, so one client that never reports loaded cannot hold the match
+    // back for everyone. It must cover a large map on a slow machine. None
+    // waits forever.
+    pub loading_timeout: Option<TimeDelta>,
 }
 
 impl Default for Config {
@@ -372,6 +386,9 @@ impl Default for Config {
             checkpoint_interval_turns: 0,
             post_game_linger: TimeDelta::minutes(5),
             join_source_stall: Some(TimeDelta::seconds(30)),
+            handshake_timeout: Some(TimeDelta::seconds(30)),
+            max_pending_per_ip: 4,
+            loading_timeout: Some(TimeDelta::minutes(5)),
         }
     }
 }
@@ -380,7 +397,7 @@ pub struct FrozenSettings {
     // Kept verbatim because JOIN must carry the same text to late joiners.
     pub json: Vec<u8>,
     pub cheats_enabled: bool,
-    pub turn_length_ms: u32,
+    pub turn_length_ms: u16,
     // Every player id in the match, AI included. Empty when the settings
     // could not be read, which keeps the resign rule from ever firing.
     pub player_ids: Vec<i32>,
@@ -811,14 +828,13 @@ impl Context {
         }
     }
 
-    fn release_turns(&mut self, turn_length_ms: u32) {
+    fn release_turns(&mut self, turn_length_ms: u16) {
         let released = self.turns.release(self.config.observer_lag_limit);
-        let length = turn_length_ms as u16;
         for turn in released {
-            self.log.record_turn_length(turn, length);
+            self.log.record_turn_length(turn, turn_length_ms);
             let msg = WireMessage::TurnSealed(TurnSealed {
                 turn,
-                turn_length: length,
+                turn_length: turn_length_ms,
             });
             self.broadcast_live(&msg);
         }
@@ -850,7 +866,7 @@ impl Context {
             let turn_length = self
                 .log
                 .turn_length(turn)
-                .unwrap_or(self.config.turn_length_ms as u16);
+                .unwrap_or(self.config.turn_length_ms);
             self.broadcast_delayed(&WireMessage::TurnSealed(TurnSealed { turn, turn_length }));
         }
         for flare in self.feed.due_flares() {
@@ -917,6 +933,8 @@ pub struct AwaitAiHost {
 pub struct Loading {
     pub settings: FrozenSettings,
     pub saved_state: Option<Vec<u8>>,
+    // Anchored on the first tick, because the FSM only learns the time there.
+    pub entered_at: Option<DateTime<Utc>>,
 }
 
 pub struct InGame {
@@ -1255,6 +1273,24 @@ impl<S: PhaseMarker> Server<S> {
             });
             return;
         }
+        // The AI host dials loopback, and it must never be refused.
+        let cap = self.ctx.config.max_pending_per_ip;
+        if cap != 0 && !addr.is_loopback() {
+            let pending = self
+                .ctx
+                .sessions
+                .values()
+                .filter(|s| s.addr == addr && s.admitted.is_none())
+                .count();
+            if pending >= cap {
+                tracing::info!(peer = peer.0, ip = %addr, pending, "connection refused: too many pending handshakes");
+                self.ctx.effects.push(Effect::Disconnect {
+                    peer,
+                    reason: DisconnectReason::Refused,
+                });
+                return;
+            }
+        }
         let session = Session::new(peer, addr);
         session
             .span
@@ -1370,6 +1406,8 @@ impl<S: PhaseMarker> Server<S> {
             self.ctx.effects.push(Effect::GameOver);
         }
 
+        self.reap_stalled_handshakes(now);
+
         if let Some(limit) = self.ctx.config.join_source_stall {
             for (source, joiner) in self.ctx.transfers.stalled(now, limit) {
                 tracing::info!(?source, ?joiner, "join source stalled");
@@ -1431,6 +1469,39 @@ impl<S: PhaseMarker> Server<S> {
             self.ctx.broadcast_except(reported, &msg, |s| {
                 s.is_in_game() || (in_setup && s.is_setup())
             });
+        }
+    }
+
+    // The protocol has no code for a timeout, and 0 is one a server must not
+    // send, so a stalled handshake is refused like a wrong password.
+    fn reap_stalled_handshakes(&mut self, now: DateTime<Utc>) {
+        let Some(timeout) = self.ctx.config.handshake_timeout else {
+            return;
+        };
+        let mut stalled = Vec::new();
+        for (peer, session) in self.ctx.sessions.iter_mut() {
+            if session.admitted.is_some() {
+                continue;
+            }
+            let since = *session.pending_since.get_or_insert(now);
+            let elapsed = now.signed_duration_since(since);
+            // Re-anchored after a drop too: the session lingers until ENet
+            // confirms the disconnect, and a peer that never acknowledges it
+            // is asked again only once another timeout has passed.
+            if elapsed < TimeDelta::zero() || elapsed >= timeout {
+                session.pending_since = Some(now);
+            }
+            if elapsed >= timeout {
+                stalled.push(*peer);
+            }
+        }
+        for peer in stalled {
+            if let Some(session) = self.ctx.sessions.get(&peer) {
+                session
+                    .span
+                    .in_scope(|| tracing::info!("handshake timed out, dropping client"));
+            }
+            self.disconnect(peer, DisconnectReason::Refused);
         }
     }
 
@@ -1906,7 +1977,7 @@ impl<S: PhaseMarker> Server<S> {
 
     fn match_record_from(&self, base: Option<BaseState>, turn: u32) -> Option<DumpRequest> {
         let settings = self.st.settings()?;
-        let default_length = settings.turn_length_ms as u16;
+        let default_length = settings.turn_length_ms;
         let first = base.as_ref().map_or(0, |b| b.turn);
         let mut turn_lengths = Vec::new();
         for t in first + 1..=turn {
@@ -2403,6 +2474,7 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
         self.with_state(Loading {
             settings,
             saved_state: None,
+            entered_at: None,
         })
     }
 }
@@ -2570,6 +2642,7 @@ impl Server<AwaitSavegame> {
         self.with_state(Loading {
             settings,
             saved_state: Some(saved_state),
+            entered_at: None,
         })
     }
 
@@ -2711,11 +2784,61 @@ impl Server<Loading> {
                 }
                 self.into()
             }
+            Input::Tick { now, stats } => {
+                self.on_common_input(Input::Tick { now, stats });
+                if self.loading_timed_out(now) {
+                    return self.all_loaded().into();
+                }
+                self.into()
+            }
             other => {
                 self.on_common_input(other);
                 self.into()
             }
         }
+    }
+
+    // Returns true when dropping the laggards leaves everyone else loaded.
+    // A dropped player keeps its slot and can rejoin the running match.
+    // Refused, because the protocol has no code for a timeout.
+    fn loading_timed_out(&mut self, now: DateTime<Utc>) -> bool {
+        let Some(timeout) = self.ctx.config.loading_timeout else {
+            return false;
+        };
+        let entered_at = *self.st.entered_at.get_or_insert(now);
+        let elapsed = now.signed_duration_since(entered_at);
+        if elapsed < TimeDelta::zero() {
+            self.st.entered_at = Some(now);
+            return false;
+        }
+        if elapsed < timeout {
+            return false;
+        }
+        let laggards: Vec<PeerID> = self
+            .ctx
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.is_setup())
+            .map(|(peer, _)| *peer)
+            .collect();
+        if laggards.is_empty() {
+            return false;
+        }
+        for peer in laggards {
+            if let Some(session) = self.ctx.sessions.get(&peer) {
+                session
+                    .span
+                    .in_scope(|| tracing::info!("loading timed out, dropping client"));
+            }
+            self.ctx.effects.push(Effect::Disconnect {
+                peer,
+                reason: DisconnectReason::Refused,
+            });
+            // Treated as gone at once rather than when ENet confirms it, or
+            // the match would keep waiting for it until then.
+            self.on_disconnected(peer);
+        }
+        self.finish_if_everyone_loaded(false)
     }
 
     fn on_message(mut self, peer: PeerID, msg: WireMessage) -> AnyServer {
@@ -3291,7 +3414,7 @@ impl<S: MatchPhase> Server<S> {
         // it, so nothing already recorded is withheld.
         let last_stored = self.ctx.log.last_command_turn().unwrap_or(0);
         let upper = (ready_turn + 1).max(last_stored);
-        let default_length = self.st.frozen().turn_length_ms as u16;
+        let default_length = self.st.frozen().turn_length_ms;
 
         for turn in (msg.current_turn + 1)..=upper {
             let commands: Vec<PlayerCommand> = self.ctx.log.commands_for(turn).to_vec();
@@ -3336,7 +3459,7 @@ impl<S: MatchPhase> Server<S> {
     // commands together with its seal, so they are still to come.
     fn resume_delayed(&mut self, peer: PeerID, client_id: u16, snapshot_turn: u32) {
         let head = self.ctx.feed.head();
-        let default_length = self.st.frozen().turn_length_ms as u16;
+        let default_length = self.st.frozen().turn_length_ms;
         for turn in (snapshot_turn + 1)..=head {
             let commands: Vec<PlayerCommand> = self.ctx.log.commands_for(turn).to_vec();
             for command in commands {
