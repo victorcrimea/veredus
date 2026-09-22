@@ -80,6 +80,9 @@ fn clone_effect(effect: &Effect) -> Effect {
             turn: *turn,
             request: request.clone(),
         },
+        Effect::MatchEnded { checkpoint } => Effect::MatchEnded {
+            checkpoint: *checkpoint,
+        },
     }
 }
 

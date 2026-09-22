@@ -103,4 +103,7 @@ pub enum GameToLobby {
         nbp: u32,
         players: String,
     },
+    // The match has been decided. The game keeps running for whoever stays,
+    // but it is no longer one to list.
+    Ended,
 }

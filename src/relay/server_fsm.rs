@@ -145,9 +145,12 @@ pub enum Input {
     AiHostExited,
     // A finished link of the rolling checkpoint chain. None means the run
     // failed or diverged. The id plays the same role as in StateDumped.
+    // `players` is each player's state at that turn as the replay saw it,
+    // indexed by player id with gaia first; empty when the run failed.
     Checkpointed {
         id: u32,
         state: Option<Vec<u8>>,
+        players: Vec<String>,
     },
 }
 
@@ -214,6 +217,12 @@ pub enum Effect {
         id: u32,
         turn: u32,
         request: DumpRequest,
+    },
+    // The match has been decided. `checkpoint` names the run whose result
+    // proved it, so the IO side can record that result as final; None when
+    // it was worked out without one.
+    MatchEnded {
+        checkpoint: Option<u32>,
     },
 }
 
@@ -297,6 +306,9 @@ pub struct Config {
     // match runs, and no replay ever starts from turn 0 again. 0 turns them
     // off; they also need sidecar_dumps.
     pub checkpoint_interval_turns: u32,
+    // How long a decided match keeps running for the players who stay to
+    // watch or chat before the game shuts down.
+    pub post_game_linger: TimeDelta,
 }
 
 impl Default for Config {
@@ -327,6 +339,7 @@ impl Default for Config {
             sidecar_dumps: false,
             hosted_ai: false,
             checkpoint_interval_turns: 0,
+            post_game_linger: TimeDelta::minutes(5),
         }
     }
 }
@@ -336,6 +349,12 @@ pub struct FrozenSettings {
     pub json: Vec<u8>,
     pub cheats_enabled: bool,
     pub turn_length_ms: u32,
+    // Every player id in the match, AI included. Empty when the settings
+    // could not be read, which keeps the resign rule from ever firing.
+    pub player_ids: Vec<i32>,
+    // With no victory condition the engine never declares anyone the
+    // winner, so running out of opponents does not end the match.
+    pub endless: bool,
 }
 
 // The server-wide phase, as the authentication rules see it. It is derived
@@ -345,6 +364,7 @@ pub enum Phase {
     Setup,
     Loading,
     InGame,
+    PostGame,
 }
 
 pub(crate) struct Context {
@@ -432,6 +452,11 @@ struct CheckpointChain {
     // so a run now lands on exactly the state the returning player needs,
     // and nobody still playing has to serialize it for them.
     prefetch: bool,
+    // Set when something suggests the match may just have been decided: a
+    // player resigned or left. The next run is due once the ready turn has
+    // passed this turn, rather than at the next interval, so the end is
+    // noticed while the players are still there to be told.
+    probe: Option<u32>,
 }
 
 struct PendingCheckpoint {
@@ -447,6 +472,13 @@ const CHECKPOINT_FAILURE_LIMIT: u8 = 2;
 impl CheckpointChain {
     fn at_or_before(&self, turn: u32) -> Option<&BaseState> {
         self.states.iter().rev().find(|b| b.turn <= turn)
+    }
+
+    // The earliest hint wins, so a later one cannot push back a check that
+    // is already due.
+    fn probe_at(&mut self, turn: u32) {
+        let probe = self.probe.get_or_insert(turn);
+        *probe = (*probe).min(turn);
     }
 }
 
@@ -823,6 +855,19 @@ pub struct InGame {
     pub settings: FrozenSettings,
 }
 
+// Still in-game on the wire: the clients' simulations keep running, so turns
+// are still released for whoever stays to watch or chat. What ends is
+// everything that only makes sense while the match can still be won: nobody
+// is waited for, nobody new is let in, and no more checkpoints are taken.
+pub struct PostGame {
+    pub settings: FrozenSettings,
+    // The checkpoint run whose result decided the match, whose outcome is
+    // then already final and needs no replay of its own.
+    pub resolved_by: Option<u32>,
+    // Anchored on the first tick, because the FSM only learns the time there.
+    pub ended_at: Option<DateTime<Utc>>,
+}
+
 // Setup handlers stay available while a savegame is being fetched.
 pub trait SetupPhase {}
 impl SetupPhase for Setup {}
@@ -860,6 +905,28 @@ impl PhaseMarker for InGame {
         Some(&self.settings)
     }
 }
+impl PhaseMarker for PostGame {
+    const PHASE: Phase = Phase::PostGame;
+    fn settings(&self) -> Option<&FrozenSettings> {
+        Some(&self.settings)
+    }
+}
+
+// The phases in which turns are being released, which share every handler
+// of the running match.
+pub trait MatchPhase: PhaseMarker {
+    fn frozen(&self) -> &FrozenSettings;
+}
+impl MatchPhase for InGame {
+    fn frozen(&self) -> &FrozenSettings {
+        &self.settings
+    }
+}
+impl MatchPhase for PostGame {
+    fn frozen(&self) -> &FrozenSettings {
+        &self.settings
+    }
+}
 
 pub enum AnyServer {
     Idle(Server<Idle>),
@@ -868,6 +935,7 @@ pub enum AnyServer {
     AwaitAiHost(Server<AwaitAiHost>),
     Loading(Server<Loading>),
     InGame(Server<InGame>),
+    PostGame(Server<PostGame>),
 }
 
 impl From<Server<Idle>> for AnyServer {
@@ -906,12 +974,20 @@ impl From<Server<InGame>> for AnyServer {
     }
 }
 
+impl From<Server<PostGame>> for AnyServer {
+    fn from(s: Server<PostGame>) -> Self {
+        AnyServer::PostGame(s)
+    }
+}
+
 impl AnyServer {
     // Read once the game thread is done with the FSM, however it got there:
     // the thread also ends when its socket closes, which no input announces.
     pub fn outcome_request(&self) -> Option<DumpRequest> {
         match self {
             AnyServer::InGame(s) => s.outcome_request(),
+            // A match decided by a checkpoint already has its final outcome.
+            AnyServer::PostGame(s) if s.st.resolved_by.is_none() => s.outcome_request(),
             _ => None,
         }
     }
@@ -924,6 +1000,7 @@ impl AnyServer {
             AnyServer::AwaitAiHost(s) => s.on_input(input),
             AnyServer::Loading(s) => s.on_input(input),
             AnyServer::InGame(s) => s.on_input(input),
+            AnyServer::PostGame(s) => s.on_input(input),
         }
     }
 
@@ -935,6 +1012,7 @@ impl AnyServer {
             AnyServer::AwaitAiHost(s) => s.take_effects(),
             AnyServer::Loading(s) => s.take_effects(),
             AnyServer::InGame(s) => s.take_effects(),
+            AnyServer::PostGame(s) => s.take_effects(),
         }
     }
 
@@ -946,6 +1024,7 @@ impl AnyServer {
             AnyServer::AwaitAiHost(s) => s.shutdown(),
             AnyServer::Loading(s) => s.shutdown(),
             AnyServer::InGame(s) => s.shutdown(),
+            AnyServer::PostGame(s) => s.shutdown(),
         }
     }
 }
@@ -1158,9 +1237,11 @@ impl<S: PhaseMarker> Server<S> {
         // Before the warning gate, on its own anchor: the budget is charged
         // from the elapsed it works out itself, so it neither depends on nor
         // disturbs the once-a-second warning cadence.
-        if S::PHASE == Phase::InGame {
+        if S::PHASE == Phase::InGame || S::PHASE == Phase::PostGame {
             let players = self.ctx.slots.connected_players();
-            let absent = if self.ctx.config.afk_pause {
+            // Once the match is decided nobody is worth waiting for, so an
+            // empty list lifts a hold still in place and starts no new one.
+            let absent = if self.ctx.config.afk_pause && S::PHASE == Phase::InGame {
                 self.ctx.afk_absent()
             } else {
                 Vec::new()
@@ -1504,6 +1585,12 @@ impl<S: PhaseMarker> Server<S> {
     // only ever returned by the Setup-phase branch below.
     fn admit(&self, name: &str) -> Result<bool, DisconnectReason> {
         let sessions = self.ctx.sessions.len();
+
+        // A decided match has nothing left to join, and a joiner would only
+        // cost a snapshot for a game that is about to close.
+        if S::PHASE == Phase::PostGame {
+            return Err(DisconnectReason::MatchInProgress);
+        }
 
         if S::PHASE == Phase::Setup {
             // The arriving session is already counted, which is what leaves a
@@ -2032,10 +2119,13 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
 
 impl<S: SetupPhase + PhaseMarker> Server<S> {
     fn freeze(&self, json: &[u8]) -> FrozenSettings {
+        let (player_ids, endless) = match_players(json);
         FrozenSettings {
             cheats_enabled: cheats_enabled(json),
             json: json.to_vec(),
             turn_length_ms: self.ctx.config.turn_length_ms,
+            player_ids,
+            endless,
         }
     }
 
@@ -2241,15 +2331,22 @@ impl Server<Setup> {
         }))
     }
 
-    // Not implemented: the saved-game flow would be "controller only, request
-    // SAVEGAME from the controller". Until it is, the start is refused rather
-    // than panicked on, because any client can send this message.
+    // Refused, and deliberately left unimplemented: a stock client offers
+    // its savegame picker only when it hosts the server itself, never when
+    // it joins one, so nothing but a modified client can send this to a
+    // dedicated server. Loading saved games is meant to come from the server
+    // side instead, with the relay supplying the saved state itself. Refused
+    // rather than panicked on, because any client can send this message.
     fn on_start_savegame_settings(
         &mut self,
         peer: PeerID,
         _msg: StartSavegameSettings,
     ) -> Option<Vec<u8>> {
-        tracing::warn!(?peer, "savegame start is not implemented, ignoring");
+        tracing::warn!(?peer, "savegame start is not supported, refusing");
+        self.ctx.server_chat(
+            Some(peer),
+            "Loading a saved game is not supported on this server.",
+        );
         None
     }
 }
@@ -2479,7 +2576,7 @@ impl Server<Loading> {
     }
 }
 
-impl Server<InGame> {
+impl<S: MatchPhase> Server<S> {
     // The whole match as released, with the players' agreed hashes, for the
     // replay that works out who won. None when no turn was ever released,
     // since there is then no match to judge, or when there is no sidecar.
@@ -2500,16 +2597,82 @@ impl Server<InGame> {
             .filter_map(|t| self.ctx.turns.reference(t).map(|hash| (t, hash.to_vec())))
             .collect()
     }
+}
 
+impl Server<InGame> {
     fn on_input(mut self, input: Input) -> AnyServer {
         match input {
             Input::Received { peer, msg } => self.on_message(peer, msg),
             Input::StateDumped { id, state } => self.on_state_dumped(id, state),
-            Input::Checkpointed { id, state } => self.on_checkpointed(id, state),
+            Input::Checkpointed { id, state, players } => {
+                if self.on_checkpointed(id, state, &players) {
+                    return self.end_match(Some(id)).into();
+                }
+            }
+            Input::Disconnected { peer } => {
+                // The losing side often just leaves, so a player going is
+                // worth an early look at whether the match is over.
+                let player_left = self
+                    .ctx
+                    .uuid_of(peer)
+                    .and_then(|u| self.ctx.slots.slot_of(&u))
+                    .is_some_and(|slot| slot != UNASSIGNED);
+                if player_left {
+                    let turn = self.ctx.turns.ready_turn();
+                    self.ctx.checkpoints.probe_at(turn);
+                }
+                self.on_common_input(Input::Disconnected { peer });
+            }
             other => self.on_common_input(other),
+        }
+        if self.resigned_out() {
+            return self.end_match(None).into();
         }
         self.maybe_checkpoint();
         self.into()
+    }
+
+    // Certain without simulating: a resign is a defeat, and after a defeat
+    // the engine declares the one player left, if any, the winner. Without a
+    // resign it never checks, so a match played alone does not end here.
+    // Resigns the relay never sees, such as a client-computed AI's, only
+    // make this miss an ending, never invent one.
+    fn resigned_out(&self) -> bool {
+        let settings = &self.st.settings;
+        if settings.endless || settings.player_ids.is_empty() || self.ctx.resigned.is_empty() {
+            return false;
+        }
+        let remaining = settings
+            .player_ids
+            .iter()
+            .filter(|p| !self.ctx.resigned.contains(p))
+            .count();
+        remaining <= 1
+    }
+
+    fn end_match(self, resolved_by: Option<u32>) -> Server<PostGame> {
+        let Server { mut ctx, st } = self;
+        tracing::info!(
+            turn = ctx.turns.ready_turn(),
+            resolved = resolved_by.is_some(),
+            "match decided, entering post-game"
+        );
+        ctx.effects.push(Effect::MatchEnded {
+            checkpoint: resolved_by,
+        });
+        let text = format!(
+            "The match is over. This server closes in {}, or once everyone has left.",
+            describe_span(ctx.config.post_game_linger)
+        );
+        ctx.server_chat(None, &text);
+        Server {
+            ctx,
+            st: PostGame {
+                settings: st.settings,
+                resolved_by,
+                ended_at: None,
+            },
+        }
     }
 
     // Starts the next link once the match has run a whole interval past the
@@ -2532,6 +2695,7 @@ impl Server<InGame> {
             turn > last
         } else {
             turn >= last.saturating_add(interval)
+                || chain.probe.is_some_and(|p| turn > p && turn > last)
         };
         if !due {
             return;
@@ -2543,6 +2707,9 @@ impl Server<InGame> {
         request.hashes = self.reference_hashes(last, turn);
         let chain = &mut self.ctx.checkpoints;
         chain.prefetch = false;
+        if chain.probe.is_some_and(|p| p < turn) {
+            chain.probe = None;
+        }
         let id = chain.next_id;
         chain.next_id = chain.next_id.wrapping_add(1);
         chain.pending = Some(PendingCheckpoint {
@@ -2556,10 +2723,12 @@ impl Server<InGame> {
             .push(Effect::Checkpoint { id, turn, request });
     }
 
-    fn on_checkpointed(&mut self, id: u32, state: Option<Vec<u8>>) {
+    // True when the run shows the match decided: every player has either
+    // won or been defeated. The chain is updated either way.
+    fn on_checkpointed(&mut self, id: u32, state: Option<Vec<u8>>, players: &[String]) -> bool {
         let chain = &mut self.ctx.checkpoints;
         if chain.pending.as_ref().is_none_or(|p| p.id != id) {
-            return;
+            return false;
         }
         let pending = chain.pending.take().expect("pending was just checked");
         let Some(bytes) = state else {
@@ -2569,7 +2738,7 @@ impl Server<InGame> {
                     "sidecar: checkpoint from turn 0 failed, no more checkpoints this match"
                 );
                 chain.disabled = true;
-                return;
+                return false;
             }
             chain.failures += 1;
             if chain.failures >= CHECKPOINT_FAILURE_LIMIT {
@@ -2580,7 +2749,7 @@ impl Server<InGame> {
                 chain.states.clear();
                 chain.failures = 0;
             }
-            return;
+            return false;
         };
         chain.failures = 0;
         chain.states.push(BaseState {
@@ -2597,8 +2766,15 @@ impl Server<InGame> {
             kept = chain.states.len(),
             "sidecar: checkpoint stored"
         );
+        // Gaia comes first and is never decided, so it is skipped.
+        players.len() > 1
+            && players[1..]
+                .iter()
+                .all(|state| state == "won" || state == "defeated")
     }
+}
 
+impl<S: MatchPhase> Server<S> {
     fn on_message(&mut self, peer: PeerID, msg: WireMessage) {
         let outcome = match msg {
             WireMessage::Joined(m) => self.on_joined(peer, m),
@@ -2787,16 +2963,16 @@ impl Server<InGame> {
 
     fn on_player_command(&mut self, peer: PeerID, msg: PlayerCommand) -> Result<(), PeerFault> {
         let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
-        if !self.st.settings.cheats_enabled {
+        let ai_player = self.ctx.is_ai_host(peer)
+            && self
+                .ctx
+                .ai_host
+                .as_ref()
+                .is_some_and(|h| h.players.contains(&msg.player));
+        if !self.st.frozen().cheats_enabled {
             // An observer holds a slot-table entry but owns no player, so a
             // command claiming player -1 must not be allowed to match it.
             let slot = self.ctx.slots.slot_of(&uuid).filter(|s| *s != UNASSIGNED);
-            let ai_player = self.ctx.is_ai_host(peer)
-                && self
-                    .ctx
-                    .ai_host
-                    .as_ref()
-                    .is_some_and(|h| h.players.contains(&msg.player));
             if slot.map(i32::from) != Some(msg.player) && !ai_player {
                 // Silently, because a cheat attempt is not worth a disconnect.
                 tracing::debug!(?peer, slot = ?slot, claimed = msg.player, "command slot mismatch");
@@ -2807,9 +2983,16 @@ impl Server<InGame> {
         // Checked against the sender's own slot even with cheats on, where
         // commands for any player are relayed, so nobody can release the
         // match from waiting on someone else.
+        // The AI host speaks for its AI players, so their resigning counts
+        // the same as a player's own.
         let own_slot = self.ctx.slots.slot_of(&uuid).map(i32::from) == Some(msg.player);
-        if own_slot && PlayerCommand::extract_command_type(&msg.data).as_deref() == Some("resign") {
+        if (own_slot || ai_player)
+            && PlayerCommand::extract_command_type(&msg.data).as_deref() == Some("resign")
+        {
             self.ctx.resigned.insert(msg.player);
+            // The resign takes effect at the turn it is scheduled for, so
+            // that is the earliest turn a replay could show the match over.
+            self.ctx.checkpoints.probe_at(msg.turn);
         }
 
         // Relayed unchanged, and the echo back to the sender is required: a
@@ -2843,7 +3026,7 @@ impl Server<InGame> {
 
     fn on_turn_sealed(&mut self, peer: PeerID, msg: TurnSealed) -> Result<(), PeerFault> {
         self.ctx.turns.on_turn_sealed(peer, msg.turn)?;
-        let turn_length = self.st.settings.turn_length_ms;
+        let turn_length = self.st.frozen().turn_length_ms;
         self.ctx.release_turns(turn_length);
         Ok(())
     }
@@ -2877,7 +3060,7 @@ impl Server<InGame> {
         // it, so nothing already recorded is withheld.
         let last_stored = self.ctx.log.last_command_turn().unwrap_or(0);
         let upper = (ready_turn + 1).max(last_stored);
-        let default_length = self.st.settings.turn_length_ms as u16;
+        let default_length = self.st.frozen().turn_length_ms as u16;
 
         for turn in (msg.current_turn + 1)..=upper {
             let commands: Vec<PlayerCommand> = self.ctx.log.commands_for(turn).to_vec();
@@ -2922,7 +3105,7 @@ impl Server<InGame> {
     // commands together with its seal, so they are still to come.
     fn resume_delayed(&mut self, peer: PeerID, client_id: u16, snapshot_turn: u32) {
         let head = self.ctx.feed.head();
-        let default_length = self.st.settings.turn_length_ms as u16;
+        let default_length = self.st.frozen().turn_length_ms as u16;
         for turn in (snapshot_turn + 1)..=head {
             let commands: Vec<PlayerCommand> = self.ctx.log.commands_for(turn).to_vec();
             for command in commands {
@@ -2949,6 +3132,56 @@ impl Server<InGame> {
     }
 }
 
+impl Server<PostGame> {
+    fn on_input(mut self, input: Input) -> AnyServer {
+        match input {
+            Input::Received { peer, msg } => self.on_message(peer, msg),
+            Input::StateDumped { id, state } => self.on_state_dumped(id, state),
+            Input::Tick { now, stats } => {
+                self.on_tick(now, stats);
+                if self.close_due(now) {
+                    self.ctx.effects.push(Effect::GameOver);
+                }
+            }
+            other => self.on_common_input(other),
+        }
+        self.into()
+    }
+
+    // Closes once nobody is left to watch, or the linger has run out. The AI
+    // host alone keeps nothing open. A negative delta re-anchors rather than
+    // firing early (A7).
+    fn close_due(&mut self, now: DateTime<Utc>) -> bool {
+        let anyone_admitted = self
+            .ctx
+            .sessions
+            .iter()
+            .any(|(p, s)| s.admitted.is_some() && !self.ctx.is_ai_host(*p));
+        if !anyone_admitted {
+            return true;
+        }
+        let anchor = *self.st.ended_at.get_or_insert(now);
+        let elapsed = now.signed_duration_since(anchor);
+        if elapsed < TimeDelta::zero() {
+            self.st.ended_at = Some(now);
+            return false;
+        }
+        elapsed >= self.ctx.config.post_game_linger
+    }
+}
+
+// A duration as the chat line announcing it reads it.
+fn describe_span(span: TimeDelta) -> String {
+    let secs = span.num_seconds().max(0);
+    if secs == 60 {
+        "1 minute".to_string()
+    } else if secs > 60 && secs % 60 == 0 {
+        format!("{} minutes", secs / 60)
+    } else {
+        format!("{secs} seconds")
+    }
+}
+
 // The only thing the server reads out of the settings blob. A full JSON parser
 // would be a dependency and a decode the relay otherwise never needs.
 fn cheats_enabled(json: &[u8]) -> bool {
@@ -2964,6 +3197,29 @@ fn cheats_enabled(json: &[u8]) -> bool {
         .take(4)
         .collect();
     value.starts_with(b"true")
+}
+
+// The player ids a match is played between, and whether it can end at all.
+// PlayerData starts at player 1: the engine puts gaia in front of it itself.
+// Settings that cannot be read give no players and an endless match, so the
+// resign rule never ends a match it cannot see.
+fn match_players(json: &[u8]) -> (Vec<i32>, bool) {
+    let Ok(attribs) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return (Vec::new(), true);
+    };
+    let Some(settings) = attribs.get("settings") else {
+        return (Vec::new(), true);
+    };
+    let count = settings
+        .get("PlayerData")
+        .and_then(|pd| pd.as_array())
+        .map_or(0, |pd| pd.len());
+    let player_ids = (1..=count as i32).collect();
+    let endless = settings
+        .get("VictoryConditions")
+        .and_then(|vc| vc.as_array())
+        .is_none_or(|vc| vc.is_empty());
+    (player_ids, endless)
 }
 
 // What START_SETTINGS becomes when a match has AI slots: every stock client
@@ -2992,7 +3248,8 @@ enum StartOutcome {
 fn split_ai_settings(json: &[u8]) -> Option<AiSettingsSplit> {
     let mut attribs: serde_json::Value = serde_json::from_slice(json).ok()?;
     let settings = attribs.get_mut("settings")?.as_object_mut()?;
-    // A PlayerData index is the player id, index 0 being gaia.
+    // PlayerData starts at player 1: the engine puts gaia in front of it
+    // itself, so a slot's player id is its index plus one.
     let players: HashSet<i32> = settings
         .get("PlayerData")?
         .as_array()?
@@ -3003,7 +3260,7 @@ fn split_ai_settings(json: &[u8]) -> Option<AiSettingsSplit> {
                 .and_then(|ai| ai.as_str())
                 .is_some_and(|ai| !ai.is_empty())
         })
-        .map(|(i, _)| i as i32)
+        .map(|(i, _)| i as i32 + 1)
         .collect();
     if players.is_empty() {
         return None;
@@ -3017,7 +3274,7 @@ fn split_ai_settings(json: &[u8]) -> Option<AiSettingsSplit> {
         .as_array_mut()?;
     for &player in &players {
         if let Some(slot) = player_data
-            .get_mut(player as usize)
+            .get_mut(player as usize - 1)
             .and_then(|pd| pd.as_object_mut())
         {
             for field in AI_FIELDS {

@@ -257,6 +257,9 @@ struct Assigned {
     assignment: Assignment,
     // Sec. 17.4: scoped to this assignment, not the account's whole lifetime.
     failures: HashMap<String, u32>,
+    // Set once the listing was withdrawn at the end of the match, so the
+    // game thread exiting does not withdraw it a second time.
+    unlisted: bool,
 }
 
 // The register IQs one account owes the game bot. A window opens on the first
@@ -358,6 +361,7 @@ async fn run_account(
                                 events_rx,
                                 assignment: Assignment { port, password_hash },
                                 failures: HashMap::new(),
+                                unlisted: false,
                             });
                             registration.clear();
                         }
@@ -396,12 +400,20 @@ async fn run_account(
                             registration.flush(&mut client, &config).await;
                             send_gamelist(&mut client, &config, gamelist::changestate(nbp, &players)).await;
                         }
+                        (Some(GameToLobby::Ended), Some(_)) => {
+                            registration.clear();
+                            send_unregister(&mut client, &config).await;
+                            if let Some(a) = assigned.as_mut() {
+                                a.unlisted = true;
+                            }
+                        }
                         (Some(_), None) => {}
                         (None, _) => {
                             // The game thread dropped its sender: the match ended.
+                            let unlisted = assigned.as_ref().is_some_and(|a| a.unlisted);
                             assigned = None;
                             registration.clear();
-                            if bound_jid.is_some() {
+                            if bound_jid.is_some() && !unlisted {
                                 send_unregister(&mut client, &config).await;
                             }
                             let _ = main_tx.send(LobbyEvent::GameEnded { account }).await;

@@ -95,6 +95,15 @@ impl Drop for CheckpointSlot {
     }
 }
 
+// What a finished checkpoint run hands back. The result JSON stays on this
+// side of the FSM, which only needs the player states to judge the match.
+struct CheckpointDone {
+    state: Vec<u8>,
+    players: Vec<String>,
+    turn: u32,
+    json: String,
+}
+
 // The one-shot runs this game can have in flight, with the channels their
 // workers answer on. Owned by the game thread for its whole life.
 struct OneShotRuns {
@@ -102,8 +111,11 @@ struct OneShotRuns {
     outcome_path: Option<PathBuf>,
     dump_tx: Sender<(u32, Option<Vec<u8>>)>,
     dump_slot: DumpSlot,
-    checkpoint_tx: Sender<(u32, Option<Vec<u8>>)>,
+    checkpoint_tx: Sender<(u32, Option<CheckpointDone>)>,
     checkpoint_slot: CheckpointSlot,
+    // The newest checkpoint result as (run id, turn, JSON), kept in case the
+    // FSM finds that this run decided the match and it becomes the outcome.
+    last_result: Option<(u32, u32, String)>,
 }
 
 // The hosted-AI process for this game, if one is running. It lives on this
@@ -186,7 +198,8 @@ pub fn run_game_server(
     let mut latest_stats: Vec<PeerStats> = Vec::new();
     let mut last_tick: DateTime<Utc> = Utc::now();
     let (dump_tx, dump_rx) = std::sync::mpsc::channel::<(u32, Option<Vec<u8>>)>();
-    let (checkpoint_tx, checkpoint_rx) = std::sync::mpsc::channel::<(u32, Option<Vec<u8>>)>();
+    let (checkpoint_tx, checkpoint_rx) =
+        std::sync::mpsc::channel::<(u32, Option<CheckpointDone>)>();
     let mut runs = OneShotRuns {
         pyrogenesis_path: pyrogenesis_path.clone(),
         outcome_path,
@@ -194,6 +207,7 @@ pub fn run_game_server(
         dump_slot: DumpSlot::default(),
         checkpoint_tx,
         checkpoint_slot: CheckpointSlot::default(),
+        last_result: None,
     };
     let mut outcome_request: Option<DumpRequest> = None;
     let mut ai_host = AiHostSlot {
@@ -242,12 +256,24 @@ pub fn run_game_server(
             );
         }
 
-        while let Ok((id, state)) = checkpoint_rx.try_recv() {
+        while let Ok((id, done)) = checkpoint_rx.try_recv() {
+            let (state, players) = match done {
+                Some(CheckpointDone {
+                    state,
+                    players,
+                    turn,
+                    json,
+                }) => {
+                    runs.last_result = Some((id, turn, json));
+                    (Some(state), players)
+                }
+                None => (None, Vec::new()),
+            };
             server = Some(
                 server
                     .take()
                     .expect("server is always present")
-                    .handle(Input::Checkpointed { id, state }),
+                    .handle(Input::Checkpointed { id, state, players }),
             );
         }
 
@@ -305,7 +331,7 @@ pub fn run_game_server(
                 break 'game;
             }
             if outcome.game_over {
-                tracing::info!("idle-shutdown timeout elapsed, ending game");
+                tracing::info!("game over, ending game");
                 let current = server.take().expect("server is always present");
                 outcome_request = current.outcome_request();
                 let effects = current.shutdown();
@@ -425,6 +451,22 @@ fn drain(
             }
             Effect::GameOver => {
                 outcome.game_over = true;
+                continue;
+            }
+            Effect::MatchEnded { checkpoint } => {
+                // The deciding run already wrote this result as progress;
+                // now it is marked final, and no replay has to follow.
+                if let Some((id, turn, json)) = runs.last_result.take()
+                    && checkpoint == Some(id)
+                {
+                    tracing::info!(turn, "match outcome resolved");
+                    if let Some(path) = &runs.outcome_path {
+                        write_outcome(path, turn, true, &json);
+                    }
+                }
+                if let Some(lobby) = lobby {
+                    let _ = lobby.events_tx.send(GameToLobby::Ended);
+                }
                 continue;
             }
             Effect::StateDump { id, turn, request } => {
@@ -561,7 +603,13 @@ fn spawn_checkpoint(runs: &mut OneShotRuns, id: u32, turn: u32, request: DumpReq
                 {
                     write_outcome(&path, turn, false, &json);
                 }
-                Some(bytes)
+                let players = result.player_states.into_iter().map(|p| p.state).collect();
+                Some(CheckpointDone {
+                    state: bytes,
+                    players,
+                    turn,
+                    json,
+                })
             }
             Ok(Err(error)) => {
                 tracing::warn!(from, turn, %error, "sidecar: checkpoint failed");

@@ -133,6 +133,7 @@ pub struct GameSection {
     pub release_controller_on_leave: bool,
     pub pause_budget_secs: u64,
     pub afk_pause: bool,
+    pub post_game_linger_secs: u64,
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
     pub enabled_mods: Vec<ModEntry>,
@@ -158,6 +159,7 @@ impl Default for GameSection {
             release_controller_on_leave: config.release_controller_on_leave,
             pause_budget_secs: config.pause_budget.num_seconds().max(0) as u64,
             afk_pause: config.afk_pause,
+            post_game_linger_secs: config.post_game_linger.num_seconds().max(0) as u64,
             buddies,
             enabled_mods: config
                 .enabled_mods
@@ -198,6 +200,7 @@ impl GameSection {
             welcome_message: self.welcome_message.clone(),
             pause_budget: secs_to_delta(self.pause_budget_secs),
             afk_pause: self.afk_pause,
+            post_game_linger: secs_to_delta(self.post_game_linger_secs),
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
             checkpoint_interval_turns,
