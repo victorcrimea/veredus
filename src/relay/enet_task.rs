@@ -30,8 +30,17 @@ const MAX_EVENTS_PER_TICK: usize = 256;
 // faster would only produce readings nothing looks at.
 const STATS_INTERVAL: TimeDelta = TimeDelta::seconds(1);
 
+// The crate defaults let any sender that completes the ENet connect, before
+// any handshake, make the host buffer tens of MiB per peer.
+#[derive(Debug, Clone, Copy)]
+pub struct EnetLimits {
+    pub max_packet_bytes: usize,
+    pub max_waiting_bytes: usize,
+}
+
 pub fn run_enet_host(
     socket: UdpSocket,
+    limits: EnetLimits,
     event_tx: Sender<InboundNetworkMessage>,
     send_rx: Receiver<OutboundNetworkMessage>,
 ) {
@@ -48,6 +57,8 @@ pub fn run_enet_host(
             channel_limit: CHANNEL_LIMIT,
             compressor: None,
             checksum: None,
+            maximum_packet_size: limits.max_packet_bytes,
+            maximum_waiting_data: limits.max_waiting_bytes,
             ..Default::default()
         },
     )

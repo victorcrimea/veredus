@@ -19,6 +19,7 @@ use crate::lobby::link::LobbyLink;
 use crate::metrics::GameMetrics;
 use crate::network_message::InboundNetworkMessage;
 use crate::network_message::OutboundNetworkMessage;
+use crate::relay::enet_task::EnetLimits;
 use crate::relay::enet_task::run_enet_host;
 use crate::relay::game_server::SidecarSetup;
 use crate::relay::game_server::run_game_server;
@@ -64,6 +65,7 @@ struct GameHandle {
 
 pub struct GamePool {
     bind_ip: IpAddr,
+    enet_limits: EnetLimits,
     games: HashMap<GameId, GameHandle>,
     used_ports: Vec<u16>,
     // Outcome replays outlive their games, so that destroying a game never
@@ -73,9 +75,10 @@ pub struct GamePool {
 }
 
 impl GamePool {
-    pub fn new(bind_ip: IpAddr) -> Self {
+    pub fn new(bind_ip: IpAddr, enet_limits: EnetLimits) -> Self {
         Self {
             bind_ip,
+            enet_limits,
             games: HashMap::new(),
             used_ports: Vec::new(),
             outcomes: Vec::new(),
@@ -147,10 +150,11 @@ impl GamePool {
         // inheriting one from the pool. Every log line then carries game_id and
         // port without threading them through by hand.
         let enet_game_id = game_id.to_string();
+        let enet_limits = self.enet_limits;
         let enet_thread = std::thread::spawn(move || {
             let span = tracing::info_span!("game", game_id = %enet_game_id, port);
             let _guard = span.entered();
-            run_enet_host(socket, event_tx, send_rx);
+            run_enet_host(socket, enet_limits, event_tx, send_rx);
         });
 
         let server_game_id = game_id.to_string();
