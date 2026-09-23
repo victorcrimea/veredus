@@ -4,280 +4,222 @@
 [![Release](https://img.shields.io/github/v/release/victorcrimea/veredus?sort=semver)](https://github.com/victorcrimea/veredus/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A dedicated, headless server for [0 A.D.](https://play0ad.com/), the free and
-open-source RTS game. It runs as a network relay that forwards game traffic
-between clients and manages lobby, session, turn and match state so games can
-be hosted around the clock without a player acting as host. The relay itself
-never runs game simulation: that happens in the players' own 0 A.D. clients,
-or in a headless `pyrogenesis` process ("sidecar") the server spawns for
-hosted-AI opponents, rejoin snapshots and post-match processing.
+Veredus is an always-on multiplayer server for
+[0 A.D.](https://play0ad.com/), the free real-time strategy game. Run it on
+a VPS or a spare machine and your group gets a game that is always there to
+join. No player has to host, and the match keeps going when someone's
+connection drops.
 
-## Table of contents
+Players use the normal, unmodified game and join the server like any other
+multiplayer game.
 
-- [Features](#features)
-- [Architecture](#architecture)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Observability and logging](#observability-and-logging)
-- [Further reading](#further-reading)
-- [License](#license)
+**Works with 0 A.D. 0.28.0.**
 
-## Features
+What you get:
 
-- **Always-on hosting** - games run without any client acting as network
-  host, so a match survives the original host disconnecting.
-- **Out-of-sync (OOS) detection** - full-state hashes are compared every turn
-  and a desync is reported instead of silently corrupting the match.
-- **Rejoin support** - a client that drops and reconnects is served a stored
-  sidecar checkpoint (or a one-shot sidecar dump when no client can serve
-  it) and resumes rather than being locked out.
-- **Rolling checkpoints** - every few hundred released turns the sidecar
-  replays the match so far and stores the state; joiners catch up from the
-  newest checkpoint and the match outcome file follows the game while it
-  runs.
-- **Hosted AI opponents** - a headless `pyrogenesis` sidecar can join as an AI
-  player, letting a game run below the human player count it was set up for.
-- **Automatic outcome resolution** - the match result is produced by replaying
-  the agreed turns in the sidecar, even when no human player stays to the
-  end, and written as `<game_id>.json` when `--outcome-dir` is set.
-- **Delayed observers** - observers can watch a configurable number of turns
-  behind live play, so streaming a match does not leak live positions.
-- **Password-protected games** - optional password gating at the ENet layer,
-  matching the stock client/host handshake.
-- **Flood and pause limits** - per-peer chat, flare and command quotas plus a
-  shared pause budget (with AFK auto-pause) keep one client from stalling or
-  spamming the match.
-- **Per-client network metrics** - RTT and packet loss are tracked per
-  client and exported to Prometheus, alongside per-game message and byte
-  counters.
-- **Lobby integration** - connects to the 0 A.D. XMPP lobby with a pool of
-  accounts and hosts a fresh game on the `hostme` command in the MUC room,
-  one game per available account.
-- **Graceful disconnects** - kicks, bans and timeouts carry defined
-  numeric disconnect reasons, matching what stock clients display, and the
-  updated slot list goes out before the peer is dropped so the departing
-  client still sees itself leave.
+- Games that never depend on one player's computer or internet connection.
+- Dropped players can rejoin a match in progress.
+- Out-of-sync detection that tells players when their games disagree, instead
+  of letting a match silently fall apart.
+- Observers who watch a few minutes behind live play, so streaming a match
+  gives nothing away.
+- Password-protected games, and limits that stop one player from spamming
+  chat or pausing forever.
+- With the optional sidecar: AI opponents hosted on the server, and a
+  recorded result for every match, even if everyone left before the end.
 
-## Architecture
+## Download
 
-```
- Clients (stock 0 A.D., unmodified)
-        |
-        v  ENet/UDP
-+----------------------------------------------------------+
-|              veredus server, per game                     |
-|                                                           |
-|  ENet socket thread <--mpsc--> synchronous Server FSM    |
-|  (send/recv, ENet host loop)   (turn scheduling, OOS,     |
-|                                  session/disconnect state) |
-|                                       |                    |
-|                                       | spawns (optional)  |
-|                                       v                    |
-|                          pyrogenesis sidecar processes     |
-|                    (hosted AI, checkpoint dumps,           |
-|                     rejoin snapshots, outcome replay)      |
-+----------------------------------------------------------+
-        ^
-        | XMPP (pool-lobby mode only)
-+----------------------------------------------------------+
-|   tokio runtime: lobby client + Prometheus/Rocket metrics |
-+----------------------------------------------------------+
-```
+Get the latest build from the
+[Releases page](https://github.com/victorcrimea/veredus/releases):
 
-Each game gets two OS threads communicating over a channel: an ENet socket
-thread and a synchronous state-machine thread. The relay is networking-only
-by design - it never simulates, and any simulation it needs (hosted AI,
-rejoin state, checkpoint and outcome replays) runs in a spawned
-`pyrogenesis` process, never inline.
+| File | Use it on |
+|---|---|
+| `veredus-*-x86_64-unknown-linux-musl.tar.gz` | Linux, 64-bit PC or server (any distribution) |
+| `veredus-*-aarch64-unknown-linux-musl.tar.gz` | Linux on ARM64 (Raspberry Pi 4/5, ARM cloud servers) |
+| `veredus-*-x86_64-unknown-linux-gnu.tar.gz` | Linux, 64-bit, if you prefer a glibc build |
+| `veredus-*-x86_64-pc-windows-msvc.zip` | Windows 10, 11 or Server, 64-bit |
 
-## Requirements
+The server is a single file with nothing to install. Each download comes
+with a `.sha256` checksum if you want to verify it.
 
-- To run: stock, unmodified 0 A.D. clients connect with no changes at all.
-- For the sidecar features (hosted AI, checkpoint/rejoin snapshots, outcome
-  replay): a built `pyrogenesis` binary from the `feature/server-sidecar`
-  branch of our 0 A.D. fork, supplied with `--pyrogenesis-path` (or
-  `[server] pyrogenesis_path`). Without it the relay still hosts matches,
-  but joiners no live client can serve are dropped instead of snapshotted.
-- To build from source: current stable Rust (edition 2024, no pinned MSRV).
+## Quick start
 
-## Installation
+1. Unpack the download and start the server.
 
-### Prebuilt binary
+   Linux:
 
-Download the latest `x86_64-unknown-linux-gnu` build from the
-[Releases page](https://github.com/victorcrimea/veredus/releases),
-verify it against the accompanying `.sha256` file, and run it - no Rust
-toolchain required:
+   ```sh
+   tar xzf veredus-*-x86_64-unknown-linux-musl.tar.gz
+   cd veredus-*-x86_64-unknown-linux-musl
+   ./veredus
+   ```
+
+   Windows: unzip it, open a terminal in that folder and run `veredus.exe`.
+   When Windows Firewall asks, allow access.
+
+2. Let players reach it: allow **UDP port 20595** through your firewall. At
+   home, also forward that port on your router to the server machine.
+
+3. In 0 A.D., choose **Multiplayer**, then **Join game**, and enter the
+   server's IP address and port 20595.
+
+The first player to join is the host: they pick the map and settings and
+start the game, just like with a normal player-hosted game. When a match
+ends, the server opens a fresh game on the same port.
+
+Stop the server with Ctrl+C. Players get a "server shutdown" message instead
+of just timing out.
+
+## Extra features with the sidecar
+
+The server itself never runs the game. Some features need a real copy of
+the game engine running next to it, which we call the sidecar:
+
+- **AI opponents** played on the server instead of on one player's PC.
+- **Rejoining** even when no other player's game can send the joiner a copy
+  of the match.
+- **Match results** worked out on the server and written to a file.
+
+The sidecar is 0 A.D. 0.28.0 with a small set of patches. It is not
+included in the downloads, so you
+[build it from source](#building-the-sidecar) (Linux). Once it is built,
+point the server at it:
 
 ```sh
-tar xzf veredus-*-x86_64-unknown-linux-gnu.tar.gz
-cd veredus-*-x86_64-unknown-linux-gnu
-./veredus --help
+./veredus --pyrogenesis-path /path/to/0ad/binaries/system/pyrogenesis
 ```
 
-### Build from source
+To keep each match's result as a JSON file, add `--outcome-dir results`.
+
+## Hosting in the multiplayer lobby
+
+Veredus can also appear in the in-game multiplayer lobby. You give it one
+or more lobby accounts, which wait in the lobby chat. A player who types
+`hostme` in the lobby chat gets a new game from a free account. The game
+appears in the game list, the player who asked is its host, and each
+account hosts one game at a time.
+
+**Before you do this on the official Wildfire Games lobby, get approval
+from the lobby's operators.** The server accounts behave like bots, and the
+lobby is a shared community space.
+
+Create a `lobby.json`:
+
+```json
+{
+  "accounts": [
+    { "jid": "myserver1@lobby.wildfiregames.com", "password": "..." },
+    { "jid": "myserver2@lobby.wildfiregames.com", "password": "..." }
+  ],
+  "muc_room": "arena28@conference.lobby.wildfiregames.com",
+  "bot_jid": "wfgbot28@lobby.wildfiregames.com/CC",
+  "public_ip": "203.0.113.10",
+  "server_name": "My Veredus server"
+}
+```
+
+- `public_ip` is the address players connect to.
+- `game_password` is optional and sets a password for every game.
+- Keep this file private: it holds account passwords.
+
+Then run:
+
+```sh
+./veredus --lobby-config lobby.json
+```
+
+Lobby games use UDP ports **20595 to 20695**, so open that whole range.
+
+## Configuration
+
+The defaults are fine to start with. To change anything, write a config
+file, edit it and restart:
+
+```sh
+./veredus --gen-config          # writes ./config.toml
+```
+
+`./config.toml` is loaded automatically when it exists. You can pick
+another file with `--config other.toml`. Command line flags override the
+file. `./veredus --help` lists every flag.
+
+Things people commonly change:
+
+- `[server] port` is the game port for a server outside the lobby.
+- `[game] server_name` and `welcome_message` set what players see.
+- `[game] turn_length_ms` controls game speed and responsiveness.
+- `[game] observer_delay_turns` sets how far behind observers watch
+  (0 means live).
+- `[game] pause_budget_secs` limits how long each player may pause.
+
+## Running as a service
+
+On Linux, a systemd unit keeps the server running across reboots and
+crashes. Save this as `/etc/systemd/system/veredus.service`:
+
+```ini
+[Unit]
+Description=Veredus 0 A.D. server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=veredus
+WorkingDirectory=/opt/veredus
+ExecStart=/opt/veredus/veredus
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create the `veredus` user (or change `User=`), then run
+`sudo systemctl enable --now veredus`. The logs are in
+`journalctl -u veredus`.
+
+On Windows, run `veredus.exe` from Task Scheduler ("At startup") or wrap it
+as a service with a tool such as [NSSM](https://nssm.cc/).
+
+## Building from source
+
+With a current stable [Rust](https://rustup.rs/) toolchain:
 
 ```sh
 cargo build --release
 ```
 
-The resulting binary is `target/release/veredus`.
+The binary is `target/release/veredus` (`veredus.exe` on Windows).
 
-## Usage
+## Building the sidecar
 
-The server listens on port 20595 by default and exposes Prometheus metrics
-on port 9091. Show all options with `cargo run -- --help` (or
-`./veredus --help`).
+The sidecar's source code is our fork of 0 A.D., on the
+`feature/server-sidecar` branch:
 
-### Standalone
+https://gitea.wildfiregames.com/victorcrimea/0ad/src/branch/feature/server-sidecar/
 
-Runs one game after another with no lobby:
-
-```sh
-cargo run -- --pyrogenesis-path ../0ad/binaries/system/pyrogenesis
-```
-
-With `[server] exit_after_game` (or a supervisor setup) it stops after one
-game instead of hosting a fresh one on the same port.
-
-### Pool lobby
-
-Hosts on the `hostme` command in the configured MUC room, allocating one
-game per available account. Either enable the `[lobby]` table in the config
-file or point at a pooled-account lobby config (JSON), which replaces the
-`[lobby]` table:
+It is the 0 A.D. 0.28.0 release plus the changes the server needs, so it
+must match the 0.28.0 game your players run. It builds like 0 A.D. itself.
+First install the build dependencies listed in the official
+[build instructions](https://gitea.wildfiregames.com/0ad/0ad/wiki/BuildInstructions),
+plus [Git LFS](https://git-lfs.com/) for the game data. Then, on Linux:
 
 ```sh
-cargo run -- --lobby-config lobby.json
+git lfs install
+git clone --branch feature/server-sidecar https://gitea.wildfiregames.com/victorcrimea/0ad.git
+cd 0ad
+libraries/build-source-libs.sh -j"$(nproc)"
+build/workspaces/update-workspaces.sh --without-atlas --without-tests
+make -C build/workspaces/gcc config=release -j"$(nproc)"
 ```
 
-Every account is one-shot today: once its game ends the account is released
-back to the pool. A pool-lobby game shuts itself down after the idle
-timeout (`[lobby] idle_shutdown_secs`, default 60 s, 0 disables) with
-nobody admitted: either nobody ever joined, or everyone left. The hosted-AI
-sidecar alone does not keep it alive.
-
-### Match outcomes
-
-With `--outcome-dir <dir>` (needs `--pyrogenesis-path`), each finished
-match's outcome is written to `<dir>/<game_id>.json` as
-`{"turn", "final", "result"}`: rewritten with `final: false` at every
-checkpoint while the match runs, then once with `final: true`. Without it
-the outcome is only logged.
-
-### Sidecar scratch files
-
-Sidecar runs (rejoin dumps, checkpoints, outcome replays) hold a match's
-settings, commands and states on disk while they run. They live in one
-directory per process, `$TMPDIR/veredus-run-<uuid>` (mode 0700), which is
-removed on a clean exit. The directories a crashed or killed instance left
-behind are removed at the next start. The directories of an instance that
-is still running are kept, so several instances can share a host.
-
-## Configuration
-
-Settings resolve as built-in defaults, then the config file, then command
-line flags, each overriding the one before. The `[log]` table is the
-exception: its environment variables win over the file.
-
-Write the default config to `./config.toml` (or a given path) and exit:
-
-```sh
-cargo run -- --gen-config
-```
-
-`./config.toml` is loaded when present; `--config` names another file:
-
-```sh
-cargo run -- --config prod.toml --port 20600
-```
-
-The file has four tables:
-
-- `[server]` - `host` (an IPv4 address; the game port never listens on IPv6,
-  since the stock client has no IPv6 support), `port` (standalone mode only; a lobby game picks its
-  own), `pyrogenesis_path`, `outcome_dir`, `checkpoint_interval_turns`
-  (default 600, 0 disables), `metrics_host` / `metrics_port` (loopback by
-  default, port 0 disables), `exit_after_game`, ENet packet/waiting caps,
-  `max_sidecar_runs` (how many one-shot sidecar runs - rejoin dumps,
-  checkpoints, outcome replays - the whole process runs at once, across all
-  games; the rest queue, rejoin dumps first. Defaults to the CPU count, 0
-  lifts the cap. The hosted-AI sidecar is not counted).
-- `[game]` - turn length, server name, welcome message, controller secret,
-  duplicate names, late-observer policy and limits, observer delay, session
-  cap, pause budget, AFK pause, post-game linger, handshake/loading/join
-  timeouts, flood limits, join rate (`join_burst`, default 3, and
-  `join_interval_secs`, default 60, 0 disables: how many joins into a
-  running match one address, or one lobby name, may make before each
-  further one waits that long; an over-rate join is refused before it
-  authenticates), password guessing (`auth_fail_burst`, default 3 per
-  lobby name, `auth_fail_burst_per_addr`, default 10 per address, and
-  `auth_fail_interval_secs`, default 300, 0 disables: how many wrong
-  passwords may be sent before each further attempt waits that long; the
-  peer is then refused as banned before its password is checked), buddies,
-  enabled mods.
-- `[lobby]` - `enabled` selects pool-lobby mode, plus the MUC room, bot JID,
-  public IP, server name, engine version, game password, idle shutdown and
-  the account list. Keep credentials out of source control.
-- `[log]` - `directives`, `loki_directives`, `loki_url`, `loki_instance`,
-  `loki_env`. See below.
-
-Unknown keys are an error, so a typo fails loudly instead of being ignored.
-An optional setting is an empty string or 0 rather than a missing key, so
-the generated file always shows every knob.
-
-## Observability and logging
-
-Prometheus metrics are served at:
-
-```text
-http://localhost:9091/metrics
-```
-
-Logging uses `tracing` with two independent sinks and filters:
-
-- `RUST_LOG` controls the stdout sink (falls back to `[log] directives`,
-  else a built-in default if unset), for example to trace one module, one
-  game or one client:
-
-  ```sh
-  RUST_LOG='error,server::relay::net_server=trace' cargo run -- ...
-  RUST_LOG='error,[game{game_id=gid_0199...}]=trace' cargo run -- ...
-  RUST_LOG='error,[client{name=bob}]=trace' cargo run -- ...
-  ```
-
-- `LOKI_LOG` independently controls what is shipped to a Loki sink, using
-  the same filter syntax. The sink exists only when `LOKI_URL` (or
-  `[log] loki_url`) is set; `LOKI_INSTANCE` (default: the hostname) and
-  `LOKI_ENV` (default `dev`) become stream labels next to `job="veredus"`.
-
-Every line logged while handling one client's input runs inside a `client`
-span (a child of `game`) carrying peer, uuid, lobby name, client id and
-name. The client IP is deliberately not a span field: it is logged only on
-connect, disconnect and refused-connection lines.
-
-Two counters cover the ENet socket thread, which has no per-game series of
-its own: `enet_inbound_dropped_packets_total` (a peer's undelivered inbound
-backlog was full and a packet was dropped) and
-`enet_slow_peer_disconnects_total` (a peer's outgoing queue stayed over its
-cap for about 30 seconds and was disconnected).
-
-`ingress_refused_connections_total` counts connections refused before
-authenticating: joins over the `join_burst` / `join_interval_secs` rate,
-logged as `connection refused: join rate`, and peers over the
-`auth_fail_burst` wrong-password budget, logged as
-`connection refused: password failures`.
-
-Two gauges show the `max_sidecar_runs` queue, by step (`dump`, `checkpoint`,
-`outcome`): `sidecar_runs_running` and `sidecar_runs_waiting`.
-
-## Further reading
-
-- [PROTOCOL.md](PROTOCOL.md) - the wire protocol, message layouts and lobby
-  IQ formats. Normative for anything on the wire; never guess a field.
+The result is `binaries/system/pyrogenesis`. Keep it inside the cloned
+folder, because it loads the game data from there, and pass its path to
+`--pyrogenesis-path`.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Veredus is licensed under Apache-2.0, see [LICENSE](LICENSE).
+
+The sidecar is a separate program, 0 A.D., licensed under GPL-2.0 or later (code)
+and CC BY-SA 3.0 (art). Its source is at the link above.

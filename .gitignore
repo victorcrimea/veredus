@@ -21,3 +21,10 @@ AGENTS.md
 
 # Local server config (generate with --gen-config)
 /config.toml
+
+# Local working notes and profiles, never published
+/REVIEW.md
+/plans/
+/profile*.txt
+/profile*.jsonp
+/.opencode/
