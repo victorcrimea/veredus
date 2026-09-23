@@ -92,6 +92,28 @@ pub struct LobbyConfig {
     pub game_password: String,
 }
 
+impl LobbyConfig {
+    // The account tasks parse these only once logging is up, where a typo
+    // could only panic; checking here turns it into a startup error.
+    pub fn validate(&self) -> Result<(), String> {
+        self.bot_jid
+            .parse::<Jid>()
+            .map_err(|error| format!("invalid lobby bot_jid '{}': {error}", self.bot_jid))?;
+        self.muc_room
+            .parse::<BareJid>()
+            .map_err(|error| format!("invalid lobby muc_room '{}': {error}", self.muc_room))?;
+        // Parsed with a resource of the shape the account task appends, so
+        // this accepts exactly what the task will.
+        let resource = format!("0ad-{}", uuid::Uuid::nil());
+        for creds in &self.accounts {
+            format!("{}/{resource}", creds.jid)
+                .parse::<Jid>()
+                .map_err(|error| format!("invalid lobby account jid '{}': {error}", creds.jid))?;
+        }
+        Ok(())
+    }
+}
+
 // Main <- XMPP account task.
 pub enum LobbyEvent {
     HostRequested {
@@ -140,14 +162,17 @@ impl LobbyManager {
     pub fn start(&mut self) -> mpsc::UnboundedReceiver<LobbyEvent> {
         let _ = tokio_xmpp::rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let bot_jid: Jid =
-            self.config.bot_jid.parse().unwrap_or_else(|error| {
-                panic!("invalid bot_jid '{}': {error:?}", self.config.bot_jid)
-            });
+        let bot_jid: Jid = self
+            .config
+            .bot_jid
+            .parse()
+            .expect("bot_jid is checked by LobbyConfig::validate");
 
-        let muc_bare: BareJid = self.config.muc_room.parse().unwrap_or_else(|error| {
-            panic!("invalid muc_room '{}': {error:?}", self.config.muc_room)
-        });
+        let muc_bare: BareJid = self
+            .config
+            .muc_room
+            .parse()
+            .expect("muc_room is checked by LobbyConfig::validate");
 
         let account_config = AccountConfig {
             muc_room: self.config.muc_room.clone(),
@@ -445,7 +470,7 @@ async fn run_account(
     let resource = format!("0ad-{}", uuid::Uuid::new_v4());
     let jid: Jid = format!("{}/{resource}", creds.jid)
         .parse()
-        .unwrap_or_else(|error| panic!("invalid lobby account jid '{}': {error:?}", creds.jid));
+        .expect("account jids are checked by LobbyConfig::validate");
     let username = jid.node().map(|n| n.to_string()).unwrap_or_default();
     // The lobby server stores the SASL-hashed form, so the client-side hash
     // has to happen before login rather than being left to XMPP SASL itself.

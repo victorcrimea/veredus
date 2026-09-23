@@ -115,6 +115,9 @@ pub fn parse_args() -> Result<Command, String> {
         None if config.lobby.enabled => Some(config.lobby.to_lobby_config()?),
         None => None,
     };
+    if let Some(lobby) = &lobby {
+        lobby.validate()?;
+    }
 
     Ok(Command::Run(Box::new(RunMode { config, lobby })))
 }
