@@ -590,7 +590,11 @@ async fn run_account(
                         crate::metrics::LOBBY_STREAM_ENDED_TOTAL.inc();
                         break 'connection false;
                     };
-                    if let Event::Online { bound_jid: online_jid, resumed } = event {
+                    if let Event::Online {
+                        bound_jid: online_jid,
+                        resumed,
+                        ..
+                    } = event {
                         tracing::info!(bound_jid = %online_jid, resumed, "lobby account online");
                         crate::metrics::LOBBY_SESSIONS_TOTAL
                             .with_label_values(&[if resumed { "true" } else { "false" }])
