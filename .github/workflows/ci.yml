@@ -30,3 +30,42 @@ jobs:
 
       - name: Test
         run: cargo test --message-format=short
+
+  # The release ships a static musl binary, so a change that breaks that
+  # build must show up before a tag does.
+  musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl --message-format=short
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: ilammy/setup-nasm@v1
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Windows-only code is invisible to the Linux clippy run.
+      - name: Clippy
+        run: cargo clippy --message-format=short --all-targets
+
+      - name: Test
+        run: cargo test --message-format=short
