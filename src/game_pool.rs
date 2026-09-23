@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::net::Ipv4Addr;
-use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -64,7 +62,7 @@ struct GameHandle {
 }
 
 pub struct GamePool {
-    bind_ip: IpAddr,
+    bind_ip: Ipv4Addr,
     enet_limits: EnetLimits,
     games: HashMap<GameId, GameHandle>,
     used_ports: Vec<u16>,
@@ -75,7 +73,7 @@ pub struct GamePool {
 }
 
 impl GamePool {
-    pub fn new(bind_ip: IpAddr, enet_limits: EnetLimits) -> Self {
+    pub fn new(bind_ip: Ipv4Addr, enet_limits: EnetLimits) -> Self {
         Self {
             bind_ip,
             enet_limits,
@@ -90,7 +88,7 @@ impl GamePool {
     fn bind_free_port(&self) -> Result<(u16, std::net::UdpSocket), String> {
         let (start, end) = PORT_RANGE;
         for port in (start..=end).filter(|port| !self.used_ports.contains(port)) {
-            let bind_addr = SocketAddr::new(self.bind_ip, port);
+            let bind_addr = SocketAddrV4::new(self.bind_ip, port);
             match std::net::UdpSocket::bind(bind_addr) {
                 Ok(socket) => return Ok((port, socket)),
                 Err(error) => {
@@ -127,7 +125,7 @@ impl GamePool {
                 if self.used_ports.contains(&port) {
                     return Err(format!("port {port} is already in use"));
                 }
-                let bind_addr = SocketAddr::new(self.bind_ip, port);
+                let bind_addr = SocketAddrV4::new(self.bind_ip, port);
                 let socket = std::net::UdpSocket::bind(bind_addr)
                     .map_err(|error| format!("failed to bind {bind_addr}: {error}"))?;
                 (port, socket)

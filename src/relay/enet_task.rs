@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -108,7 +109,7 @@ pub fn run_enet_host(
         for _ in 0..MAX_EVENTS_PER_TICK {
             match host.service() {
                 Ok(Some(event)) => {
-                    let addr = match &event {
+                    let peer = match &event {
                         Event::Connect { peer, data: _ } => peer,
                         Event::Disconnect { peer, data: _ } => peer,
                         Event::Receive {
@@ -116,12 +117,28 @@ pub fn run_enet_host(
                             channel_id: _,
                             packet: _,
                         } => peer,
-                    }
-                    .address()
-                    .expect("a peer with an event has a known address")
-                    .ip();
+                    };
+                    let peer_id = peer.id();
+                    let socket_addr = peer
+                        .address()
+                        .expect("a peer with an event has a known address");
+                    let event = event.no_ref();
 
-                    let inbound_message = match event.no_ref() {
+                    let addr = match socket_addr {
+                        SocketAddr::V4(addr) => *addr.ip(),
+                        // The socket is bound IPv4 only, so this should never
+                        // arrive. Dropping the peer rather than panicking keeps
+                        // the socket loop, and with it the game, alive.
+                        SocketAddr::V6(addr) => {
+                            tracing::error!(%addr, "IPv6 peer on an IPv4 socket, dropping it");
+                            if let Some(handle) = host.get_peer_mut(peer_id) {
+                                handle.disconnect_now(DisconnectReason::Refused as u32);
+                            }
+                            continue;
+                        }
+                    };
+
+                    let inbound_message = match event {
                         EventNoRef::Connect { peer, data: _ } => {
                             inbound.insert(peer, Arc::new(AtomicUsize::new(0)));
                             InboundNetworkMessage::Connect { peer, addr }

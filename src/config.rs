@@ -64,7 +64,9 @@ pub struct FileConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerSection {
-    pub host: IpAddr,
+    // IPv4 only: the stock client cannot reach an IPv6 address, and a
+    // dual-stack socket would hand IPv4 clients over as v4-mapped IPv6.
+    pub host: Ipv4Addr,
     // Standalone mode only; a lobby game picks its own.
     pub port: u16,
     pub pyrogenesis_path: PathBuf,
@@ -83,7 +85,7 @@ pub struct ServerSection {
 impl Default for ServerSection {
     fn default() -> Self {
         ServerSection {
-            host: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            host: Ipv4Addr::UNSPECIFIED,
             port: DEFAULT_PORT,
             pyrogenesis_path: PathBuf::new(),
             outcome_dir: PathBuf::new(),

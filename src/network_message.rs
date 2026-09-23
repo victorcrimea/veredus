@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
-use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -43,11 +43,11 @@ impl Drop for InboundCredit {
 pub enum InboundNetworkMessage {
     Connect {
         peer: PeerID,
-        addr: IpAddr,
+        addr: Ipv4Addr,
     },
     Disconnect {
         peer: PeerID,
-        addr: IpAddr,
+        addr: Ipv4Addr,
         reason: u32,
     },
     Message {

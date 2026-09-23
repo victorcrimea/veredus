@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -25,9 +26,9 @@ struct Args {
     /// refuses to overwrite an existing file
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = DEFAULT_CONFIG_PATH)]
     gen_config: Option<PathBuf>,
-    /// Bind address [default: 0.0.0.0]
+    /// IPv4 bind address; the stock client has no IPv6 [default: 0.0.0.0]
     #[arg(long)]
-    host: Option<IpAddr>,
+    host: Option<Ipv4Addr>,
     /// Listen port (standalone mode only; a lobby game picks its own)
     /// [default: 20595]
     #[arg(long)]

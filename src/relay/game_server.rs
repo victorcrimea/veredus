@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
-use std::net::IpAddr;
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -456,17 +455,10 @@ fn to_input(
     metrics: &mut GameMetrics,
 ) -> Option<Input> {
     match message {
-        InboundNetworkMessage::Connect { peer, addr } => match addr {
-            IpAddr::V4(addr) => {
-                metrics.connected();
-                Some(Input::Connected { peer, addr })
-            }
-            // The stock client is IPv4 only, and the ban list is keyed by v4.
-            IpAddr::V6(addr) => {
-                tracing::warn!(?peer, %addr, "ignoring IPv6 peer");
-                None
-            }
-        },
+        InboundNetworkMessage::Connect { peer, addr } => {
+            metrics.connected();
+            Some(Input::Connected { peer, addr })
+        }
         // Logged here rather than in the FSM because only this side knows
         // the ENet reason word, and a peer refused at connect, which never
         // got a session, is still logged with its address.

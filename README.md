@@ -187,7 +187,8 @@ cargo run -- --config prod.toml --port 20600
 
 The file has four tables:
 
-- `[server]` - `host`, `port` (standalone mode only; a lobby game picks its
+- `[server]` - `host` (an IPv4 address; the game port never listens on IPv6,
+  since the stock client has no IPv6 support), `port` (standalone mode only; a lobby game picks its
   own), `pyrogenesis_path`, `outcome_dir`, `checkpoint_interval_turns`
   (default 600, 0 disables), `metrics_host` / `metrics_port` (loopback by
   default, port 0 disables), `exit_after_game`, ENet packet/waiting caps.
