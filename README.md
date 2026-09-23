@@ -36,8 +36,9 @@ What you get:
   gives nothing away.
 - Password-protected games, and limits that stop one player from spamming
   chat or pausing forever.
-- With the optional sidecar: AI opponents hosted on the server, and a
-  recorded result for every match, even if everyone left before the end.
+
+More features, such as AI opponents hosted on the server, are on the way,
+see [Upcoming features](#upcoming-features).
 
 ## Download
 
@@ -82,26 +83,20 @@ ends, the server opens a fresh game on the same port.
 Stop the server with Ctrl+C. Players get a "server shutdown" message instead
 of just timing out.
 
-## Extra features with the sidecar
+## Upcoming features
 
-The server itself never runs the game. Some features need a real copy of
-the game engine running next to it, which we call the sidecar:
+Some features need a real copy of the game engine running next to the
+server, which we call the sidecar. The sidecar is not publicly available
+yet. Until it is, the server offers everything listed above, and these
+will follow once it is released:
 
 - **AI opponents** played on the server instead of on one player's PC.
 - **Rejoining** even when no other player's game can send the joiner a copy
   of the match.
-- **Match results** worked out on the server and written to a file.
+- **Match results** worked out on the server and saved to a file, even if
+  everyone left before the end.
 
-The sidecar is 0 A.D. 0.28.0 with a small set of patches. It is not
-included in the downloads, so you
-[build it from source](#building-the-sidecar) (Linux). Once it is built,
-point the server at it:
-
-```sh
-./veredus --pyrogenesis-path /path/to/0ad/binaries/system/pyrogenesis
-```
-
-To keep each match's result as a JSON file, add `--outcome-dir results`.
+We will announce it here when it becomes available.
 
 ## Hosting in the multiplayer lobby
 
@@ -202,35 +197,6 @@ cargo build --release
 
 The binary is `target/release/veredus` (`veredus.exe` on Windows).
 
-## Building the sidecar
-
-The sidecar's source code is our fork of 0 A.D., on the
-`feature/server-sidecar` branch:
-
-https://gitea.wildfiregames.com/victorcrimea/0ad/src/branch/feature/server-sidecar/
-
-It is the 0 A.D. 0.28.0 release plus the changes the server needs, so it
-must match the 0.28.0 game your players run. It builds like 0 A.D. itself.
-First install the build dependencies listed in the official
-[build instructions](https://gitea.wildfiregames.com/0ad/0ad/wiki/BuildInstructions),
-plus [Git LFS](https://git-lfs.com/) for the game data. Then, on Linux:
-
-```sh
-git lfs install
-git clone --branch feature/server-sidecar https://gitea.wildfiregames.com/victorcrimea/0ad.git
-cd 0ad
-libraries/build-source-libs.sh -j"$(nproc)"
-build/workspaces/update-workspaces.sh --without-atlas --without-tests
-make -C build/workspaces/gcc config=release -j"$(nproc)"
-```
-
-The result is `binaries/system/pyrogenesis`. Keep it inside the cloned
-folder, because it loads the game data from there, and pass its path to
-`--pyrogenesis-path`.
-
 ## License
 
 Veredus is licensed under Apache-2.0, see [LICENSE](LICENSE).
-
-The sidecar is a separate program, 0 A.D., licensed under GPL-2.0 or later (code)
-and CC BY-SA 3.0 (art). Its source is at the link above.
