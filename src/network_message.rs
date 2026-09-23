@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use rusty_enet::PeerID;
-
+use crate::enet::PeerID;
 use crate::relay::monitor::PeerStats;
 
 // A per-peer inbound byte budget is charged on the ENet thread (which is

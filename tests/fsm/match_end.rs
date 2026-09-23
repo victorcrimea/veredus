@@ -6,8 +6,8 @@
 // scope here.
 
 use chrono::TimeDelta;
-use rusty_enet::PeerID;
 
+use veredus::enet::PeerID;
 use veredus::relay::messages::PlayerCommand;
 use veredus::relay::messages::WireMessage;
 use veredus::relay::server_fsm::AnyServer;

@@ -12,8 +12,8 @@ use std::net::Ipv4Addr;
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
-use rusty_enet::PeerID;
 
+use veredus::enet::PeerID;
 use veredus::relay::gamestate_transfer::KIND_RUNNING_GAME;
 use veredus::relay::messages::Authenticate;
 use veredus::relay::messages::AuthenticateResult;

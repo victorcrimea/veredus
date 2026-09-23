@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use chrono::TimeDelta;
 use chrono::Utc;
-use rusty_enet as enet;
-use rusty_enet::Event;
-use rusty_enet::EventNoRef;
-use rusty_enet::PeerID;
 
+use crate::enet;
+use crate::enet::Event;
+use crate::enet::EventNoRef;
+use crate::enet::PeerID;
 use crate::network_message::InboundCredit;
 use crate::network_message::InboundNetworkMessage;
 use crate::network_message::OutboundNetworkMessage;

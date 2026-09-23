@@ -6,8 +6,8 @@
 use std::net::Ipv4Addr;
 
 use chrono::TimeDelta;
-use rusty_enet::PeerID;
 
+use veredus::enet::PeerID;
 use veredus::relay::messages::Authenticate;
 use veredus::relay::messages::Chat;
 use veredus::relay::messages::Flare;

@@ -5,8 +5,8 @@
 // pass.
 
 use chrono::TimeDelta;
-use rusty_enet::PeerID;
 
+use veredus::enet::PeerID;
 use veredus::relay::messages::WireMessage;
 use veredus::relay::monitor::PeerStats;
 

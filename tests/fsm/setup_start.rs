@@ -3,8 +3,7 @@
 
 // TEST_PLAN.md section 5.3.
 
-use rusty_enet::PeerID;
-
+use veredus::enet::PeerID;
 use veredus::relay::messages::GameSettings;
 use veredus::relay::messages::MapPlayerIdToSlot;
 use veredus::relay::messages::PreGameStatus;

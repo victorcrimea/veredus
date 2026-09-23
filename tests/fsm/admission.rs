@@ -4,8 +4,8 @@
 // TEST_PLAN.md section 5.2.
 
 use chrono::TimeDelta;
-use rusty_enet::PeerID;
 
+use veredus::enet::PeerID;
 use veredus::relay::auth;
 use veredus::relay::messages::Guid;
 use veredus::relay::messages::Kicked;

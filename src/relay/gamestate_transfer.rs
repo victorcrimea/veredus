@@ -7,8 +7,8 @@ use std::sync::Arc;
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
-use rusty_enet::PeerID;
 
+use crate::enet::PeerID;
 use crate::relay::fault::PeerFault;
 use crate::relay::messages::GamestateChunk;
 

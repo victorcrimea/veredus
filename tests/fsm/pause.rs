@@ -6,8 +6,8 @@
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
-use rusty_enet::PeerID;
 
+use veredus::enet::PeerID;
 use veredus::relay::messages::Guid;
 use veredus::relay::messages::LoadedGame;
 use veredus::relay::messages::PlayerPause;

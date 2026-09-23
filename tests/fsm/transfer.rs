@@ -7,8 +7,7 @@
 
 use std::sync::Arc;
 
-use rusty_enet::PeerID;
-
+use veredus::enet::PeerID;
 use veredus::relay::fault::PeerFault;
 use veredus::relay::gamestate_transfer::CHUNK_SIZE;
 use veredus::relay::gamestate_transfer::KIND_RUNNING_GAME;

@@ -6,8 +6,7 @@
 
 use std::collections::HashSet;
 
-use rusty_enet::PeerID;
-
+use veredus::enet::PeerID;
 use veredus::relay::messages::Chat;
 use veredus::relay::messages::Flare;
 use veredus::relay::messages::Guid;

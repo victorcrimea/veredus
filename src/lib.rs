@@ -3,6 +3,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod enet;
 pub mod game_pool;
 pub mod lobby;
 pub mod metrics;

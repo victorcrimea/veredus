@@ -4,8 +4,7 @@
 // F22: observers watch the match a fixed number of turns behind the
 // players, served from the match log rather than from the live stream.
 
-use rusty_enet::PeerID;
-
+use veredus::enet::PeerID;
 use veredus::relay::messages::Flare;
 use veredus::relay::messages::PlayerCommand;
 use veredus::relay::messages::WireMessage;

@@ -8,8 +8,8 @@ use std::net::Ipv4Addr;
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
-use rusty_enet::PeerID;
 
+use crate::enet::PeerID;
 use crate::relay::messages::AuthenticateResultCode;
 use crate::relay::messages::WireMessage;
 use crate::relay::server_fsm::Config;

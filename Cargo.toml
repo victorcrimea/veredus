@@ -2,10 +2,14 @@
 name = "veredus"
 version = "0.2.1"
 edition = "2024"
-license = "Apache-2.0"
+rust-version = "1.89"
+license = "Apache-2.0 AND MIT"
 description = "Dedicated server for 0 A.D. multiplayer games"
+homepage = "https://github.com/victorcrimea/veredus"
 repository = "https://github.com/victorcrimea/veredus"
 readme = "README.md"
+keywords = ["0ad", "enet", "game-server", "multiplayer"]
+categories = ["network-programming", "game-development"]
 
 [profile.release]
 strip = true
@@ -17,7 +21,6 @@ lto = true
 chrono = { version = "0.4.40", default-features = false, features = ["now"] }
 hex = "0.4.3"
 rocket = { version = "0.5", default-features = false, features = ["http2"] }
-rusty_enet = { git = "https://github.com/victorcrimea/rusty_enet.git", rev = "a6749fbc6bec3c00e2359941eb5e2dfef6d4ec1f" }
 serde = {version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

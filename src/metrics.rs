@@ -24,9 +24,9 @@ use prometheus::register_int_counter;
 use prometheus::register_int_counter_vec;
 use prometheus::register_int_gauge;
 use prometheus::register_int_gauge_vec;
-use rusty_enet::PeerID;
-use rusty_enet::consts::PEER_PACKET_LOSS_SCALE;
 
+use crate::enet::PeerID;
+use crate::enet::consts::PEER_PACKET_LOSS_SCALE;
 use crate::relay::monitor::PeerStats;
 use crate::relay::server_fsm::Counters;
 use crate::relay::server_fsm::GameSnapshot;

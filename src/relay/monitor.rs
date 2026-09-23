@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::enet::PeerID;
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
-use rusty_enet::PeerID;
 
 // Warnings are advisory only: real connection loss is ENet's peer timeout, and
 // the server never disconnects anyone over these.

@@ -7,8 +7,8 @@ use std::ops::RangeInclusive;
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
-use rusty_enet::PeerID;
 
+use crate::enet::PeerID;
 use crate::relay::messages::Guid;
 use crate::relay::rate_limit::Limits;
 

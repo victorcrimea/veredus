@@ -3,8 +3,7 @@
 
 // TEST_PLAN.md section 5.1.
 
-use rusty_enet::PeerID;
-
+use veredus::enet::PeerID;
 use veredus::relay::messages::Kicked;
 use veredus::relay::messages::SynAck;
 use veredus::relay::messages::WireMessage;

@@ -5,8 +5,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use rusty_enet::PeerID;
-
+use crate::enet::PeerID;
 use crate::relay::fault::PeerFault;
 use crate::relay::messages::PlayerCommand;
 

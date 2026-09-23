@@ -6,8 +6,7 @@ use std::collections::HashMap;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
-use rusty_enet::PeerID;
-
+use crate::enet::PeerID;
 use crate::relay::messages::Flare;
 use crate::relay::messages::Join;
 use crate::relay::turn::INITIAL_READY_TURN;

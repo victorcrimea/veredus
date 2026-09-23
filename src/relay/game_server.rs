@@ -15,8 +15,8 @@ use std::time::Duration;
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
-use rusty_enet::PeerID;
 
+use crate::enet::PeerID;
 use crate::lobby::link::GameToLobby;
 use crate::lobby::link::LobbyAuthToken;
 use crate::lobby::link::LobbyLink;

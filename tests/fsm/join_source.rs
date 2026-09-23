@@ -7,8 +7,8 @@
 // failure notice and no timeout of its own.
 
 use chrono::TimeDelta;
-use rusty_enet::PeerID;
 
+use veredus::enet::PeerID;
 use veredus::relay::gamestate_transfer::KIND_RUNNING_GAME;
 use veredus::relay::messages::GamestateChunk;
 use veredus::relay::messages::GamestateResponse;

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
-use rusty_enet::PeerID;
 
+use crate::enet::PeerID;
 use crate::lobby::link::LobbyMap;
 use crate::relay::auth;
 use crate::relay::auth::LateObserverPolicy;
