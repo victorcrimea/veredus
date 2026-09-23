@@ -617,6 +617,7 @@ fn drain(
                 ai_host.process = None;
                 continue;
             }
+            Effect::PasswordRejected { .. } => continue,
         };
         if send_tx.send(outbound).is_err() {
             tracing::info!("ENet send channel closed, shutting down");

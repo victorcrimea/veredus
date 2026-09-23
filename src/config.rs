@@ -196,6 +196,9 @@ pub struct GameSection {
     pub flood_kick_multiple: u32,
     pub join_burst: u32,
     pub join_interval_secs: u64,
+    pub auth_fail_burst: u32,
+    pub auth_fail_burst_per_addr: u32,
+    pub auth_fail_interval_secs: u64,
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
     pub enabled_mods: Vec<ModEntry>,
@@ -244,6 +247,11 @@ impl Default for GameSection {
             join_burst: config.join_burst,
             join_interval_secs: config
                 .join_interval
+                .map_or(0, |d| d.num_seconds().max(0) as u64),
+            auth_fail_burst: config.auth_fail_burst,
+            auth_fail_burst_per_addr: config.auth_fail_burst_per_addr,
+            auth_fail_interval_secs: config
+                .auth_fail_interval
                 .map_or(0, |d| d.num_seconds().max(0) as u64),
             buddies,
             enabled_mods: config
@@ -305,6 +313,10 @@ impl GameSection {
             join_burst: self.join_burst,
             join_interval: (self.join_interval_secs != 0)
                 .then(|| secs_to_delta(self.join_interval_secs)),
+            auth_fail_burst: self.auth_fail_burst,
+            auth_fail_burst_per_addr: self.auth_fail_burst_per_addr,
+            auth_fail_interval: (self.auth_fail_interval_secs != 0)
+                .then(|| secs_to_delta(self.auth_fail_interval_secs)),
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
             checkpoint_interval_turns,
@@ -461,6 +473,15 @@ impl FileConfig {
         if self.game.join_interval_secs != 0 && self.game.join_burst == 0 {
             return Err(
                 "[game] join_burst must be at least 1 when join_interval_secs is set".to_string(),
+            );
+        }
+        if self.game.auth_fail_interval_secs != 0
+            && (self.game.auth_fail_burst == 0 || self.game.auth_fail_burst_per_addr == 0)
+        {
+            return Err(
+                "[game] auth_fail_burst and auth_fail_burst_per_addr must be at least 1 \
+                 when auth_fail_interval_secs is set"
+                    .to_string(),
             );
         }
         if self.game.flare_per_sec != 0 && self.game.flare_burst == 0 {

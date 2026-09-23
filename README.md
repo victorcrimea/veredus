@@ -203,7 +203,12 @@ The file has four tables:
   `join_interval_secs`, default 60, 0 disables: how many joins into a
   running match one address, or one lobby name, may make before each
   further one waits that long; an over-rate join is refused before it
-  authenticates), buddies, enabled mods.
+  authenticates), password guessing (`auth_fail_burst`, default 3 per
+  lobby name, `auth_fail_burst_per_addr`, default 10 per address, and
+  `auth_fail_interval_secs`, default 300, 0 disables: how many wrong
+  passwords may be sent before each further attempt waits that long; the
+  peer is then refused as banned before its password is checked), buddies,
+  enabled mods.
 - `[lobby]` - `enabled` selects pool-lobby mode, plus the MUC room, bot JID,
   public IP, server name, engine version, game password, idle shutdown and
   the account list. Keep credentials out of source control.
@@ -251,8 +256,10 @@ backlog was full and a packet was dropped) and
 cap for about 30 seconds and was disconnected).
 
 `ingress_refused_connections_total` counts connections refused before
-authenticating, today joins over the `join_burst` / `join_interval_secs`
-rate; each is logged as `connection refused: join rate`.
+authenticating: joins over the `join_burst` / `join_interval_secs` rate,
+logged as `connection refused: join rate`, and peers over the
+`auth_fail_burst` wrong-password budget, logged as
+`connection refused: password failures`.
 
 Two gauges show the `max_sidecar_runs` queue, by step (`dump`, `checkpoint`,
 `outcome`): `sidecar_runs_running` and `sidecar_runs_waiting`.

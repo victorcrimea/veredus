@@ -229,6 +229,12 @@ pub enum Effect {
     MatchEnded {
         checkpoint: Option<u32>,
     },
+    // A peer's AUTHENTICATE failed the password check. The wire only says
+    // "refused", which other refusals send too, so the ingress gate needs
+    // this to charge the failure to whoever made it. No IO follows from it.
+    PasswordRejected {
+        peer: PeerID,
+    },
 }
 
 // Values travel as the ENet disconnect `data` word; only the number reaches the client.
@@ -384,6 +390,13 @@ pub struct Config {
     // turns it off.
     pub join_burst: u32,
     pub join_interval: Option<TimeDelta>,
+    // How many wrong passwords one lobby name, or one address, may send
+    // before it is turned away, and how long it waits for each one back.
+    // An address gets more, because players behind one NAT share it and
+    // only one of them may be guessing. None turns it off.
+    pub auth_fail_burst: u32,
+    pub auth_fail_burst_per_addr: u32,
+    pub auth_fail_interval: Option<TimeDelta>,
 }
 
 impl Default for Config {
@@ -430,6 +443,9 @@ impl Default for Config {
             flood_kick_multiple: 4,
             join_burst: 3,
             join_interval: Some(TimeDelta::seconds(60)),
+            auth_fail_burst: 3,
+            auth_fail_burst_per_addr: 10,
+            auth_fail_interval: Some(TimeDelta::minutes(5)),
         }
     }
 }
@@ -1862,6 +1878,7 @@ impl<S: PhaseMarker> Server<S> {
         // what a client with no password sends.
         let expected = password::hash(&self.ctx.config.server_password_hash, msg.name.as_bytes());
         if expected != msg.password && !is_ai_host {
+            self.ctx.effects.push(Effect::PasswordRejected { peer });
             self.disconnect(peer, DisconnectReason::Refused);
             return Ok(());
         }

@@ -92,6 +92,7 @@ fn clone_effect(effect: &Effect) -> Effect {
         Effect::MatchEnded { checkpoint } => Effect::MatchEnded {
             checkpoint: *checkpoint,
         },
+        Effect::PasswordRejected { peer } => Effect::PasswordRejected { peer: *peer },
     }
 }
 

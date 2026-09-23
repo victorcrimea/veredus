@@ -131,6 +131,11 @@ pub struct Gate {
     // one lobby account can come from many addresses.
     join_by_addr: Ledger<Ipv4Addr>,
     join_by_lobby_name: Ledger<String>,
+    // Wrong passwords, charged the same two ways. Loopback is never charged,
+    // because the AI host dials in from there and a local process failing a
+    // few guesses must not keep it out of the game.
+    auth_fail_by_addr: Ledger<Ipv4Addr>,
+    auth_fail_by_lobby_name: Ledger<String>,
 }
 
 impl Gate {
@@ -138,6 +143,11 @@ impl Gate {
         Gate {
             join_by_addr: Ledger::new(config.join_burst, config.join_interval),
             join_by_lobby_name: Ledger::new(config.join_burst, config.join_interval),
+            auth_fail_by_addr: Ledger::new(
+                config.auth_fail_burst_per_addr,
+                config.auth_fail_interval,
+            ),
+            auth_fail_by_lobby_name: Ledger::new(config.auth_fail_burst, config.auth_fail_interval),
         }
     }
 
@@ -154,14 +164,16 @@ impl Gate {
             Input::Tick { now, .. } => {
                 self.join_by_addr.prune(*now);
                 self.join_by_lobby_name.prune(*now);
+                self.auth_fail_by_addr.prune(*now);
+                self.auth_fail_by_lobby_name.prune(*now);
                 Decision::Pass
             }
             // Refused before the password hash and before a client id is
-            // issued, so a refused joiner costs nothing but the handshake.
+            // issued, so a refused peer costs nothing but the handshake.
             Input::Received {
                 peer,
                 msg: WireMessage::Authenticate(_),
-            } if matches!(phase, Phase::InGame | Phase::PostGame) => {
+            } => {
                 let Some(now) = now else {
                     return Decision::Pass;
                 };
@@ -171,10 +183,27 @@ impl Gate {
                 if session.admitted.is_some() {
                     return Decision::Pass;
                 }
+                let lobby_key = session.lobby_name.as_ref().map(|name| name.to_lowercase());
+
+                let addr_guessing = !session.addr.is_loopback()
+                    && !self.auth_fail_by_addr.has_token(&session.addr, now);
+                let name_guessing = lobby_key
+                    .as_ref()
+                    .is_some_and(|key| !self.auth_fail_by_lobby_name.has_token(key, now));
+                if addr_guessing || name_guessing {
+                    return Decision::Refuse {
+                        reason: DisconnectReason::Banned,
+                        cause: "password failures",
+                    };
+                }
+
+                if !matches!(phase, Phase::InGame | Phase::PostGame) {
+                    return Decision::Pass;
+                }
                 let addr_ok = self.join_by_addr.has_token(&session.addr, now);
-                let name_ok = session.lobby_name.as_ref().is_none_or(|name| {
-                    self.join_by_lobby_name.has_token(&name.to_lowercase(), now)
-                });
+                let name_ok = lobby_key
+                    .as_ref()
+                    .is_none_or(|key| self.join_by_lobby_name.has_token(key, now));
                 if addr_ok && name_ok {
                     Decision::Pass
                 } else {
@@ -199,22 +228,31 @@ impl Gate {
             return;
         };
         for effect in effects {
-            let Effect::Send {
-                peer,
-                msg: WireMessage::AuthenticateResult(result),
-            } = effect
-            else {
-                continue;
-            };
-            if !matches!(result.code, AuthenticateResultCode::OkRejoining) {
-                continue;
-            }
-            let Some(session) = sessions.get(peer) else {
-                continue;
-            };
-            self.join_by_addr.spend(session.addr, now);
-            if let Some(name) = session.lobby_name.as_ref() {
-                self.join_by_lobby_name.spend(name.to_lowercase(), now);
+            match effect {
+                Effect::Send {
+                    peer,
+                    msg: WireMessage::AuthenticateResult(result),
+                } if matches!(result.code, AuthenticateResultCode::OkRejoining) => {
+                    let Some(session) = sessions.get(peer) else {
+                        continue;
+                    };
+                    self.join_by_addr.spend(session.addr, now);
+                    if let Some(name) = session.lobby_name.as_ref() {
+                        self.join_by_lobby_name.spend(name.to_lowercase(), now);
+                    }
+                }
+                Effect::PasswordRejected { peer } => {
+                    let Some(session) = sessions.get(peer) else {
+                        continue;
+                    };
+                    if !session.addr.is_loopback() {
+                        self.auth_fail_by_addr.spend(session.addr, now);
+                    }
+                    if let Some(name) = session.lobby_name.as_ref() {
+                        self.auth_fail_by_lobby_name.spend(name.to_lowercase(), now);
+                    }
+                }
+                _ => {}
             }
         }
     }
