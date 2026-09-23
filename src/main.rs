@@ -73,6 +73,9 @@ async fn main() {
     veredus::sidecar::set_run_limit(config.server.max_sidecar_runs);
     let mut pool = GamePool::new(config.server.host, config.server.enet_limits());
     let pyrogenesis_path = config.server.pyrogenesis_path();
+    if pyrogenesis_path.is_some() {
+        veredus::sidecar::init_work_root();
+    }
     let outcome_dir = config.server.outcome_dir();
     let base = config.game.server_config(
         pyrogenesis_path.is_some(),
@@ -112,6 +115,7 @@ async fn main() {
             std::process::exit(1);
         }
     }
+    veredus::sidecar::remove_work_root();
 
     if let Err(error) = result {
         tracing::error!(%error, "standalone game could not be hosted");

@@ -95,6 +95,127 @@ pub fn set_run_limit(limit: usize) {
     });
 }
 
+// Sidecar runs write a match's settings, commands and states to disk. They
+// go under one directory per process, private to its user, so another local
+// user cannot read them. The lock inside is held for the life of the process
+// and released by the OS however it dies, which is how a later start tells a
+// crashed instance's leftovers from a live instance's runs.
+const WORK_ROOT_PREFIX: &str = "veredus-run-";
+const WORK_ROOT_LOCK: &str = "lock";
+// Older builds put each run straight into the temp dir under these names.
+// No current build does, so any left behind belong to a dead process.
+const UNROOTED_WORK_PREFIXES: [&str; 3] =
+    ["veredus-dump-", "veredus-checkpoint-", "veredus-outcome-"];
+
+static WORK_ROOT: OnceLock<WorkRoot> = OnceLock::new();
+
+struct WorkRoot {
+    path: PathBuf,
+    _lock: std::fs::File,
+}
+
+// Removes what crashed or killed instances left in the temp dir, then creates
+// this process's private root. A failure only costs the privacy: runs then
+// fall back to the shared temp dir, rather than every joiner losing its dump.
+pub fn init_work_root() {
+    let tmp = std::env::temp_dir();
+    sweep_work_dirs(&tmp);
+    match create_work_root(&tmp) {
+        Ok(root) => {
+            tracing::debug!(path = %root.path.display(), "sidecar: work dir created");
+            let _ = WORK_ROOT.set(root);
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            dir = %tmp.display(),
+            "sidecar: cannot create a private work dir, runs will be readable by other users"
+        ),
+    }
+}
+
+// Called on a clean exit; anything a hard exit leaves is swept at the next
+// start instead.
+pub fn remove_work_root() {
+    if let Some(root) = WORK_ROOT.get() {
+        remove_work_dir(&root.path);
+    }
+}
+
+// A fresh directory per run, so a run never reads back another run's output.
+pub fn work_dir(kind: &str) -> PathBuf {
+    let name = format!("{kind}-{}", uuid::Uuid::new_v4());
+    match WORK_ROOT.get() {
+        Some(root) => root.path.join(name),
+        None => std::env::temp_dir().join(format!("veredus-{name}")),
+    }
+}
+
+pub fn remove_work_dir(dir: &Path) {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        // A run cancelled before it wrote anything never created it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::debug!(%error, dir = %dir.display(), "sidecar: cannot remove work dir");
+        }
+    }
+}
+
+fn create_work_root(tmp: &Path) -> std::io::Result<WorkRoot> {
+    let path = tmp.join(format!("{WORK_ROOT_PREFIX}{}", uuid::Uuid::new_v4()));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&path)?;
+    let lock = std::fs::File::create(path.join(WORK_ROOT_LOCK))?;
+    lock.try_lock()?;
+    Ok(WorkRoot { path, _lock: lock })
+}
+
+fn sweep_work_dirs(tmp: &Path) {
+    let Ok(entries) = std::fs::read_dir(tmp) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // Not following links: the temp dir is shared, and a planted link
+        // must not steer the removal somewhere else.
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let path = entry.path();
+        let stale = if name.starts_with(WORK_ROOT_PREFIX) {
+            work_root_abandoned(&path)
+        } else {
+            UNROOTED_WORK_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        };
+        if !stale {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => tracing::info!(dir = %path.display(), "sidecar: removed stale work dir"),
+            Err(error) => {
+                tracing::warn!(%error, dir = %path.display(), "sidecar: cannot remove stale work dir");
+            }
+        }
+    }
+}
+
+// Anything short of taking the lock counts as in use: a root another instance
+// has only just created has no lock file yet, and one owned by another user
+// cannot be opened at all.
+fn work_root_abandoned(dir: &Path) -> bool {
+    std::fs::File::open(dir.join(WORK_ROOT_LOCK)).is_ok_and(|lock| lock.try_lock().is_ok())
+}
+
 // Held for a whole run, decode and replay together, so a run that has
 // started never queues a second time halfway through.
 struct RunPermit {

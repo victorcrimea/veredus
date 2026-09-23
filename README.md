@@ -167,6 +167,15 @@ match's outcome is written to `<dir>/<game_id>.json` as
 checkpoint while the match runs, then once with `final: true`. Without it
 the outcome is only logged.
 
+### Sidecar scratch files
+
+Sidecar runs (rejoin dumps, checkpoints, outcome replays) hold a match's
+settings, commands and states on disk while they run. They live in one
+directory per process, `$TMPDIR/veredus-run-<uuid>` (mode 0700), which is
+removed on a clean exit. The directories a crashed or killed instance left
+behind are removed at the next start. The directories of an instance that
+is still running are kept, so several instances can share a host.
+
 ## Configuration
 
 Settings resolve as built-in defaults, then the config file, then command

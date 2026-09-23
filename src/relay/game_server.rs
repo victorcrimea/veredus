@@ -654,9 +654,9 @@ fn spawn_dump(
     std::thread::spawn(move || {
         let _guard = span.entered();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let dir = std::env::temp_dir().join(format!("veredus-dump-{}", uuid::Uuid::new_v4()));
+            let dir = crate::sidecar::work_dir("dump");
             let result = crate::sidecar::dump_state(&path, &dir, turn, &request, now, &cancel);
-            let _ = std::fs::remove_dir_all(&dir);
+            crate::sidecar::remove_work_dir(&dir);
             result
         }));
         let state = match outcome {
@@ -703,10 +703,9 @@ fn spawn_checkpoint(runs: &mut OneShotRuns, id: u32, turn: u32, request: DumpReq
     runs.checkpoint_slot.handle = Some(std::thread::spawn(move || {
         let _guard = span.entered();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let dir =
-                std::env::temp_dir().join(format!("veredus-checkpoint-{}", uuid::Uuid::new_v4()));
+            let dir = crate::sidecar::work_dir("checkpoint");
             let result = crate::sidecar::checkpoint(&path, &dir, turn, &request, now, &cancel);
-            let _ = std::fs::remove_dir_all(&dir);
+            crate::sidecar::remove_work_dir(&dir);
             result
         }));
         let state = match outcome {
@@ -774,11 +773,10 @@ fn spawn_outcome(
         tracing::info!(from, turn, "sidecar: replaying match for its outcome");
         let never = AtomicBool::new(false);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let dir =
-                std::env::temp_dir().join(format!("veredus-outcome-{}", uuid::Uuid::new_v4()));
+            let dir = crate::sidecar::work_dir("outcome");
             let result =
                 crate::sidecar::resolve_outcome(&pyrogenesis_path, &dir, &request, now, &never);
-            let _ = std::fs::remove_dir_all(&dir);
+            crate::sidecar::remove_work_dir(&dir);
             result
         }));
         let (result, json) = match outcome {
