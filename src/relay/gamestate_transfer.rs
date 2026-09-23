@@ -18,6 +18,13 @@ pub const CHUNK_SIZE: usize = 1024;
 pub const WINDOW: u32 = 32;
 pub const MAX_TRANSFER: u32 = 8 * 1024 * 1024;
 
+// What a stock client accepts as a transfer length. It drops anything else
+// without telling the sender, so a payload outside this range can never be
+// served, whoever produced it.
+pub fn fits(len: usize) -> bool {
+    len != 0 && len <= MAX_TRANSFER as usize
+}
+
 pub const KIND_SAVEGAME: i8 = 0;
 pub const KIND_RUNNING_GAME: i8 = 1;
 
@@ -118,6 +125,12 @@ impl Transfers {
         self.granted.remove(&peer)
     }
 
+    // Stops waiting on one transfer while the source's others stay open.
+    // Chunks it still sends for this id are then dropped unacknowledged.
+    pub fn abandon(&mut self, peer: PeerID, request_id: u32) {
+        self.incoming.remove(&(peer, request_id));
+    }
+
     // Returns the chunks that fit the window straight away; an empty payload
     // is refused because the client rejects a zero length and then hangs.
     pub fn begin_send(
@@ -126,10 +139,10 @@ impl Transfers {
         request_id: u32,
         data: Arc<Vec<u8>>,
     ) -> Option<(u32, Vec<GamestateChunk>)> {
-        let length = u32::try_from(data.len()).ok()?;
-        if length == 0 || length > MAX_TRANSFER {
+        if !fits(data.len()) {
             return None;
         }
+        let length = u32::try_from(data.len()).ok()?;
         self.outgoing.insert(
             (peer, request_id),
             Outgoing {

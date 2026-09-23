@@ -16,8 +16,10 @@ use crate::lobby::link::LobbyMap;
 use crate::relay::auth;
 use crate::relay::auth::LateObserverPolicy;
 use crate::relay::fault::PeerFault;
+use crate::relay::gamestate_transfer;
 use crate::relay::gamestate_transfer::KIND_RUNNING_GAME;
 use crate::relay::gamestate_transfer::KIND_SAVEGAME;
+use crate::relay::gamestate_transfer::MAX_TRANSFER;
 use crate::relay::gamestate_transfer::Purpose;
 use crate::relay::gamestate_transfer::Transfers;
 use crate::relay::ingress::Decision;
@@ -2247,6 +2249,40 @@ impl<S: PhaseMarker> Server<S> {
         self.start_snapshot_fetch(joiner, true);
     }
 
+    // Every source serializes the same simulation, so once one snapshot is
+    // past what a client accepts, trying the next source would only freeze
+    // another player for a state that cannot be sent either. Refused here
+    // rather than granted, because a granted snapshot that is never sent
+    // leaves the joiner loading forever with nothing to say why.
+    fn refuse_unservable_join(&mut self, joiner: PeerID, bytes: usize) {
+        // A joiner that left while its snapshot was fetched has nobody left
+        // to tell.
+        if !self
+            .ctx
+            .sessions
+            .get(&joiner)
+            .is_some_and(|s| s.is_syncing())
+        {
+            return;
+        }
+        tracing::warn!(
+            ?joiner,
+            bytes,
+            limit = MAX_TRANSFER,
+            "join refused: game state is larger than a client accepts"
+        );
+        let text = format!(
+            "This match's game state is {:.1} MiB, more than the {} MiB a client can download, so it cannot be joined.",
+            bytes as f64 / (1024.0 * 1024.0),
+            MAX_TRANSFER / (1024 * 1024)
+        );
+        self.ctx.server_chat(Some(joiner), &text);
+        // The protocol has no code for this; it is the one the join path
+        // already uses when no snapshot can be had at all.
+        self.ctx
+            .disconnect(joiner, DisconnectReason::MatchInProgress);
+    }
+
     // Hands a snapshot to one joiner: a delayed joiner waits on the feed
     // until its state is due, everyone else loads straight away, even from
     // a snapshot older than live: any snapshot turn is valid, because the
@@ -2257,6 +2293,10 @@ impl<S: PhaseMarker> Server<S> {
         snapshot: Arc<Vec<u8>>,
         turns: RangeInclusive<u32>,
     ) {
+        if !gamestate_transfer::fits(snapshot.len()) {
+            self.refuse_unservable_join(joiner, snapshot.len());
+            return;
+        }
         // A joiner that left while its snapshot was fetched must not leave a
         // grant behind for whichever peer is handed its id next.
         let Some(session) = self
@@ -2420,6 +2460,18 @@ impl<S: PhaseMarker> Server<S> {
         peer: PeerID,
         msg: GamestateResponse,
     ) -> Result<(), PeerFault> {
+        // Caught at the declared length, before a single chunk is buffered.
+        // The source is not at fault: its state has simply outgrown the
+        // limit. A zero length is left to on_response, since that source is
+        // broken and another one may do better.
+        if msg.length > MAX_TRANSFER
+            && let Some(Purpose::JoinSnapshot { joiner, .. }) =
+                self.ctx.transfers.purpose(peer, msg.request_id)
+        {
+            self.ctx.transfers.abandon(peer, msg.request_id);
+            self.refuse_unservable_join(joiner, msg.length as usize);
+            return Ok(());
+        }
         self.ctx
             .transfers
             .on_response(peer, msg.request_id, msg.length)
