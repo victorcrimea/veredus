@@ -3558,6 +3558,17 @@ impl<S: MatchPhase> Server<S> {
     }
 
     fn on_turn_sealed(&mut self, peer: PeerID, msg: TurnSealed) -> Result<(), PeerFault> {
+        // A client cannot simulate a turn that was never released, so it seals
+        // at most COMMAND_DELAY ahead of the ready turn. Past that, a client
+        // left as the only blocker could have one release run the match
+        // forward by any number of turns at once.
+        let ready_turn = self.ctx.turns.ready_turn();
+        if msg.turn > ready_turn.saturating_add(COMMAND_DELAY) {
+            return Err(PeerFault::TurnSealAhead {
+                got: msg.turn,
+                ready: ready_turn,
+            });
+        }
         self.ctx.turns.on_turn_sealed(peer, msg.turn)?;
         let turn_length = self.st.frozen().turn_length_ms;
         self.ctx.release_turns(turn_length);
@@ -3565,6 +3576,16 @@ impl<S: MatchPhase> Server<S> {
     }
 
     fn on_state_hash(&mut self, peer: PeerID, msg: StateHash) -> Result<(), PeerFault> {
+        // No client can hash a turn it was never given, and a hash for a
+        // future turn would sit in the pending comparisons until everyone
+        // else got there.
+        let ready_turn = self.ctx.turns.ready_turn();
+        if msg.turn > ready_turn {
+            return Err(PeerFault::StateHashAhead {
+                got: msg.turn,
+                ready: ready_turn,
+            });
+        }
         // The server runs no simulation, so it can only compare what the
         // clients report, never decide which of them is right.
         for mismatch in self

@@ -39,6 +39,10 @@ pub enum PeerFault {
     TurnSealOutOfSequence { got: u32, want: u32 },
     #[error("state hash for turn {got} out of sequence, expected {want}")]
     StateHashOutOfSequence { got: u32, want: u32 },
+    #[error("turn seal {got} is past what ready turn {ready} allows")]
+    TurnSealAhead { got: u32, ready: u32 },
+    #[error("state hash for turn {got} is past ready turn {ready}")]
+    StateHashAhead { got: u32, ready: u32 },
     #[error("gamestate transfer exceeds declared length")]
     TransferOverrun,
     #[error("kept sending far past its rate limit")]
@@ -54,10 +58,10 @@ impl PeerFault {
     // is what the protocol asks for anything unaccepted in the current phase.
     pub fn reason(&self) -> Option<DisconnectReason> {
         match self {
-            PeerFault::TurnSealOutOfSequence { .. } => {
+            PeerFault::TurnSealOutOfSequence { .. } | PeerFault::TurnSealAhead { .. } => {
                 Some(DisconnectReason::OutOfSequenceTurnSeal)
             }
-            PeerFault::StateHashOutOfSequence { .. } => {
+            PeerFault::StateHashOutOfSequence { .. } | PeerFault::StateHashAhead { .. } => {
                 Some(DisconnectReason::OutOfSequenceStateHash)
             }
             // The protocol has no code for flooding; Kicked is what the
