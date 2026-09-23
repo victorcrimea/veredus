@@ -30,6 +30,12 @@ use veredus::relay::server_fsm::Config;
 // log_level setting cannot quiet it; only a directive here can.
 const DEFAULT_LOG_DIRECTIVES: &str = "info,rocket=error,_=error,hyper=error";
 
+// musl's own allocator takes one global lock, which every game's socket and
+// tick threads would then contend on.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[rocket::get("/metrics")]
 fn metrics_route() -> (rocket::http::ContentType, String) {
     (
