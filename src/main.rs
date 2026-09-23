@@ -82,7 +82,7 @@ async fn main() {
     let result = match mode.lobby {
         Some(lobby_config) => {
             let base = Config {
-                idle_shutdown: Some(config.lobby.idle_shutdown()),
+                idle_shutdown: config.lobby.idle_shutdown(),
                 ..base
             };
             run_pool_lobby_mode(&mut pool, lobby_config, base, pyrogenesis_path, outcome_dir).await;

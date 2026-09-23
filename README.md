@@ -155,9 +155,9 @@ cargo run -- --lobby-config lobby.json
 
 Every account is one-shot today: once its game ends the account is released
 back to the pool. A pool-lobby game shuts itself down after the idle
-timeout (`[lobby] idle_shutdown_secs`, default 60 s) with nobody admitted:
-either nobody ever joined, or everyone left. The hosted-AI sidecar alone
-does not keep it alive.
+timeout (`[lobby] idle_shutdown_secs`, default 60 s, 0 disables) with
+nobody admitted: either nobody ever joined, or everyone left. The hosted-AI
+sidecar alone does not keep it alive.
 
 ### Match outcomes
 

@@ -364,8 +364,10 @@ impl Default for LobbySection {
 }
 
 impl LobbySection {
-    pub fn idle_shutdown(&self) -> TimeDelta {
-        secs_to_delta(self.idle_shutdown_secs)
+    // 0 means never, as for every other duration here; a zero timeout would
+    // close each game on its first tick, before anyone could join it.
+    pub fn idle_shutdown(&self) -> Option<TimeDelta> {
+        (self.idle_shutdown_secs != 0).then(|| secs_to_delta(self.idle_shutdown_secs))
     }
 
     // The fields default to empty only so the generated file can show them;
