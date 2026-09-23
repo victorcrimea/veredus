@@ -6,7 +6,7 @@ use crate::relay::fault::ParseError;
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateHash {
     pub turn: u32,
-    pub hash: Vec<u8>,
+    pub hash: [u8; 16],
 }
 
 impl StateHash {
@@ -49,10 +49,19 @@ impl StateHash {
         ]) as usize;
         pos += 4;
 
-        if buffer.len() < pos + hash_len {
-            return Err(ParseError::Truncated { field: "hash data" });
+        if hash_len != 16 {
+            return Err(ParseError::WrongSize {
+                field: "hash",
+                should_be: 16,
+                declared: hash_len,
+            });
         }
-        let hash = buffer[pos..pos + hash_len].to_vec();
+
+        let hash: [u8; 16] = if buffer.len() < pos + hash_len {
+            return Err(ParseError::Truncated { field: "hash data" });
+        } else {
+            buffer[pos..pos + 16].try_into().unwrap()
+        };
 
         Ok(Self { turn, hash })
     }

@@ -87,10 +87,13 @@ fn turn_sealed(peer: PeerID, turn: u32) -> Input {
     }
 }
 
-fn state_hash(peer: PeerID, turn: u32, hash: Vec<u8>) -> Input {
+fn state_hash(peer: PeerID, turn: u32, fill: u8) -> Input {
     Input::Received {
         peer,
-        msg: WireMessage::StateHash(StateHash { turn, hash }),
+        msg: WireMessage::StateHash(StateHash {
+            turn,
+            hash: [fill; 16],
+        }),
     }
 }
 
@@ -157,12 +160,12 @@ fn turn_counters_start_and_resume_at_the_right_offsets() {
     );
 
     // The first accepted hash is for turn 1 (FIRST_SIMULATED_TURN + 1).
-    let effects = h.input(state_hash(bob, 0, vec![0xAA]));
+    let effects = h.input(state_hash(bob, 0, 0xAA));
     assert_eq!(
         disconnects(&effects),
         vec![(bob, DisconnectReason::OutOfSequenceStateHash)]
     );
-    let effects = h.input(state_hash(bob, 2, vec![0xAA]));
+    let effects = h.input(state_hash(bob, 2, 0xAA));
     assert_eq!(
         disconnects(&effects),
         vec![(bob, DisconnectReason::OutOfSequenceStateHash)]
@@ -207,12 +210,12 @@ fn turn_counters_start_and_resume_at_the_right_offsets() {
     );
 
     let expected_hash = ready_turn + 1;
-    let effects = h.input(state_hash(carol, expected_hash - 1, vec![0xBB]));
+    let effects = h.input(state_hash(carol, expected_hash - 1, 0xBB));
     assert_eq!(
         disconnects(&effects),
         vec![(carol, DisconnectReason::OutOfSequenceStateHash)]
     );
-    let effects = h.input(state_hash(carol, expected_hash + 1, vec![0xBB]));
+    let effects = h.input(state_hash(carol, expected_hash + 1, 0xBB));
     assert_eq!(
         disconnects(&effects),
         vec![(carol, DisconnectReason::OutOfSequenceStateHash)]
@@ -393,16 +396,16 @@ fn desync_latches_comparison_off_until_the_desynced_peer_leaves() {
 
     // Turn 1: Bob's hash disagrees with Alice's (the reference, by lowest
     // client id); Carol agrees. Reported exactly once.
-    h.input(state_hash(alice, 1, vec![1]));
-    h.input(state_hash(bob, 1, vec![2]));
-    let effects = h.input(state_hash(carol, 1, vec![1]));
+    h.input(state_hash(alice, 1, 1));
+    h.input(state_hash(bob, 1, 2));
+    let effects = h.input(state_hash(carol, 1, 1));
     assert_eq!(wrong_hash_players(&effects), vec![vec!["Bob".to_string()]]);
 
     // Turn 2: a genuine new mismatch between Alice and Carol, but the
     // outstanding desync from turn 1 must suppress it entirely.
-    h.input(state_hash(alice, 2, vec![9]));
-    h.input(state_hash(bob, 2, vec![3]));
-    let effects = h.input(state_hash(carol, 2, vec![7]));
+    h.input(state_hash(alice, 2, 9));
+    h.input(state_hash(bob, 2, 3));
+    let effects = h.input(state_hash(carol, 2, 7));
     assert!(
         wrong_hash_players(&effects).is_empty(),
         "an outstanding desync must suppress comparison entirely, got {effects:?}"

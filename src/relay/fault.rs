@@ -13,6 +13,12 @@ pub enum ParseError {
     BadUtf8 { field: &'static str },
     #[error("declared size {declared} but got {actual} bytes")]
     SizeMismatch { declared: usize, actual: usize },
+    #[error("Wrong field size {declared} but should be {should_be} bytes")]
+    WrongSize {
+        field: &'static str,
+        declared: usize,
+        should_be: usize,
+    },
     #[error("unknown message type {0}")]
     UnknownType(u8),
 }

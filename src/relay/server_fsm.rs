@@ -3567,7 +3567,11 @@ impl<S: MatchPhase> Server<S> {
     fn on_state_hash(&mut self, peer: PeerID, msg: StateHash) -> Result<(), PeerFault> {
         // The server runs no simulation, so it can only compare what the
         // clients report, never decide which of them is right.
-        for mismatch in self.ctx.turns.on_state_hash(peer, msg.turn, msg.hash)? {
+        for mismatch in self
+            .ctx
+            .turns
+            .on_state_hash(peer, msg.turn, msg.hash.to_vec())?
+        {
             self.ctx.report_mismatch(mismatch);
         }
         Ok(())
