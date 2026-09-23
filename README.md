@@ -191,7 +191,11 @@ The file has four tables:
   since the stock client has no IPv6 support), `port` (standalone mode only; a lobby game picks its
   own), `pyrogenesis_path`, `outcome_dir`, `checkpoint_interval_turns`
   (default 600, 0 disables), `metrics_host` / `metrics_port` (loopback by
-  default, port 0 disables), `exit_after_game`, ENet packet/waiting caps.
+  default, port 0 disables), `exit_after_game`, ENet packet/waiting caps,
+  `max_sidecar_runs` (how many one-shot sidecar runs - rejoin dumps,
+  checkpoints, outcome replays - the whole process runs at once, across all
+  games; the rest queue, rejoin dumps first. Defaults to the CPU count, 0
+  lifts the cap. The hosted-AI sidecar is not counted).
 - `[game]` - turn length, server name, welcome message, controller secret,
   duplicate names, late-observer policy and limits, observer delay, session
   cap, pause budget, AFK pause, post-game linger, handshake/loading/join
@@ -241,6 +245,9 @@ its own: `enet_inbound_dropped_packets_total` (a peer's undelivered inbound
 backlog was full and a packet was dropped) and
 `enet_slow_peer_disconnects_total` (a peer's outgoing queue stayed over its
 cap for about 30 seconds and was disconnected).
+
+Two gauges show the `max_sidecar_runs` queue, by step (`dump`, `checkpoint`,
+`outcome`): `sidecar_runs_running` and `sidecar_runs_waiting`.
 
 ## Further reading
 

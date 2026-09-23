@@ -10,6 +10,10 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
@@ -56,6 +60,136 @@ const AI_HOST_LOG_POLLS: u64 = 600;
 // How long the AI host gets to leave on its own after being asked to stop,
 // before it is killed outright.
 const TERM_GRACE_POLLS: u64 = 60;
+
+// Bounds how many one-shot engine runs the whole process has going at once,
+// across every game: each is a full engine, and nothing else stops every game
+// in the pool from asking for one together. Unset means unlimited.
+static RUN_LIMIT: OnceLock<RunLimiter> = OnceLock::new();
+
+struct RunLimiter {
+    queue: Mutex<RunQueue>,
+    freed: Condvar,
+}
+
+struct RunQueue {
+    limit: usize,
+    running: usize,
+    // Only urgent waiters are counted: a non-urgent run steps aside while any
+    // of them is queued, so a joiner's dump never sits behind a replay.
+    waiting_urgent: usize,
+}
+
+// 0 leaves runs unlimited. The limit is a process setting fixed before any
+// game exists, so only the first call counts.
+pub fn set_run_limit(limit: usize) {
+    if limit == 0 {
+        return;
+    }
+    let _ = RUN_LIMIT.set(RunLimiter {
+        queue: Mutex::new(RunQueue {
+            limit,
+            running: 0,
+            waiting_urgent: 0,
+        }),
+        freed: Condvar::new(),
+    });
+}
+
+// Held for a whole run, decode and replay together, so a run that has
+// started never queues a second time halfway through.
+struct RunPermit {
+    step: &'static str,
+    limiter: Option<&'static RunLimiter>,
+}
+
+impl Drop for RunPermit {
+    fn drop(&mut self) {
+        crate::metrics::SIDECAR_RUNS_RUNNING
+            .with_label_values(&[self.step])
+            .dec();
+        if let Some(limiter) = self.limiter {
+            let mut queue = limiter.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            queue.running -= 1;
+            drop(queue);
+            limiter.freed.notify_all();
+        }
+    }
+}
+
+// Waits for a free slot. `urgent` is for a run someone is waiting on (a
+// joiner's dump); the others only finish later for being queued. The wait
+// polls `cancel` like a running step does, so a game that ends never waits
+// on the queue, and it is not charged to the step's timeout.
+fn acquire_run(
+    step: &'static str,
+    urgent: bool,
+    cancel: &AtomicBool,
+) -> Result<RunPermit, SidecarError> {
+    let running = crate::metrics::SIDECAR_RUNS_RUNNING.with_label_values(&[step]);
+    let Some(limiter) = RUN_LIMIT.get() else {
+        running.inc();
+        return Ok(RunPermit {
+            step,
+            limiter: None,
+        });
+    };
+    let waiting = crate::metrics::SIDECAR_RUNS_WAITING.with_label_values(&[step]);
+    let mut queue = limiter.queue.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut queued = false;
+    // Only full poll intervals are counted, so the logged wait is a lower
+    // bound; it is counted rather than timed because this module never reads
+    // the clock.
+    let mut timeouts: u64 = 0;
+    loop {
+        if queue.running < queue.limit && (urgent || queue.waiting_urgent == 0) {
+            break;
+        }
+        if cancel.load(Ordering::SeqCst) {
+            if queued {
+                waiting.dec();
+                if urgent {
+                    queue.waiting_urgent -= 1;
+                    drop(queue);
+                    // A run that stepped aside for this one may go now.
+                    limiter.freed.notify_all();
+                }
+            }
+            return Err(SidecarError::Cancelled);
+        }
+        if !queued {
+            queued = true;
+            waiting.inc();
+            if urgent {
+                queue.waiting_urgent += 1;
+            }
+        }
+        let (guard, wait) = limiter
+            .freed
+            .wait_timeout(queue, STEP_POLL)
+            .unwrap_or_else(PoisonError::into_inner);
+        queue = guard;
+        if wait.timed_out() {
+            timeouts += 1;
+        }
+    }
+    if queued {
+        waiting.dec();
+        if urgent {
+            queue.waiting_urgent -= 1;
+        }
+    }
+    queue.running += 1;
+    drop(queue);
+    running.inc();
+    if queued {
+        let waited_ms = timeouts * STEP_POLL.as_millis() as u64;
+        tracing::info!(step, waited_ms, "sidecar: run waited for a free slot");
+    }
+    Ok(RunPermit {
+        step,
+        limiter: Some(limiter),
+    })
+}
 
 // A state a replay can resume from instead of turn 0: the wire turn it was
 // dumped at and the dump itself, in the same compressed, turn-prefixed format
@@ -438,6 +572,7 @@ pub fn dump_state(
     if let Some(base) = request.base.as_ref().filter(|b| b.turn == turn) {
         return Ok(base.state.to_vec());
     }
+    let _permit = acquire_run("dump", true, cancel)?;
     let mut cmd = prepare_replay(pyrogenesis, dir, request, now, cancel)?;
     let dump_path = add_dump_args(&mut cmd, dir, turn);
     let output = run_logged(&mut cmd, "dump", STEP_TIMEOUT, cancel)?;
@@ -466,6 +601,7 @@ pub fn checkpoint(
     if turn <= request.first_turn() {
         return Err(SidecarError::NoTurn);
     }
+    let _permit = acquire_run("checkpoint", false, cancel)?;
     let mut cmd = prepare_replay(pyrogenesis, dir, request, now, cancel)?;
     // Quick hashes are skipped by default, and they are most of what the
     // players agreed on.
@@ -496,6 +632,7 @@ pub fn resolve_outcome(
     now: DateTime<Utc>,
     cancel: &AtomicBool,
 ) -> Result<(ReplayResult, String), SidecarError> {
+    let _permit = acquire_run("outcome", false, cancel)?;
     let mut cmd = prepare_replay(pyrogenesis, dir, request, now, cancel)?;
     // Quick hashes are skipped by default, and they are most of what the
     // players agreed on.

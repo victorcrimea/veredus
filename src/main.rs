@@ -70,6 +70,7 @@ async fn main() {
 
     serve_metrics(config.server.metrics_host, config.server.metrics_port);
 
+    veredus::sidecar::set_run_limit(config.server.max_sidecar_runs);
     let mut pool = GamePool::new(config.server.host, config.server.enet_limits());
     let pyrogenesis_path = config.server.pyrogenesis_path();
     let outcome_dir = config.server.outcome_dir();

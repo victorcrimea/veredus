@@ -42,6 +42,13 @@ const DEFAULT_ENET_MAX_PACKET_BYTES: usize = u16::MAX as usize;
 // more than a stock client ever has in flight.
 const DEFAULT_ENET_MAX_WAITING_BYTES: usize = 256 * 1024;
 
+// One engine per core: a replay is CPU-bound, so running more at once than
+// there are cores only makes each one finish later. Read from the machine, which means a
+// generated file carries the core count of the host that generated it.
+fn default_max_sidecar_runs() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
 // Loaded without --config only when present, so a checkout with no file still
 // runs on the built-in defaults.
 pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
@@ -80,6 +87,9 @@ pub struct ServerSection {
     pub exit_after_game: bool,
     pub enet_max_packet_bytes: usize,
     pub enet_max_waiting_bytes: usize,
+    // How many one-shot engine runs (dumps, checkpoints, outcome replays) the
+    // whole process may have going at once; the rest queue. 0 lifts the cap.
+    pub max_sidecar_runs: usize,
 }
 
 impl Default for ServerSection {
@@ -95,6 +105,7 @@ impl Default for ServerSection {
             exit_after_game: false,
             enet_max_packet_bytes: DEFAULT_ENET_MAX_PACKET_BYTES,
             enet_max_waiting_bytes: DEFAULT_ENET_MAX_WAITING_BYTES,
+            max_sidecar_runs: default_max_sidecar_runs(),
         }
     }
 }

@@ -300,6 +300,24 @@ pub static SIDECAR_RUNS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
+pub static SIDECAR_RUNS_RUNNING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "sidecar_runs_running",
+        "One-shot pyrogenesis runs holding a slot of [server] max_sidecar_runs, by step",
+        &["step"]
+    )
+    .unwrap()
+});
+
+pub static SIDECAR_RUNS_WAITING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "sidecar_runs_waiting",
+        "One-shot pyrogenesis runs queued for a free slot, by step",
+        &["step"]
+    )
+    .unwrap()
+});
+
 pub static SIDECAR_RUN_CPU_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "sidecar_run_cpu_seconds",
