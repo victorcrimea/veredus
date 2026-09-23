@@ -199,7 +199,11 @@ The file has four tables:
 - `[game]` - turn length, server name, welcome message, controller secret,
   duplicate names, late-observer policy and limits, observer delay, session
   cap, pause budget, AFK pause, post-game linger, handshake/loading/join
-  timeouts, flood limits, buddies, enabled mods.
+  timeouts, flood limits, join rate (`join_burst`, default 3, and
+  `join_interval_secs`, default 60, 0 disables: how many joins into a
+  running match one address, or one lobby name, may make before each
+  further one waits that long; an over-rate join is refused before it
+  authenticates), buddies, enabled mods.
 - `[lobby]` - `enabled` selects pool-lobby mode, plus the MUC room, bot JID,
   public IP, server name, engine version, game password, idle shutdown and
   the account list. Keep credentials out of source control.
@@ -245,6 +249,10 @@ its own: `enet_inbound_dropped_packets_total` (a peer's undelivered inbound
 backlog was full and a packet was dropped) and
 `enet_slow_peer_disconnects_total` (a peer's outgoing queue stayed over its
 cap for about 30 seconds and was disconnected).
+
+`ingress_refused_connections_total` counts connections refused before
+authenticating, today joins over the `join_burst` / `join_interval_secs`
+rate; each is logged as `connection refused: join rate`.
 
 Two gauges show the `max_sidecar_runs` queue, by step (`dump`, `checkpoint`,
 `outcome`): `sidecar_runs_running` and `sidecar_runs_waiting`.

@@ -6,6 +6,7 @@ pub mod enet_task;
 pub mod fault;
 pub mod game_server;
 pub mod gamestate_transfer;
+pub mod ingress;
 pub mod messages;
 pub mod monitor;
 pub mod observer_feed;

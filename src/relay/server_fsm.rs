@@ -20,6 +20,8 @@ use crate::relay::gamestate_transfer::KIND_RUNNING_GAME;
 use crate::relay::gamestate_transfer::KIND_SAVEGAME;
 use crate::relay::gamestate_transfer::Purpose;
 use crate::relay::gamestate_transfer::Transfers;
+use crate::relay::ingress::Decision;
+use crate::relay::ingress::Gate;
 use crate::relay::messages::Ack;
 use crate::relay::messages::Authenticate;
 use crate::relay::messages::AuthenticateResult;
@@ -375,6 +377,13 @@ pub struct Config {
     // How many times its limit a peer may send before it is disconnected
     // rather than merely dropped. 0 never disconnects.
     pub flood_kick_multiple: u32,
+    // How many joins into a running match one address, or one lobby name,
+    // may make before it has to wait, and how long it waits for each one
+    // back. Every join makes a player or a sidecar serialize the match, so
+    // this is what keeps a join-and-leave loop from stalling the game. None
+    // turns it off.
+    pub join_burst: u32,
+    pub join_interval: Option<TimeDelta>,
 }
 
 impl Default for Config {
@@ -419,6 +428,8 @@ impl Default for Config {
             command_bytes_per_turn: 16 * 1024,
             pause_min_charge: TimeDelta::seconds(5),
             flood_kick_multiple: 4,
+            join_burst: 3,
+            join_interval: Some(TimeDelta::seconds(60)),
         }
     }
 }
@@ -458,6 +469,8 @@ pub struct Counters {
     pub join_from_checkpoint: u64,
     pub join_from_dump: u64,
     pub join_from_client: u64,
+    // Connections the ingress gate turned away before the FSM saw them.
+    pub gate_refused: u64,
 }
 
 // A read-only view of one game for the IO side to report.
@@ -486,6 +499,7 @@ pub(crate) struct Context {
     next_client_id: u16,
     banned_ips: HashSet<Ipv4Addr>,
     banned_names: HashSet<String>,
+    gate: Gate,
     // Players whose leaving the match does not wait for, because they were
     // removed on purpose or gave up and are not coming back.
     forfeited: HashSet<Guid>,
@@ -720,6 +734,27 @@ impl Context {
             self.broadcast_player_slots();
         }
         self.effects.push(Effect::Disconnect { peer, reason });
+    }
+
+    // False means the input stops here and the phase handlers never see it.
+    fn gate_check(&mut self, phase: Phase, input: &Input) -> bool {
+        match self.gate.check(phase, input, &self.sessions, self.now) {
+            Decision::Pass => true,
+            Decision::Drop => false,
+            Decision::Refuse { reason, cause } => {
+                if let Input::Received { peer, .. } = input {
+                    if let Some(session) = self.sessions.get(peer) {
+                        let ip = session.addr;
+                        session
+                            .span
+                            .in_scope(|| tracing::info!(%ip, "connection refused: {cause}"));
+                    }
+                    self.counters.gate_refused += 1;
+                    self.disconnect(*peer, reason);
+                }
+                false
+            }
+        }
     }
 
     fn fault(&mut self, peer: PeerID, fault: PeerFault) {
@@ -1181,8 +1216,33 @@ impl AnyServer {
         }
     }
 
-    pub fn handle(self, input: Input) -> AnyServer {
+    // Idle has no phase and takes no network input, so the gate skips it.
+    fn gate_parts(&mut self) -> Option<(Phase, &mut Context)> {
+        fn parts<S: PhaseMarker>(s: &mut Server<S>) -> (Phase, &mut Context) {
+            (S::PHASE, &mut s.ctx)
+        }
         match self {
+            AnyServer::Idle(_) => None,
+            AnyServer::Setup(s) => Some(parts(s)),
+            AnyServer::AwaitSavegame(s) => Some(parts(s)),
+            AnyServer::AwaitAiHost(s) => Some(parts(s)),
+            AnyServer::Loading(s) => Some(parts(s)),
+            AnyServer::InGame(s) => Some(parts(s)),
+            AnyServer::PostGame(s) => Some(parts(s)),
+        }
+    }
+
+    pub fn handle(mut self, input: Input) -> AnyServer {
+        let mark = match self.gate_parts() {
+            Some((phase, ctx)) => {
+                if !ctx.gate_check(phase, &input) {
+                    return self;
+                }
+                Some(ctx.effects.len())
+            }
+            None => None,
+        };
+        let mut next = match self {
             AnyServer::Idle(s) => s.on_input(input),
             AnyServer::Setup(s) => s.on_input(input),
             AnyServer::AwaitSavegame(s) => s.on_input(input),
@@ -1190,7 +1250,15 @@ impl AnyServer {
             AnyServer::Loading(s) => s.on_input(input),
             AnyServer::InGame(s) => s.on_input(input),
             AnyServer::PostGame(s) => s.on_input(input),
+        };
+        // Effects are only drained by take_effects, outside this call, so
+        // everything from the mark on was pushed for this input, whichever
+        // phase the handlers left the server in.
+        if let (Some(mark), Some((_, ctx))) = (mark, next.gate_parts()) {
+            let pushed = ctx.effects.get(mark..).unwrap_or_default();
+            ctx.gate.observe(pushed, &ctx.sessions, ctx.now);
         }
+        next
     }
 
     pub fn take_effects(&mut self) -> Vec<Effect> {
@@ -2560,6 +2628,7 @@ impl Server<Idle> {
     pub fn new(config: Config) -> Self {
         let pause_budget = PauseBudget::new(config.pause_budget, config.pause_min_charge);
         let delay = config.observer_delay_turns;
+        let gate = Gate::new(&config);
         Server {
             ctx: Context {
                 config,
@@ -2571,6 +2640,7 @@ impl Server<Idle> {
                 next_client_id: 1,
                 banned_ips: HashSet::new(),
                 banned_names: HashSet::new(),
+                gate,
                 forfeited: HashSet::new(),
                 resigned: HashSet::new(),
                 transfers: Transfers::default(),

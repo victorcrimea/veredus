@@ -251,6 +251,16 @@ pub static REJOIN_STATE_SOURCE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(||
     .unwrap()
 });
 
+// Counted per game by the FSM and summed here: connections the ingress gate
+// refused before any phase handler saw them.
+pub static INGRESS_REFUSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ingress_refused_connections_total",
+        "Connections refused by the ingress gate, such as joins over the per-address rate"
+    )
+    .unwrap()
+});
+
 pub static CLIENT_ROUND_TRIP_TIME: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         "game_client_round_trip_time_seconds",
@@ -434,6 +444,7 @@ pub fn init() {
     LazyLock::force(&GAME_TURNS);
     LazyLock::force(&LOBBY_ACCOUNTS);
     LazyLock::force(&LOBBY_ACCOUNTS_BUSY);
+    LazyLock::force(&INGRESS_REFUSED_TOTAL);
     LazyLock::force(&ENET_INBOUND_DROPPED_TOTAL);
     LazyLock::force(&ENET_SLOW_PEER_DISCONNECTS_TOTAL);
     LazyLock::force(&LOBBY_STREAM_ENDED_TOTAL);
@@ -633,6 +644,8 @@ impl GameMetrics {
                     .inc_by(now_count - last_count);
             }
         }
+
+        INGRESS_REFUSED_TOTAL.inc_by(counters.gate_refused - last.gate_refused);
 
         let mut present = HashSet::new();
         for (peer, name) in &snapshot.clients {

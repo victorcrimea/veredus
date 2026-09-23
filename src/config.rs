@@ -194,6 +194,8 @@ pub struct GameSection {
     pub command_bytes_per_turn: usize,
     pub pause_min_charge_secs: u64,
     pub flood_kick_multiple: u32,
+    pub join_burst: u32,
+    pub join_interval_secs: u64,
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
     pub enabled_mods: Vec<ModEntry>,
@@ -239,6 +241,10 @@ impl Default for GameSection {
             command_bytes_per_turn: config.command_bytes_per_turn,
             pause_min_charge_secs: config.pause_min_charge.num_seconds().max(0) as u64,
             flood_kick_multiple: config.flood_kick_multiple,
+            join_burst: config.join_burst,
+            join_interval_secs: config
+                .join_interval
+                .map_or(0, |d| d.num_seconds().max(0) as u64),
             buddies,
             enabled_mods: config
                 .enabled_mods
@@ -296,6 +302,9 @@ impl GameSection {
             command_bytes_per_turn: self.command_bytes_per_turn,
             pause_min_charge: secs_to_delta(self.pause_min_charge_secs),
             flood_kick_multiple: self.flood_kick_multiple,
+            join_burst: self.join_burst,
+            join_interval: (self.join_interval_secs != 0)
+                .then(|| secs_to_delta(self.join_interval_secs)),
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
             checkpoint_interval_turns,
@@ -447,6 +456,11 @@ impl FileConfig {
         if self.game.chat_per_sec != 0 && self.game.chat_burst == 0 {
             return Err(
                 "[game] chat_burst must be at least 1 when chat_per_sec is set".to_string(),
+            );
+        }
+        if self.game.join_interval_secs != 0 && self.game.join_burst == 0 {
+            return Err(
+                "[game] join_burst must be at least 1 when join_interval_secs is set".to_string(),
             );
         }
         if self.game.flare_per_sec != 0 && self.game.flare_burst == 0 {
