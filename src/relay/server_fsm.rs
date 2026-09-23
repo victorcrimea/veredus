@@ -3507,6 +3507,13 @@ impl<S: MatchPhase> Server<S> {
             }
         }
 
+        // Silently, like the out-of-range turn above: a stock client never
+        // sends this.
+        if PlayerCommand::has_repeated_type(&msg.data) {
+            tracing::debug!(?peer, turn = msg.turn, "command repeats its type key");
+            return Ok(());
+        }
+
         let ai_player = self.ctx.is_ai_host(peer)
             && self
                 .ctx

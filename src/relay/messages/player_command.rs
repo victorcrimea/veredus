@@ -78,34 +78,52 @@ mod tests;
 
 impl PlayerCommand {
     /// Extract the "type" property from a SpiderMonkey-serialized command
-    /// object. Returns None if parsing fails or the object doesn't have a
-    /// string "type" property.
+    /// object. Returns None if parsing fails, the object doesn't have a
+    /// string "type" property, or it has more than one "type" property.
     pub fn extract_command_type(data: &[u8]) -> Option<String> {
-        if data.first()? != &SCRIPT_TYPE_OBJECT {
-            return None;
+        match type_values(data)?.as_slice() {
+            [only] => only.clone(),
+            _ => None,
         }
-        let mut pos = 1;
-
-        let num_props = read_u32(data, &mut pos)?;
-
-        for _ in 0..num_props {
-            // Each property: ScriptString(name) + ScriptVal(value)
-            let (name, _) = read_script_string(data, &mut pos)?;
-            if name == "type" {
-                if data.get(pos)? == &SCRIPT_TYPE_STRING {
-                    pos += 1;
-                    let (val, _) = read_script_string(data, &mut pos)?;
-                    return Some(val);
-                } else {
-                    return None;
-                }
-            } else {
-                pos = skip_script_val(data, pos, 0)?;
-            }
-        }
-
-        None
     }
+
+    // No JS object can hold two own properties of the same name, so only a
+    // crafted packet repeats "type", and which copy the engine keeps is not
+    // something the relay can know. Such a command is dropped rather than
+    // guessed at, so the relay and the engine never disagree on what it was.
+    pub fn has_repeated_type(data: &[u8]) -> bool {
+        type_values(data).is_some_and(|values| values.len() > 1)
+    }
+}
+
+// Every value the top-level object gives "type", in wire order: Some for a
+// string, None for any other value. The whole object is walked, not just up
+// to the first match, because a repeat further on has to be seen too.
+// Returns None if the object does not parse.
+fn type_values(data: &[u8]) -> Option<Vec<Option<String>>> {
+    if data.first()? != &SCRIPT_TYPE_OBJECT {
+        return None;
+    }
+    let mut pos = 1;
+
+    let num_props = read_u32(data, &mut pos)?;
+
+    let mut values = Vec::new();
+    for _ in 0..num_props {
+        let (name, _) = read_script_string(data, &mut pos)?;
+        if name == "type" && data.get(pos)? == &SCRIPT_TYPE_STRING {
+            pos += 1;
+            let (val, _) = read_script_string(data, &mut pos)?;
+            values.push(Some(val));
+        } else {
+            if name == "type" {
+                values.push(None);
+            }
+            pos = skip_script_val(data, pos, 0)?;
+        }
+    }
+
+    Some(values)
 }
 
 pub(crate) const SCRIPT_TYPE_VOID: u8 = 0x00;
