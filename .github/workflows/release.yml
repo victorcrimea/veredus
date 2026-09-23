@@ -9,30 +9,114 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # cc-rs would look for an aarch64-linux-musl-gcc cross compiler; the
+      # runner is native arm64, so plain musl-gcc is the right one.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CC_aarch64_unknown_linux_musl: musl-gcc
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: ilammy/setup-nasm@v1
+        if: runner.os == 'Windows'
 
       - name: Build
-        run: cargo build --release --message-format=short
+        env:
+          # Links the C runtime into the exe, so it runs without the Visual
+          # C++ redistributable installed.
+          RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
+        run: cargo build --release --target ${{ matrix.target }} --message-format=short
+
+      - name: Check the binary
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/veredus"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then bin="$bin.exe"; fi
+          if [[ "${{ matrix.target }}" == *musl ]]; then
+            file "$bin"
+            file "$bin" | grep -q "static"
+          fi
+          "$bin" --version
 
       - name: Package
         run: |
           set -euo pipefail
-          name="veredus-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          name="veredus-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp target/release/veredus "$name/"
           cp LICENSE README.md "$name/"
-          tar czf "$name.tar.gz" "$name"
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "target/${{ matrix.target }}/release/veredus.exe" "$name/"
+            7z a -tzip "$name.zip" "$name" > /dev/null
+            sha256sum "$name.zip" > "$name.zip.sha256"
+          else
+            cp "target/${{ matrix.target }}/release/veredus" "$name/"
+            tar czf "$name.tar.gz" "$name"
+            sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            veredus-*.tar.gz
+            veredus-*.zip
+            veredus-*.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
 
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          body: |
+            Works with 0 A.D. 0.28.0 clients.
+
+            | Download | For |
+            |---|---|
+            | `x86_64-unknown-linux-musl` | Linux on x86_64, any distribution (static) |
+            | `aarch64-unknown-linux-musl` | Linux on ARM64, any distribution (static) |
+            | `x86_64-unknown-linux-gnu` | Linux on x86_64 with glibc |
+            | `x86_64-pc-windows-msvc` | Windows 10/11 and Server, 64-bit |
+
+            The optional sidecar (hosted AI, rejoin snapshots, match results)
+            is a patched 0 A.D. engine, built from source:
+            https://gitea.wildfiregames.com/victorcrimea/0ad/src/branch/feature/server-sidecar/
           files: |
             veredus-*.tar.gz
-            veredus-*.tar.gz.sha256
+            veredus-*.zip
+            veredus-*.sha256
