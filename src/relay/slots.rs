@@ -153,9 +153,13 @@ impl Slots {
             .count()
     }
 
-    // A returning client is a joiner only if it matches a slot someone left.
+    // A returning client is a joiner only if it matches a player slot someone
+    // left; an observer row holds nothing worth bypassing the admission
+    // limits for.
     pub fn has_disconnected_named(&self, name: &str) -> bool {
-        self.entries.iter().any(|e| !e.connected && e.name == name)
+        self.entries
+            .iter()
+            .any(|e| !e.connected && e.slot != UNASSIGNED && e.name == name)
     }
 
     // The nbp/players pair a lobby game listing reports (PROTOCOL.md Sec.
