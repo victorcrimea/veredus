@@ -70,6 +70,8 @@ async fn main() {
 
     serve_metrics(config.server.metrics_host, config.server.metrics_port);
 
+    #[cfg(windows)]
+    veredus::sidecar::guard_orphans();
     veredus::sidecar::set_run_limit(config.server.max_sidecar_runs);
     let mut pool = GamePool::new(config.server.host, config.server.enet_limits());
     let pyrogenesis_path = config.server.pyrogenesis_path();
@@ -144,7 +146,35 @@ async fn shutdown_signal() -> &'static str {
             }
         }
     }
-    #[cfg(not(unix))]
+    // A console window closed, a logoff or a shutdown each get only a few
+    // seconds before Windows kills the process, but that is enough to tell
+    // the peers and start the games' shutdown.
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        match (
+            windows::ctrl_close(),
+            windows::ctrl_shutdown(),
+            windows::ctrl_break(),
+        ) {
+            (Ok(mut close), Ok(mut shutdown), Ok(mut brk)) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "Ctrl+C",
+                    _ = close.recv() => "console close",
+                    _ = shutdown.recv() => "system shutdown",
+                    _ = brk.recv() => "Ctrl+Break",
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "cannot listen for console close, only Ctrl+C stops the server cleanly"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                "Ctrl+C"
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
         "Ctrl+C"
@@ -192,6 +222,7 @@ fn build_loki_layer(log: &LogSection) -> Option<tracing_loki::Layer> {
     // label their streams would interleave.
     let instance = env_or("LOKI_INSTANCE", &log.loki_instance)
         .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
         .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "unknown".to_string());

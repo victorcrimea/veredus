@@ -461,8 +461,9 @@ impl ResourceWatch {
 // Asks the kernel to kill the child when the thread that spawned it exits, so
 // a relay killed outright does not leave engines running with nobody to reap
 // them. The signal is tied to the spawning thread, not the process, so every
-// child here is spawned by a thread that outlives it. Other platforms have no
-// such guard and keep an orphan running until it exits on its own.
+// child here is spawned by a thread that outlives it. Windows gets the same
+// guarantee process-wide from `guard_orphans`; other platforms have no such
+// guard and keep an orphan running until it exits on its own.
 #[cfg(target_os = "linux")]
 fn guard_orphan(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -486,6 +487,50 @@ fn guard_orphan(cmd: &mut Command) {
 
 #[cfg(not(target_os = "linux"))]
 fn guard_orphan(_cmd: &mut Command) {}
+
+// Windows has no parent-death signal. Instead the relay puts itself in a job
+// that kills every member when its last handle closes; children join the job
+// at creation, so there is no window between spawn and guard, and the handle
+// is deliberately never closed, so it goes only when the process does.
+#[cfg(windows)]
+pub fn guard_orphans() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+    use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+    use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
+    use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    // SAFETY: plain Win32 calls on a job handle this function owns; the limit
+    // struct is plain data, for which all zeroes is the documented "no limit".
+    let result = unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            Err(std::io::Error::last_os_error())
+        } else {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&raw const info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0;
+            if configured && AssignProcessToJobObject(job, GetCurrentProcess()) != 0 {
+                Ok(())
+            } else {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                Err(error)
+            }
+        }
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, "sidecar: cannot create a kill-on-exit job, engines may outlive a killed relay");
+    }
+}
 
 // The long-lived hosted-AI client for one match: a headless pyrogenesis that
 // joins the relay like any stock client and sends the AI players' commands.

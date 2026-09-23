@@ -3,6 +3,9 @@ name = "veredus"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+description = "Dedicated server for 0 A.D. multiplayer games"
+repository = "https://github.com/victorcrimea/veredus"
+readme = "README.md"
 
 [profile.release]
 strip = true
@@ -38,3 +41,6 @@ unicode-general-category = "1.1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
