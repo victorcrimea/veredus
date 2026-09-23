@@ -188,6 +188,7 @@ fn turn_counters_start_and_resume_at_the_right_offsets() {
     // as its first accepted values.
     let carol = PeerID(200);
     h.admit(carol, "Carol");
+    h.serve_snapshot();
     h.input(Input::Received {
         peer: carol,
         msg: WireMessage::LoadedGame(LoadedGame { current_turn: 0 }),

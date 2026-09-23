@@ -37,6 +37,10 @@ pub enum PeerFault {
     TransferOverrun,
     #[error("kept sending far past its rate limit")]
     Flooding,
+    #[error("loaded a game before any snapshot was handed to it")]
+    LoadedBeforeSnapshot,
+    #[error("loaded at turn {got}, but its snapshot is at turn {lo}..={hi}")]
+    LoadedTurnOutOfRange { got: u32, lo: u32, hi: u32 },
 }
 
 impl PeerFault {
@@ -53,6 +57,11 @@ impl PeerFault {
             // The protocol has no code for flooding; Kicked is what the
             // client shows for being removed over its own behaviour.
             PeerFault::Flooding => Some(DisconnectReason::Kicked),
+            // Likewise no code exists for a joiner lying about its snapshot,
+            // which only a tampered client can do.
+            PeerFault::LoadedBeforeSnapshot | PeerFault::LoadedTurnOutOfRange { .. } => {
+                Some(DisconnectReason::Kicked)
+            }
             PeerFault::NoSession
             | PeerFault::NotController
             | PeerFault::WrongPhase

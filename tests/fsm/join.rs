@@ -102,6 +102,7 @@ fn join_replay_is_contiguous_from_the_snapshot_turn() {
 
     let carol = PeerID(3);
     h.admit(carol, "Carol");
+    h.serve_snapshot();
 
     let snapshot_turn = INITIAL_READY_TURN;
     h.input(Input::Received {

@@ -232,6 +232,7 @@ fn slot_recovery_prefers_uuid_then_name_and_never_steals() {
 
         // Finish Carol's join so she can speak in-game, then confirm the
         // quota she inherited is Bob's drained 150s, not a fresh 180s.
+        h.serve_snapshot();
         h.input(Input::Received {
             peer: carol,
             msg: WireMessage::LoadedGame(LoadedGame { current_turn: 0 }),

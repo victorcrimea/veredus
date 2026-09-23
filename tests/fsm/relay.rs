@@ -206,6 +206,7 @@ fn joined_replays_the_current_paused_set() {
 
     let carol = PeerID(3);
     let carol_guid = h.admit(carol, "Carol");
+    h.serve_snapshot();
     h.input(Input::Received {
         peer: carol,
         msg: WireMessage::LoadedGame(LoadedGame {

@@ -27,7 +27,9 @@ pub const KIND_RUNNING_GAME: i8 = 1;
 pub enum Purpose {
     // A snapshot pulled from a playing client on behalf of a joiner. Keyed per
     // request rather than a single cache slot, so concurrent joins cannot race.
-    JoinSnapshot { joiner: PeerID },
+    // `floor` is the last turn the source had hashed when asked: it serializes
+    // only after that, so the snapshot cannot be older.
+    JoinSnapshot { joiner: PeerID, floor: u32 },
     Savegame,
 }
 
@@ -90,7 +92,7 @@ impl Transfers {
     pub fn stalled(&mut self, now: DateTime<Utc>, limit: TimeDelta) -> Vec<(PeerID, PeerID)> {
         let mut dropped = Vec::new();
         self.incoming.retain(|(source, _), rx| {
-            let Purpose::JoinSnapshot { joiner } = rx.purpose else {
+            let Purpose::JoinSnapshot { joiner, .. } = rx.purpose else {
                 return true;
             };
             let since = *rx.last_progress.get_or_insert(now);
@@ -237,8 +239,8 @@ impl Transfers {
         self.outgoing.retain(|(p, _), _| *p != peer);
         let mut orphaned = Vec::new();
         self.incoming.retain(|(source, _), rx| match rx.purpose {
-            Purpose::JoinSnapshot { joiner } if joiner == peer => false,
-            Purpose::JoinSnapshot { joiner } if *source == peer => {
+            Purpose::JoinSnapshot { joiner, .. } if joiner == peer => false,
+            Purpose::JoinSnapshot { joiner, .. } if *source == peer => {
                 orphaned.push(joiner);
                 false
             }

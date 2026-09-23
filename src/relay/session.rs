@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::net::Ipv4Addr;
+use std::ops::RangeInclusive;
 
 use chrono::DateTime;
 use chrono::TimeDelta;
@@ -28,6 +29,10 @@ pub struct Session {
     // Join sources that already failed this client, so re-sourcing does not
     // pick a live but unresponsive one again.
     pub tried_sources: Vec<PeerID>,
+    // The turns a client loading the snapshot it was handed can report back:
+    // exact for a sidecar state, a window for one pulled from a client.
+    // Anything else in its LOADED_GAME is not a stock client.
+    pub snapshot_turns: Option<RangeInclusive<u32>>,
     // When the handshake timeout started counting for this session. It is
     // set on the first tick after connecting, since that is where the FSM
     // learns the time.
@@ -78,6 +83,7 @@ impl Session {
             mean_rtt: TimeDelta::zero(),
             since_last_received: TimeDelta::zero(),
             tried_sources: Vec::new(),
+            snapshot_turns: None,
             pending_since: None,
             span,
             limits,

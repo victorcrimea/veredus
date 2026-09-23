@@ -14,9 +14,12 @@ use chrono::TimeDelta;
 use chrono::Utc;
 use rusty_enet::PeerID;
 
+use veredus::relay::gamestate_transfer::KIND_RUNNING_GAME;
 use veredus::relay::messages::Authenticate;
 use veredus::relay::messages::AuthenticateResult;
 use veredus::relay::messages::AuthenticateResultCode;
+use veredus::relay::messages::GamestateChunk;
+use veredus::relay::messages::GamestateResponse;
 use veredus::relay::messages::Guid;
 use veredus::relay::messages::LoadedGame;
 use veredus::relay::messages::MapPlayerIdToSlot;
@@ -340,6 +343,36 @@ impl Harness {
             "start_match: loading did not finish into InGame"
         );
         players
+    }
+
+    // Completes the newest running-game snapshot request with a one-chunk
+    // payload, so a joiner may then report LOADED_GAME: the server refuses
+    // one from a joiner it never handed a snapshot.
+    pub fn serve_snapshot(&mut self) -> Vec<Effect> {
+        let (source, request_id) = self
+            .log
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Effect::Send {
+                    peer,
+                    msg: WireMessage::GamestateRequest(r),
+                } if r.request_type == KIND_RUNNING_GAME => Some((*peer, r.request_id)),
+                _ => None,
+            })
+            .expect("serve_snapshot: no snapshot was requested");
+        let data = vec![0u8; 4];
+        self.input(Input::Received {
+            peer: source,
+            msg: WireMessage::GamestateResponse(GamestateResponse {
+                request_id,
+                length: data.len() as u32,
+            }),
+        });
+        self.input(Input::Received {
+            peer: source,
+            msg: WireMessage::GamestateChunk(GamestateChunk { request_id, data }),
+        })
     }
 
     pub fn log(&self) -> &[Effect] {

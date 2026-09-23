@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use chrono::DateTime;
@@ -595,6 +596,7 @@ impl CheckpointChain {
 pub(crate) enum TransferDone {
     JoinSnapshot {
         joiner: PeerID,
+        floor: u32,
         snapshot: Arc<Vec<u8>>,
     },
     Savegame(Vec<u8>),
@@ -2082,7 +2084,7 @@ impl<S: PhaseMarker> Server<S> {
                 "join served from a sidecar checkpoint"
             );
             self.ctx.counters.join_from_checkpoint += 1;
-            self.deliver_snapshot(joiner, base.state, base.turn);
+            self.deliver_snapshot(joiner, base.state, base.turn..=base.turn);
             return;
         }
         if allow_dump && joiner_delayed && self.request_state_dump(joiner, self.ctx.feed.head()) {
@@ -2126,10 +2128,11 @@ impl<S: PhaseMarker> Server<S> {
             return;
         };
 
+        let floor = self.ctx.turns.simulated_turn(source).unwrap_or(0);
         let request_id = self.ctx.transfers.allocate();
         self.ctx
             .transfers
-            .expect(source, request_id, Purpose::JoinSnapshot { joiner });
+            .expect(source, request_id, Purpose::JoinSnapshot { joiner, floor });
         self.ctx.send(
             source,
             WireMessage::GamestateRequest(GamestateRequest {
@@ -2163,17 +2166,24 @@ impl<S: PhaseMarker> Server<S> {
     // until its state is due, everyone else loads straight away, even from
     // a snapshot older than live: any snapshot turn is valid, because the
     // join replay catches the joiner up from wherever it loads.
-    fn deliver_snapshot(&mut self, joiner: PeerID, snapshot: Arc<Vec<u8>>, bound: u32) {
+    fn deliver_snapshot(
+        &mut self,
+        joiner: PeerID,
+        snapshot: Arc<Vec<u8>>,
+        turns: RangeInclusive<u32>,
+    ) {
         // A joiner that left while its snapshot was fetched must not leave a
         // grant behind for whichever peer is handed its id next.
-        if !self
+        let Some(session) = self
             .ctx
             .sessions
-            .get(&joiner)
-            .is_some_and(Session::is_syncing)
-        {
+            .get_mut(&joiner)
+            .filter(|s| s.is_syncing())
+        else {
             return;
-        }
+        };
+        let bound = *turns.end();
+        session.snapshot_turns = Some(turns);
         let Some(settings) = self.st.settings() else {
             return;
         };
@@ -2354,15 +2364,16 @@ impl<S: PhaseMarker> Server<S> {
 
         let purpose = self.ctx.transfers.purpose(peer, msg.request_id);
         let done = self.ctx.transfers.on_chunk(peer, msg.request_id, &msg.data);
-        if let (Err(PeerFault::TransferOverrun), Some(Purpose::JoinSnapshot { joiner })) =
+        if let (Err(PeerFault::TransferOverrun), Some(Purpose::JoinSnapshot { joiner, .. })) =
             (&done, purpose)
         {
             self.retry_join(joiner, peer);
         }
         match done? {
-            Some((Purpose::JoinSnapshot { joiner }, bytes)) => {
+            Some((Purpose::JoinSnapshot { joiner, floor }, bytes)) => {
                 Ok(Some(TransferDone::JoinSnapshot {
                     joiner,
+                    floor,
                     snapshot: Arc::new(bytes),
                 }))
             }
@@ -3197,8 +3208,11 @@ impl<S: MatchPhase> Server<S> {
 
     // A completed snapshot is what unblocks the joiner that asked for it.
     fn on_snapshot_chunk(&mut self, peer: PeerID, msg: GamestateChunk) -> Result<(), PeerFault> {
-        if let Some(TransferDone::JoinSnapshot { joiner, snapshot }) =
-            self.on_gamestate_chunk(peer, msg)?
+        if let Some(TransferDone::JoinSnapshot {
+            joiner,
+            floor,
+            snapshot,
+        }) = self.on_gamestate_chunk(peer, msg)?
         {
             // The snapshot cannot be past the last turn its source was
             // sealed, so a delayed joiner waits until the feed reaches that
@@ -3209,7 +3223,7 @@ impl<S: MatchPhase> Server<S> {
                 self.ctx.turns.ready_turn()
             };
             self.ctx.counters.join_from_client += 1;
-            self.deliver_snapshot(joiner, snapshot, bound);
+            self.deliver_snapshot(joiner, snapshot, floor..=bound);
         }
         Ok(())
     }
@@ -3235,7 +3249,7 @@ impl<S: MatchPhase> Server<S> {
                         .is_some_and(|s| s.is_syncing());
                     if still_syncing {
                         self.ctx.counters.join_from_dump += 1;
-                        self.deliver_snapshot(joiner, snapshot.clone(), turn);
+                        self.deliver_snapshot(joiner, snapshot.clone(), turn..=turn);
                     }
                 }
             }
@@ -3491,9 +3505,27 @@ impl<S: MatchPhase> Server<S> {
 
     // Only a syncing joiner sends this once the match is running.
     fn on_loaded_game(&mut self, peer: PeerID, msg: LoadedGame) -> Result<(), PeerFault> {
-        let session = self.ctx.sessions.get(&peer).ok_or(PeerFault::NoSession)?;
+        let session = self
+            .ctx
+            .sessions
+            .get_mut(&peer)
+            .ok_or(PeerFault::NoSession)?;
         if !session.is_syncing() {
             return Err(PeerFault::WrongPhase);
+        }
+        // The replay starts right after the reported turn, so a turn the
+        // snapshot cannot be at would either wrap the range or make the
+        // server resend the whole match.
+        let turns = session
+            .snapshot_turns
+            .take()
+            .ok_or(PeerFault::LoadedBeforeSnapshot)?;
+        if !turns.contains(&msg.current_turn) {
+            return Err(PeerFault::LoadedTurnOutOfRange {
+                got: msg.current_turn,
+                lo: *turns.start(),
+                hi: *turns.end(),
+            });
         }
         let uuid = session.uuid.clone().ok_or(PeerFault::NoSession)?;
         let client_id = session.client_id().ok_or(PeerFault::NoSession)?;
@@ -3511,7 +3543,7 @@ impl<S: MatchPhase> Server<S> {
         let upper = (ready_turn + 1).max(last_stored);
         let default_length = self.st.frozen().turn_length_ms;
 
-        for turn in (msg.current_turn + 1)..=upper {
+        for turn in msg.current_turn.saturating_add(1)..=upper {
             let commands: Vec<PlayerCommand> = self.ctx.log.commands_for(turn).to_vec();
             for command in commands {
                 self.ctx.send(peer, WireMessage::PlayerCommand(command));
@@ -3555,7 +3587,7 @@ impl<S: MatchPhase> Server<S> {
     fn resume_delayed(&mut self, peer: PeerID, client_id: u16, snapshot_turn: u32) {
         let head = self.ctx.feed.head();
         let default_length = self.st.frozen().turn_length_ms;
-        for turn in (snapshot_turn + 1)..=head {
+        for turn in snapshot_turn.saturating_add(1)..=head {
             let commands: Vec<PlayerCommand> = self.ctx.log.commands_for(turn).to_vec();
             for command in commands {
                 self.ctx.send(peer, WireMessage::PlayerCommand(command));

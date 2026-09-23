@@ -117,6 +117,10 @@ impl TurnManager {
         self.out_of_sync.contains(&peer) || self.observers_out_of_sync.contains(&peer)
     }
 
+    pub fn simulated_turn(&self, peer: PeerID) -> Option<u32> {
+        self.clients.get(&peer).map(|c| c.simulated_turn)
+    }
+
     pub fn is_delayed(&self, peer: PeerID) -> bool {
         self.clients.get(&peer).is_some_and(|c| c.delayed)
     }
