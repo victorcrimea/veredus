@@ -115,6 +115,9 @@ struct OneShotRuns {
     // The newest checkpoint result as (run id, turn, JSON), kept in case the
     // FSM finds that this run decided the match and it becomes the outcome.
     last_result: Option<(u32, u32, String)>,
+    // The result of the run that decided the match, which no outcome replay
+    // follows, kept as the replay folder's metadata.
+    decided_result: Option<String>,
 }
 
 // The hosted-AI process for this game, if one is running. It lives on this
@@ -238,8 +241,10 @@ pub fn run_game_server(
         checkpoint_tx,
         checkpoint_slot: CheckpointSlot::default(),
         last_result: None,
+        decided_result: None,
     };
     let mut outcome_request: Option<DumpRequest> = None;
+    let mut replay_request: Option<DumpRequest> = None;
     let mut ai_host = AiHostSlot {
         pyrogenesis_path: pyrogenesis_path.clone(),
         connect: ai_host_connect,
@@ -412,6 +417,7 @@ pub fn run_game_server(
                 metrics.ended("game_over");
                 let current = server.take().expect("server is always present");
                 outcome_request = current.outcome_request();
+                replay_request = current.replay_request();
                 observe_final(&current, &latest_stats, &latest_loss, metrics);
                 // Outside post-game this is the idle timeout, where normally
                 // no human is admitted to read the line.
@@ -443,6 +449,7 @@ pub fn run_game_server(
             // A saved match has not ended, so it has no outcome to replay.
             if !current.saved_on_stop() {
                 outcome_request = current.outcome_request();
+                replay_request = current.replay_request();
             }
             observe_final(&current, &latest_stats, &latest_loss, metrics);
             let effects = current.stop();
@@ -477,9 +484,23 @@ pub fn run_game_server(
 
     // The two shutdown paths consume the server, so they read the record
     // first; every other way out leaves it in place.
-    let request = outcome_request.or_else(|| server.as_ref()?.outcome_request())?;
+    let outcome = outcome_request.or_else(|| server.as_ref()?.outcome_request());
+    // Kept next to the outcome, in a folder of its own named after the game,
+    // laid out the way the game keeps its own replays.
+    let replay = replay_request
+        .or_else(|| server.as_ref()?.replay_request())
+        .zip(runs.outcome_path.as_ref().map(|p| p.with_extension("")));
+    if outcome.is_none() && replay.is_none() {
+        return None;
+    }
     let path = pyrogenesis_path?;
-    Some(spawn_outcome(path, request, runs.outcome_path.take()))
+    Some(spawn_outcome(
+        path,
+        outcome,
+        replay,
+        runs.decided_result.take(),
+        runs.outcome_path.take(),
+    ))
 }
 
 // Stats are cached rather than fed straight in, so the FSM sees timing only on
@@ -620,6 +641,7 @@ fn drain(
                     if let Some(path) = &runs.outcome_path {
                         write_outcome(path, turn, true, &json);
                     }
+                    runs.decided_result = Some(json);
                 }
                 if let Some(lobby) = lobby {
                     let _ = lobby.events_tx.send(GameToLobby::Ended);
@@ -861,10 +883,13 @@ fn player_summary(result: &crate::sidecar::ReplayResult) -> Vec<(usize, &str, &s
 
 // The outcome replay runs the whole match, which can take minutes, so it gets
 // a thread of its own and the game thread returns at once. Nothing can cancel
-// it but the process exiting.
+// it but the process exiting. The replay file is written after the outcome,
+// so a second signal that cuts this short loses the less important one.
 fn spawn_outcome(
     pyrogenesis_path: PathBuf,
-    request: DumpRequest,
+    request: Option<DumpRequest>,
+    replay: Option<(DumpRequest, PathBuf)>,
+    decided_result: Option<String>,
     outcome_path: Option<PathBuf>,
 ) -> JoinHandle<()> {
     // Read here, on the game thread, for the same reasons as in spawn_dump.
@@ -872,41 +897,88 @@ fn spawn_outcome(
     let span = tracing::Span::current();
     std::thread::spawn(move || {
         let _guard = span.entered();
-        let from = request.first_turn();
-        let turn = request.last_turn();
-        tracing::info!(from, turn, "sidecar: replaying match for its outcome");
-        let never = AtomicBool::new(false);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let dir = crate::sidecar::work_dir("outcome");
-            let result =
-                crate::sidecar::resolve_outcome(&pyrogenesis_path, &dir, &request, now, &never);
-            crate::sidecar::remove_work_dir(&dir);
-            result
-        }));
-        let (result, json) = match outcome {
-            Ok(Ok(resolved)) => resolved,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "sidecar: match outcome replay failed");
-                match_outcome("failed");
-                return;
-            }
-            Err(_) => {
-                tracing::warn!("sidecar: match outcome replay panicked");
-                match_outcome("failed");
-                return;
-            }
-        };
-        match_outcome("replay");
-        tracing::info!(
-            turn,
-            time_elapsed_ms = result.time_elapsed,
-            players = ?player_summary(&result),
-            "match outcome resolved"
-        );
-        if let Some(path) = outcome_path {
-            write_outcome(&path, turn, true, &json);
+        let resolved = request.and_then(|request| {
+            resolve_outcome(&pyrogenesis_path, &request, outcome_path.as_deref(), now)
+        });
+        if let Some((request, out)) = replay {
+            let metadata = resolved.or(decided_result);
+            write_replay(&pyrogenesis_path, &request, metadata.as_deref(), &out, now);
         }
     })
+}
+
+fn resolve_outcome(
+    pyrogenesis_path: &std::path::Path,
+    request: &DumpRequest,
+    outcome_path: Option<&std::path::Path>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let from = request.first_turn();
+    let turn = request.last_turn();
+    tracing::info!(from, turn, "sidecar: replaying match for its outcome");
+    let never = AtomicBool::new(false);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let dir = crate::sidecar::work_dir("outcome");
+        let result = crate::sidecar::resolve_outcome(pyrogenesis_path, &dir, request, now, &never);
+        crate::sidecar::remove_work_dir(&dir);
+        result
+    }));
+    let (result, json) = match outcome {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "sidecar: match outcome replay failed");
+            match_outcome("failed");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("sidecar: match outcome replay panicked");
+            match_outcome("failed");
+            return None;
+        }
+    };
+    match_outcome("replay");
+    tracing::info!(
+        turn,
+        time_elapsed_ms = result.time_elapsed,
+        players = ?player_summary(&result),
+        "match outcome resolved"
+    );
+    if let Some(path) = outcome_path {
+        write_outcome(path, turn, true, &json);
+    }
+    Some(json)
+}
+
+fn write_replay(
+    pyrogenesis_path: &std::path::Path,
+    request: &DumpRequest,
+    metadata: Option<&str>,
+    out_dir: &std::path::Path,
+    now: DateTime<Utc>,
+) {
+    if metadata.is_none() {
+        tracing::warn!("sidecar: no match result, the replay is kept without metadata.json");
+    }
+    let never = AtomicBool::new(false);
+    let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let dir = crate::sidecar::work_dir("replay");
+        let result = crate::sidecar::write_replay(
+            pyrogenesis_path,
+            &dir,
+            request,
+            metadata,
+            out_dir,
+            now,
+            &never,
+        );
+        crate::sidecar::remove_work_dir(&dir);
+        result
+    }));
+    match written {
+        Ok(Ok(())) => tracing::info!(path = %out_dir.display(), "match replay written"),
+        Ok(Err(error)) => tracing::warn!(%error, "sidecar: cannot write match replay"),
+        Err(_) => tracing::warn!("sidecar: match replay panicked"),
+    }
 }
 
 fn match_outcome(outcome: &str) {

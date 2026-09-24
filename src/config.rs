@@ -378,8 +378,9 @@ pub struct SavesSection {
     /// Keep a decided match's bundle instead of deleting it.
     pub keep_finished: bool,
     /// Directory each finished match's outcome is written to, as
-    /// <game_id>.json; empty only logs it. Needs [server]
-    /// pyrogenesis_path, which replays the match to work the outcome out.
+    /// <game_id>.json, with the match's replay in the folder <game_id>;
+    /// empty only logs it. Needs [server] pyrogenesis_path, which replays
+    /// the match to work the outcome out.
     pub outcome_dir: PathBuf,
     /// Without a sidecar, how often one playing client is asked for the
     /// match state, which pauses the game for a moment. The copy lets the

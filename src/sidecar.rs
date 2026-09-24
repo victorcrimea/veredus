@@ -823,6 +823,55 @@ pub fn resolve_outcome(
     parse_result(&output)
 }
 
+// Keeps the whole match as a replay folder the game can list and play back:
+// commands.txt, and metadata.json when there is a result for it, since the
+// game's own metadata is the same result JSON the replay prints. The request
+// must carry no base. The engine is needed only to decode the commands. Each
+// file is written aside and renamed into place, so whoever watches the
+// directory never reads half of one.
+pub fn write_replay(
+    pyrogenesis: &Path,
+    dir: &Path,
+    request: &DumpRequest,
+    metadata: Option<&str>,
+    out_dir: &Path,
+    now: DateTime<Utc>,
+    cancel: &AtomicBool,
+) -> Result<(), SidecarError> {
+    let _permit = acquire_run("replay", false, cancel)?;
+    for created in [dir, out_dir] {
+        std::fs::create_dir_all(created).map_err(|error| SidecarError::Io {
+            context: format!("creating {}", created.display()),
+            error,
+        })?;
+    }
+    let decoded = decode_commands(pyrogenesis, dir, &request.commands, cancel)?;
+    let commands_txt = out_dir.join("commands.txt");
+    let tmp = commands_txt.with_extension("txt.tmp");
+    write_commands_txt(&tmp, request, &decoded, now)?;
+    rename_into_place(&tmp, &commands_txt)?;
+    if let Some(metadata) = metadata {
+        let metadata_json = out_dir.join("metadata.json");
+        let tmp = metadata_json.with_extension("json.tmp");
+        std::fs::write(&tmp, metadata).map_err(|error| SidecarError::Io {
+            context: format!("writing {}", tmp.display()),
+            error,
+        })?;
+        rename_into_place(&tmp, &metadata_json)?;
+    }
+    Ok(())
+}
+
+fn rename_into_place(tmp: &Path, path: &Path) -> Result<(), SidecarError> {
+    std::fs::rename(tmp, path).map_err(|error| {
+        let _ = std::fs::remove_file(tmp);
+        SidecarError::Io {
+            context: format!("renaming {} into place", tmp.display()),
+            error,
+        }
+    })
+}
+
 // Decodes the request's commands, writes the replay file and the base state
 // next to it, and returns the engine invocation that replays them. Only the
 // turns after the base are decoded, so a chained run costs its own chunk and
@@ -1042,10 +1091,17 @@ fn build_start_json(request: &DumpRequest, now: DateTime<Utc>) -> Result<String,
                 .mods
                 .iter()
                 .map(|m| match mod_pathname(&m.name) {
-                    Some(pathname) => {
-                        serde_json::json!({"mod": pathname, "name": m.name, "version": m.version})
-                    }
-                    None => serde_json::json!({"name": m.name, "version": m.version}),
+                    Some(pathname) => serde_json::json!({
+                        "mod": pathname,
+                        "name": m.name,
+                        "version": m.version,
+                        "ignoreInCompatibilityChecks": false,
+                    }),
+                    None => serde_json::json!({
+                        "name": m.name,
+                        "version": m.version,
+                        "ignoreInCompatibilityChecks": false,
+                    }),
                 })
                 .collect::<Vec<_>>()
         ),

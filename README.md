@@ -109,6 +109,9 @@ no Windows sidecar yet. On other systems you can
 ```
 
 To keep each match's result as a JSON file, add `--outcome-dir results`.
+Next to each result the server also keeps the match's replay, as a folder
+named after the game holding `commands.txt` and `metadata.json`, the same
+files the game keeps for its own replays.
 
 ## Restarts
 

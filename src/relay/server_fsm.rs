@@ -1537,6 +1537,19 @@ impl AnyServer {
         }
     }
 
+    // Unlike the outcome, wanted even when a checkpoint decided the match,
+    // and a match kept for a restart has not ended, so it has no replay yet.
+    pub fn replay_request(&self) -> Option<DumpRequest> {
+        if self.kept_for_restart() {
+            return None;
+        }
+        match self {
+            AnyServer::InGame(s) => s.replay_request(),
+            AnyServer::PostGame(s) => s.replay_request(),
+            _ => None,
+        }
+    }
+
     // The span of the client behind `peer`, while it has a session.
     pub fn peer_span(&self, peer: PeerID) -> Option<tracing::Span> {
         self.ctx().sessions.get(&peer).map(|s| s.span.clone())
@@ -3924,6 +3937,19 @@ impl<S: MatchPhase> Server<S> {
         }
         let mut request = self.match_record(turn)?;
         request.hashes = self.reference_hashes(request.first_turn(), turn);
+        Some(request)
+    }
+
+    // The whole match from turn 0, whatever checkpoints exist, since a replay
+    // file has to start from the settings. None under the same conditions as
+    // the outcome, because decoding the commands needs the sidecar too.
+    fn replay_request(&self) -> Option<DumpRequest> {
+        let turn = self.ctx.turns.ready_turn();
+        if !self.ctx.config.sidecar_dumps || turn <= INITIAL_READY_TURN {
+            return None;
+        }
+        let mut request = self.match_record_from(None, turn)?;
+        request.hashes = self.reference_hashes(0, turn);
         Some(request)
     }
 
