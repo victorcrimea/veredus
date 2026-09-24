@@ -148,6 +148,7 @@ fn an_incompatible_match_is_left_untouched() {
     ));
     let mut no_sidecar = expect();
     no_sidecar.sidecar = false;
+    std::fs::remove_file(dir.join(bundle::STATE)).unwrap();
     assert!(matches!(load(&dir, &no_sidecar), Err(Skip::NoSidecar)));
     let mut lobby = expect();
     lobby.mode = Mode::Lobby;
@@ -253,11 +254,16 @@ fn scan_finds_running_and_stopped_only() {
 }
 
 #[test]
-fn without_a_sidecar_a_saved_client_state_is_enough() {
+fn without_a_sidecar_a_checkpoint_or_client_state_is_enough() {
     let setup = setup();
     let dir = stopped_match(&setup, Vec::new());
     let mut no_sidecar = expect();
     no_sidecar.sidecar = false;
+    let resumable = load(&dir, &no_sidecar).expect("resumable from the checkpoint");
+    assert!(resumable.data.seed.is_none());
+    assert_eq!(resumable.data.base.as_ref().map(|b| b.turn), Some(4));
+    drop(resumable);
+    std::fs::remove_file(dir.join(bundle::STATE)).unwrap();
     assert!(matches!(load(&dir, &no_sidecar), Err(Skip::NoSidecar)));
 
     write(

@@ -3430,7 +3430,21 @@ impl Server<Idle> {
         }
         let mut pull = ctx.client_pull_for(&server.st.settings, turn);
         if !ctx.config.sidecar_dumps {
-            server.st.seed = data.seed;
+            // A match saved with a sidecar has only its checkpoint, which
+            // needs no sidecar to serve. An exact turn beats a client state
+            // that may be no newer.
+            let checkpoint = data.base.as_ref().map(|b| Seed {
+                turns: b.turn..=b.turn,
+                state: b.state.clone(),
+            });
+            server.st.seed = match (data.seed, checkpoint) {
+                (Some(client), Some(checkpoint))
+                    if checkpoint.turns.start() < client.turns.start() =>
+                {
+                    Some(client)
+                }
+                (client, checkpoint) => checkpoint.or(client),
+            };
             if let Some(pull) = pull.as_mut() {
                 pull.saved = server.st.seed.is_some();
             }

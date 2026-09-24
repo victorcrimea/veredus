@@ -54,7 +54,8 @@ pub struct ResumeData {
     pub slots: SlotsSnapshot,
     // The newest checkpoint, when one was stored and still matches its turn.
     pub base: Option<BaseState>,
-    // The newest client state, for a server without a sidecar.
+    // The newest client state, for a server without a sidecar, which can
+    // also serve `base` instead.
     pub seed: Option<Seed>,
     // What brings the AI host back, for a match with hosted AI players.
     pub ai: Option<AiResume>,
@@ -144,7 +145,7 @@ pub enum Skip {
     Locked,
     #[error("incompatible: {0}")]
     Incompatible(String),
-    #[error("no sidecar to rebuild its state, and no client state saved")]
+    #[error("no sidecar to rebuild its state, and no saved state to serve")]
     NoSidecar,
     #[error("given up after {0} resume attempts, marked abandoned")]
     Abandoned(u32),
@@ -195,7 +196,8 @@ pub fn load(dir: &Path, expect: &Expect) -> Result<Resumable, Skip> {
         .ok_or(Skip::Locked)?;
     check_compatible(&manifest, expect)?;
     let seed = read_client_state(dir);
-    if !expect.sidecar && seed.is_none() {
+    let base = read_state(dir);
+    if !expect.sidecar && seed.is_none() && base.is_none() {
         return Err(Skip::NoSidecar);
     }
     let ai = if manifest.ai_players.is_empty() {
@@ -218,7 +220,6 @@ pub fn load(dir: &Path, expect: &Expect) -> Result<Resumable, Skip> {
             SlotsSnapshot::default()
         }
     };
-    let base = read_state(dir);
 
     let mut manifest = manifest;
     manifest.resume_attempts += 1;
