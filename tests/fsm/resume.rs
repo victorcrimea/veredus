@@ -89,6 +89,7 @@ fn data(base: Option<BaseState>) -> ResumeData {
         },
         base,
         ai: None,
+        lobby_map: None,
     }
 }
 

@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use tracing_subscriber::EnvFilter;
@@ -103,6 +104,7 @@ async fn main() {
                 idle_shutdown: config.lobby.idle_shutdown(),
                 ..base
             };
+            let saved = pick_lobby_resumables(&config.server, save.as_ref(), &base).await;
             run_pool_lobby_mode(
                 &mut pool,
                 lobby_config,
@@ -110,6 +112,7 @@ async fn main() {
                 pyrogenesis_path,
                 outcome_dir,
                 save,
+                saved,
             )
             .await;
             Ok(())
@@ -313,6 +316,23 @@ async fn pick_resumable(
         .unwrap_or_default()
 }
 
+// Every saved lobby match that can be resumed here. A lobby server has an
+// account pool rather than one port, so it takes them all.
+async fn pick_lobby_resumables(
+    server: &ServerSection,
+    save: Option<&SaveSetup>,
+    server_config: &Config,
+) -> Vec<Resumable> {
+    let Some(setup) = save.filter(|_| server.resume) else {
+        return Vec::new();
+    };
+    let expect = Expect::new(Mode::Lobby, server_config, server.max_resume_attempts);
+    let root = setup.root.clone();
+    tokio::task::spawn_blocking(move || resume::pick_all(&root, &expect))
+        .await
+        .unwrap_or_default()
+}
+
 // Hosts one game after another on the same port, or only one when
 // `exit_after_game` hands restarting over to a supervisor. `resumable`, when
 // set, is the first game.
@@ -377,6 +397,185 @@ async fn run_standalone(
     }
 }
 
+// What every game this lobby server hosts is built from.
+struct LobbyHosting {
+    base: Config,
+    pyrogenesis_path: Option<PathBuf>,
+    outcome_dir: Option<PathBuf>,
+    save: Option<SaveSetup>,
+    engine_version: String,
+    game_password: String,
+    server_name: String,
+    // The node of each account's JID, recorded in its games' save bundles.
+    account_nodes: Vec<String>,
+}
+
+// Which account hosts what, and for whom.
+#[derive(Default)]
+struct LobbyGames {
+    // A sender is a lobby username, not an account: this is what stops one
+    // impatient "hostme" spam from claiming every free account.
+    active_senders: HashSet<String>,
+    account_sender: HashMap<usize, String>,
+    account_game: HashMap<usize, GameId>,
+}
+
+impl LobbyGames {
+    // Two saved matches can share a host, and ending the first must not free
+    // that host's name while the second still runs.
+    fn hosted(&mut self, account: usize, sender: String, game_id: GameId) {
+        if self.active_senders.insert(sender.clone()) {
+            self.account_sender.insert(account, sender);
+        }
+        self.account_game.insert(account, game_id);
+    }
+}
+
+// Hosts one game on an account the caller has already reserved and hands it
+// to that account. None when it could not be hosted: the account is then
+// released again, unless its task is gone and it can host nothing.
+async fn host_lobby_game(
+    pool: &mut GamePool,
+    lobby_mgr: &mut LobbyManager,
+    hosting: &LobbyHosting,
+    account: usize,
+    host_jid: String,
+    lobby_host_name: String,
+    resume: Option<Resumable>,
+) -> Option<GameId> {
+    // Sec. 18: the lobby host stores H = hash(rawPassword,
+    // hostFullJID + rawPassword + engineVersion), keyed to the
+    // account's own bound JID since that is what a joining client
+    // salts with.
+    let salt = format!(
+        "{host_jid}{}{}",
+        hosting.game_password, hosting.engine_version
+    );
+    let raw_password = hosting.game_password.clone();
+    let hashed =
+        tokio::task::spawn_blocking(move || password::hash(&raw_password, salt.as_bytes())).await;
+    // An empty hash would host the game with no password at all.
+    let password_hash = match hashed {
+        Ok(password_hash) => password_hash,
+        Err(error) => {
+            tracing::error!(account, %error, "game password hash failed");
+            lobby_mgr.release(account);
+            return None;
+        }
+    };
+
+    let server_config = Config {
+        lobby_mode: true,
+        server_password_hash: password_hash.clone(),
+        server_name: hosting.server_name.clone(),
+        lobby_host_name: lobby_host_name.clone(),
+        ..hosting.base.clone()
+    };
+
+    let (auth_tx, auth_rx) = std::sync::mpsc::channel();
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let lobby_account = hosting
+        .account_nodes
+        .get(account)
+        .cloned()
+        .unwrap_or_default();
+
+    let resumed = resume.is_some();
+    let created = pool.create_game(GameConfig {
+        port: None,
+        server: server_config,
+        lobby: Some(LobbyLink { auth_rx, events_tx }),
+        pyrogenesis_path: hosting.pyrogenesis_path.clone(),
+        outcome_dir: hosting.outcome_dir.clone(),
+        save: hosting.save.clone().map(|setup| SaveSetup {
+            lobby_account,
+            ..setup
+        }),
+        resume,
+    });
+    let (game_id, port) = match created {
+        Ok(created) => created,
+        Err(error) => {
+            tracing::error!(account, %error, resumed, "failed to create a lobby game");
+            lobby_mgr.release(account);
+            return None;
+        }
+    };
+    tracing::info!(
+        game_id = %game_id,
+        port,
+        account,
+        host = %lobby_host_name,
+        resumed,
+        "hosted a lobby game"
+    );
+    if !lobby_mgr.assign(account, auth_tx, events_rx, port, password_hash) {
+        // The account task is gone, so nothing would ever report
+        // this game ended. The account stays reserved because it
+        // can no longer host anything.
+        tracing::error!(account, game_id = %game_id, "lobby account unusable, dropping its game");
+        tokio::task::block_in_place(|| pool.destroy_game(game_id));
+        return None;
+    }
+    Some(game_id)
+}
+
+// Saved matches take free accounts ahead of any hostme, since their players
+// are already waiting to get back in. Those left over wait for the next
+// account to be released.
+async fn host_saved_matches(
+    pool: &mut GamePool,
+    lobby_mgr: &mut LobbyManager,
+    hosting: &LobbyHosting,
+    games: &mut LobbyGames,
+    saved: &mut VecDeque<Resumable>,
+) {
+    while let Some(next) = saved.front() {
+        let preferred = hosting
+            .account_nodes
+            .iter()
+            .position(|node| *node == next.existing.manifest.lobby_account);
+        let Some(account) = lobby_mgr.reserve_free(preferred) else {
+            tracing::info!(
+                waiting = saved.len(),
+                "saved matches are waiting for a free lobby account"
+            );
+            return;
+        };
+        let Some(mut next) = saved.pop_front() else {
+            return;
+        };
+        let host_jid = lobby_mgr.host_jid(account).unwrap_or_default().to_string();
+        // Recorded now, so a later restart prefers the account the match
+        // actually runs on.
+        next.existing.manifest.lobby_account = hosting
+            .account_nodes
+            .get(account)
+            .cloned()
+            .unwrap_or_default();
+        let host = next.existing.manifest.lobby_host_name.clone();
+        tracing::info!(
+            game_id = %next.game_id,
+            turn = next.data.last_turn(),
+            account,
+            "resuming a saved lobby match"
+        );
+        let hosted = host_lobby_game(
+            pool,
+            lobby_mgr,
+            hosting,
+            account,
+            host_jid,
+            host.clone(),
+            Some(next),
+        )
+        .await;
+        if let Some(game_id) = hosted {
+            games.hosted(account, host, game_id);
+        }
+    }
+}
+
 async fn run_pool_lobby_mode(
     pool: &mut GamePool,
     lobby_config: LobbyConfig,
@@ -384,6 +583,7 @@ async fn run_pool_lobby_mode(
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
     save: Option<SaveSetup>,
+    saved: Vec<Resumable>,
 ) {
     tracing::info!(
         accounts = lobby_config.accounts.len(),
@@ -391,26 +591,29 @@ async fn run_pool_lobby_mode(
         "lobby config loaded"
     );
 
-    let engine_version = lobby_config.engine_version.clone();
-    let game_password = lobby_config.game_password.clone();
-    let server_name = lobby_config.server_name.clone();
-    // The node of each account's JID, recorded in its games' save bundles.
-    let account_nodes: Vec<String> = lobby_config
-        .accounts
-        .iter()
-        .map(|a| a.jid.split('@').next().unwrap_or_default().to_string())
-        .collect();
+    let hosting = LobbyHosting {
+        base,
+        pyrogenesis_path,
+        outcome_dir,
+        save,
+        engine_version: lobby_config.engine_version.clone(),
+        game_password: lobby_config.game_password.clone(),
+        server_name: lobby_config.server_name.clone(),
+        account_nodes: lobby_config
+            .accounts
+            .iter()
+            .map(|a| a.jid.split('@').next().unwrap_or_default().to_string())
+            .collect(),
+    };
 
     let mut lobby_mgr = LobbyManager::new(lobby_config);
     let mut events = lobby_mgr.start();
+    let mut games = LobbyGames::default();
+    let mut saved: VecDeque<Resumable> = saved.into();
+
+    host_saved_matches(pool, &mut lobby_mgr, &hosting, &mut games, &mut saved).await;
 
     tracing::info!("waiting for 'hostme' in MUC chat to create a game");
-
-    // A sender is a lobby username, not an account: this is what stops one
-    // impatient "hostme" spam from claiming every free account.
-    let mut active_senders: HashSet<String> = HashSet::new();
-    let mut account_sender: HashMap<usize, String> = HashMap::new();
-    let mut account_game: HashMap<usize, GameId> = HashMap::new();
 
     // One future for the whole loop, so a signal that arrives while an event
     // is being handled is not missed.
@@ -435,7 +638,7 @@ async fn run_pool_lobby_mode(
                 sender,
                 host_jid,
             } => {
-                if active_senders.contains(&sender) {
+                if games.active_senders.contains(&sender) {
                     tracing::debug!(account, %sender, "ignoring duplicate hostme");
                     hostme_outcome("duplicate_sender");
                     continue;
@@ -447,91 +650,36 @@ async fn run_pool_lobby_mode(
                     hostme_outcome("account_busy");
                     continue;
                 }
-
-                // Sec. 18: the lobby host stores H = hash(rawPassword,
-                // hostFullJID + rawPassword + engineVersion), keyed to the
-                // account's own bound JID since that is what a joining client
-                // salts with.
-                let salt = format!("{host_jid}{game_password}{engine_version}");
-                let raw_password = game_password.clone();
-                let hashed = tokio::task::spawn_blocking(move || {
-                    password::hash(&raw_password, salt.as_bytes())
-                })
+                let hosted = host_lobby_game(
+                    pool,
+                    &mut lobby_mgr,
+                    &hosting,
+                    account,
+                    host_jid,
+                    sender.clone(),
+                    None,
+                )
                 .await;
-                // An empty hash would host the game with no password at all.
-                let password_hash = match hashed {
-                    Ok(password_hash) => password_hash,
-                    Err(error) => {
-                        tracing::error!(account, %error, "game password hash failed");
-                        hostme_outcome("failed");
-                        lobby_mgr.release(account);
-                        continue;
-                    }
-                };
-
-                let server_config = Config {
-                    lobby_mode: true,
-                    server_password_hash: password_hash.clone(),
-                    server_name: server_name.clone(),
-                    lobby_host_name: sender.clone(),
-                    ..base.clone()
-                };
-
-                let (auth_tx, auth_rx) = std::sync::mpsc::channel();
-                let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-                match pool.create_game(GameConfig {
-                    port: None,
-                    server: server_config,
-                    lobby: Some(LobbyLink { auth_rx, events_tx }),
-                    pyrogenesis_path: pyrogenesis_path.clone(),
-                    outcome_dir: outcome_dir.clone(),
-                    save: save.clone().map(|setup| SaveSetup {
-                        lobby_account: account_nodes.get(account).cloned().unwrap_or_default(),
-                        ..setup
-                    }),
-                    resume: None,
-                }) {
-                    Ok((game_id, port)) => {
-                        tracing::info!(
-                            game_id = %game_id,
-                            port,
-                            account,
-                            %sender,
-                            "hosted a game for a lobby request"
-                        );
-                        if !lobby_mgr.assign(account, auth_tx, events_rx, port, password_hash) {
-                            // The account task is gone, so nothing would ever report
-                            // this game ended. The account stays reserved because it
-                            // can no longer host anything.
-                            tracing::error!(account, game_id = %game_id, "lobby account unusable, dropping its game");
-                            hostme_outcome("failed");
-                            tokio::task::block_in_place(|| pool.destroy_game(game_id));
-                            continue;
-                        }
+                match hosted {
+                    Some(game_id) => {
                         hostme_outcome("hosted");
-                        active_senders.insert(sender.clone());
-                        account_sender.insert(account, sender);
-                        account_game.insert(account, game_id);
+                        games.hosted(account, sender, game_id);
                     }
-                    Err(error) => {
-                        tracing::error!(account, %error, "failed to create game for hostme");
-                        hostme_outcome("failed");
-                        lobby_mgr.release(account);
-                    }
+                    None => hostme_outcome("failed"),
                 }
             }
             LobbyEvent::GameEnded { account } => {
                 tracing::info!(account, "lobby game ended");
-                if let Some(sender) = account_sender.remove(&account) {
-                    active_senders.remove(&sender);
+                if let Some(sender) = games.account_sender.remove(&account) {
+                    games.active_senders.remove(&sender);
                 }
-                if let Some(game_id) = account_game.remove(&account) {
+                if let Some(game_id) = games.account_game.remove(&account) {
                     // destroy_game joins both of the game's OS threads, so it
                     // must not block the async runtime's worker thread.
                     tokio::task::block_in_place(|| pool.destroy_game(game_id));
                 }
                 lobby_mgr.release(account);
+                host_saved_matches(pool, &mut lobby_mgr, &hosting, &mut games, &mut saved).await;
             }
         }
     }

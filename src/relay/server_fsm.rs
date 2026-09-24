@@ -3397,10 +3397,28 @@ impl Server<Idle> {
     // A saved match, rebuilt as it stopped: every turn and agreed hash, the
     // slot table with everyone gone, and a run that rebuilds the state at
     // the turn it stopped at, unless the save already holds that state.
-    pub fn resume(self, data: ResumeData) -> Server<Resuming> {
+    pub fn resume(mut self, data: ResumeData) -> Server<Resuming> {
         let turn = data.last_turn();
         let settings = frozen_settings(&data.settings, data.turn_length_ms);
         let slots = data.slots;
+        if self.ctx.config.lobby_mode {
+            // Re-listed at once as a match in progress, since the bot dropped
+            // it when the old process left. Nobody is back yet, so the saved
+            // players stand in for the connected ones the listing counts.
+            let mut players: Vec<&SavedPlayer> = slots.players.iter().collect();
+            players.sort_by_key(|p| p.player_id);
+            let names: Vec<&str> = players.iter().map(|p| p.name.as_str()).collect();
+            let nbp = names.len() as u32;
+            let players = names.join(", ");
+            self.ctx.effects.push(Effect::LobbyListing {
+                host_username: self.ctx.config.lobby_host_name.clone(),
+                nbp,
+                players: players.clone(),
+                map: data.lobby_map.clone(),
+                mods: self.ctx.config.enabled_mods.clone(),
+            });
+            self.ctx.effects.push(Effect::LobbyStarted { nbp, players });
+        }
         let mut server = self.with_state(Resuming {
             settings,
             turn,
@@ -3424,6 +3442,7 @@ impl Server<Idle> {
             let slot = i8::try_from(p.player_id).unwrap_or(UNASSIGNED);
             (Guid(p.uuid.clone()), p.name.clone(), slot)
         }));
+        ctx.lobby_map = data.lobby_map;
         ctx.banned_names = slots.banned_names.iter().cloned().collect();
         ctx.resigned = slots.resigned.iter().copied().collect();
         ctx.forfeited = slots.forfeited.iter().cloned().map(Guid).collect();

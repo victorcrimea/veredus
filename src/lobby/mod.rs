@@ -142,6 +142,10 @@ struct AccountSlot {
     control_tx: mpsc::Sender<AccountControl>,
     handle: Option<JoinHandle<()>>,
     in_use: bool,
+    // The full JID the account binds, which the game password is salted
+    // with. Known before the account is online, so a resumed match can be
+    // hosted without waiting for a hostme to report it.
+    host_jid: String,
 }
 
 pub struct LobbyManager {
@@ -197,6 +201,13 @@ impl LobbyManager {
             let creds = creds.clone();
             let account_config = account_config.clone();
             let task_main_tx = main_tx.clone();
+            // Generated once per task, not per connection: clients salt the
+            // game password with the full JID, so it must stay stable across
+            // reconnects. The lobby bot also filters
+            // IQs by resource prefix, mirroring what the stock client does
+            // ("0ad-" + a fresh guid).
+            let resource = format!("0ad-{}", uuid::Uuid::new_v4());
+            let host_jid = format!("{}/{resource}", creds.jid);
 
             let span = tracing::info_span!("lobby_account", account = idx, jid = %creds.jid);
 
@@ -208,7 +219,15 @@ impl LobbyManager {
                         ))
                         .await;
                     }
-                    run_account(idx, creds, account_config, control_rx, task_main_tx).await;
+                    run_account(
+                        idx,
+                        creds,
+                        resource,
+                        account_config,
+                        control_rx,
+                        task_main_tx,
+                    )
+                    .await;
                 }
                 .instrument(span),
             );
@@ -217,6 +236,7 @@ impl LobbyManager {
                 control_tx,
                 handle: Some(handle),
                 in_use: false,
+                host_jid,
             });
         }
 
@@ -237,6 +257,21 @@ impl LobbyManager {
             }
             _ => false,
         }
+    }
+
+    // For a resumed match, which has no hostme to tie it to one account:
+    // the account that hosted it before when that one is free, else any.
+    pub fn reserve_free(&mut self, preferred: Option<usize>) -> Option<usize> {
+        let account = preferred
+            .filter(|&i| self.accounts.get(i).is_some_and(|slot| !slot.in_use))
+            .or_else(|| self.accounts.iter().position(|slot| !slot.in_use))?;
+        self.reserve(account).then_some(account)
+    }
+
+    pub fn host_jid(&self, account: usize) -> Option<&str> {
+        self.accounts
+            .get(account)
+            .map(|slot| slot.host_jid.as_str())
     }
 
     pub fn assign(
@@ -459,15 +494,11 @@ fn build_muc_presence(muc_room: &str, bound_jid: &Jid) -> Presence {
 async fn run_account(
     account: usize,
     creds: XmppCredentials,
+    resource: String,
     config: AccountConfig,
     mut control_rx: mpsc::Receiver<AccountControl>,
     main_tx: mpsc::UnboundedSender<LobbyEvent>,
 ) {
-    // Generated once per task, not per connection: clients salt the game
-    // password with the full JID (PROTOCOL.md Sec. 18), so it must stay
-    // stable across reconnects. The lobby bot also filters IQs by resource
-    // prefix, mirroring what the stock client does ("0ad-" + a fresh guid).
-    let resource = format!("0ad-{}", uuid::Uuid::new_v4());
     let jid: Jid = format!("{}/{resource}", creds.jid)
         .parse()
         .expect("account jids are checked by LobbyConfig::validate");

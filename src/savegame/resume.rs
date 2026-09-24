@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::lobby::link::LobbyMap;
 use crate::relay::messages::PlayerCommand;
 use crate::relay::server_fsm::Config;
 use crate::relay::server_fsm::SIMULATION_VERSION;
@@ -48,6 +49,8 @@ pub struct ResumeData {
     pub base: Option<BaseState>,
     // What brings the AI host back, for a match with hosted AI players.
     pub ai: Option<AiResume>,
+    // What the lobby listing showed, for a lobby match to be listed again.
+    pub lobby_map: Option<LobbyMap>,
 }
 
 // The AI host's side of a saved match: its own copy of the settings, the
@@ -115,6 +118,25 @@ pub fn pick(root: &Path, expect: &Expect) -> Option<Resumable> {
         }
         match load(&dir, expect) {
             Ok(resumable) => chosen = Some(resumable),
+            Err(Skip::Locked) => {
+                tracing::info!(dir = %dir.display(), "save: saved match is held by another process")
+            }
+            Err(skip) => {
+                tracing::warn!(dir = %dir.display(), %skip, "save: saved match not resumed")
+            }
+        }
+    }
+    chosen
+}
+
+// Every bundle under `root` that can be resumed here, newest first, each
+// locked and with this attempt counted. A lobby server has an account pool
+// rather than one port, so it takes them all.
+pub fn pick_all(root: &Path, expect: &Expect) -> Vec<Resumable> {
+    let mut chosen = Vec::new();
+    for dir in scan(root) {
+        match load(&dir, expect) {
+            Ok(resumable) => chosen.push(resumable),
             Err(Skip::Locked) => {
                 tracing::info!(dir = %dir.display(), "save: saved match is held by another process")
             }
@@ -228,6 +250,7 @@ pub fn load(dir: &Path, expect: &Expect) -> Result<Resumable, Skip> {
         slots,
         base,
         ai,
+        lobby_map: manifest.lobby_map.clone(),
     };
     Ok(Resumable {
         game_id: manifest.game_id.clone(),
