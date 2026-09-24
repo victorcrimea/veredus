@@ -1,4 +1,4 @@
-# Veredus - 0 A.D. Dedicated Server
+# Veredus - Dedicated Server
 
 ![Veredus banner](banner.png)
 
