@@ -3390,7 +3390,12 @@ impl Server<Idle> {
         }
     }
 
-    pub fn listen(self) -> Server<Setup> {
+    pub fn listen(mut self) -> Server<Setup> {
+        // The hostme sender can only find the game through the listing, and
+        // nothing else would list it before somebody joins.
+        if self.ctx.config.lobby_mode {
+            self.ctx.push_lobby_listing();
+        }
         self.with_state(Setup)
     }
 
