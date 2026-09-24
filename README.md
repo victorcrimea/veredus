@@ -6,54 +6,50 @@
 [![Release](https://img.shields.io/github/v/release/victorcrimea/veredus?sort=semver)](https://github.com/victorcrimea/veredus/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Veredus is an always-on multiplayer server for
-[0 A.D.](https://play0ad.com/), the free real-time strategy game. Run it on
-a VPS or a spare machine and your group gets a game that is always there to
-join. No player has to host, and the match keeps going when someone's
-connection drops.
+Veredus is an unofficial dedicated server for [0 A.D.](https://play0ad.com/)
+that relays multiplayer matches between the players' unmodified game
+clients. Normally one player's computer hosts the match, so that player's
+connection, lag or departure affects everyone; with Veredus no player hosts.
 
-Players use the normal, unmodified game and join the server like any other
-multiplayer game.
+**Works with 0 A.D. Release 28 (0.28.0).**
 
-**Works with 0 A.D. 0.28.0.**
+## Key features
 
-What you get:
+- One player's PC and connection carry the match -> no player hosts; the
+  match survives anyone leaving, and waits for a dropped or lagging player
+  only as long as their pause budget lasts.
+- Joining must not need extra software -> players use the stock 0.28.0 game,
+  nothing to install.
+- Someone has to set up every lobby game -> type `hostme` in the lobby chat
+  and a fresh game is hosted for you, with you as its host, many at once.
+- A disconnected or timed-out player loses their place -> they get their
+  own slot back when they return; so does a kicked player who was not banned.
+- A server restart or crash ends the match -> every match is saved as it
+  goes and continues after a restart, paused until the host types `!resume`.
 
-- Games that never depend on one player's computer or internet connection.
-- Dropped players can rejoin a match in progress.
-- Out-of-sync detection that tells players when their games disagree, instead
-  of letting a match silently fall apart.
-- Observers who watch a few minutes behind live play, so streaming a match
-  gives nothing away.
-- Password-protected games, and limits that stop one player from spamming
-  chat or pausing forever.
-- With the optional sidecar: AI opponents hosted on the server, and a
-  recorded result for every match, even if everyone left before the end.
+With the [sidecar](#extra-features-with-the-sidecar), a patched headless
+0 A.D. run next to the server:
 
-## Download
-
-Get the latest build from the
-[Releases page](https://github.com/victorcrimea/veredus/releases):
-
-| File | Use it on |
-|---|---|
-| `veredus-*-x86_64-unknown-linux-musl.tar.gz` | Linux, 64-bit PC or server (any distribution) |
-| `veredus-*-aarch64-unknown-linux-musl.tar.gz` | Linux on ARM64 (Raspberry Pi 4/5, ARM cloud servers) |
-| `veredus-*-x86_64-unknown-linux-gnu.tar.gz` | Linux, 64-bit, if you prefer a glibc build |
-| `veredus-*-x86_64-pc-windows-msvc.zip` | Windows 10, 11 or Server, 64-bit |
-
-The server is a single file with nothing to install. Each download comes
-with a `.sha256` checksum if you want to verify it.
-
-Each Linux file also comes as a `-sidecar` version, for example
-`veredus-*-x86_64-unknown-linux-musl-sidecar.tar.gz`, which adds the
-[sidecar](#extra-features-with-the-sidecar) ready to run.
+- Rejoining makes a player's game stop to send a copy -> the server builds
+  the joiner's copy itself.
+- AI opponents load one player's PC -> the AI runs on the server.
+- Games with AI cannot be rejoined -> with server-hosted AI they can.
+- An AI crash spoils the match -> the server pauses, restarts the AI and
+  catches it up.
+- Players leave before the end and the result is lost -> the server works
+  it out anyway and, with `--outcome-dir`, keeps it with a replay the game
+  can play (for any match that played at least one turn).
 
 ## Quick start
 
-1. Unpack the download and start the server.
+1. Download the file for your system from the
+   [Releases page](https://github.com/victorcrimea/veredus/releases). The
+   server is a single file with nothing to install. Each Linux file also
+   comes as a `-sidecar` version with the sidecar included.
 
-   Linux:
+2. Unpack it and start the server.
+
+   Linux, for example on a 64-bit PC:
 
    ```sh
    tar xzf veredus-*-x86_64-unknown-linux-musl.tar.gz
@@ -64,18 +60,62 @@ Each Linux file also comes as a `-sidecar` version, for example
    Windows: unzip it, open a terminal in that folder and run `veredus.exe`.
    When Windows Firewall asks, allow access.
 
-2. Let players reach it: allow **UDP port 20595** through your firewall. At
-   home, also forward that port on your router to the server machine.
+3. Optional, Linux only: from a `-sidecar` download, start it with the
+   sidecar instead. This needs glibc 2.36 or newer (Debian 12, Ubuntu 24.04
+   and later).
 
-3. In 0 A.D., choose **Multiplayer**, then **Join game**, and enter the
-   server's IP address and port 20595.
+   ```sh
+   ./veredus --pyrogenesis-path sidecar/binaries/system/pyrogenesis
+   ```
 
-The first player to join is the host: they pick the map and settings and
-start the game, just like with a normal player-hosted game. When a match
-ends, the server opens a fresh game on the same port.
+4. Allow **UDP port 20595** through your firewall. At home, also forward
+   that port on your router to the server machine.
 
-Stop the server with Ctrl+C. Players get a "server shutdown" message instead
-of just timing out.
+5. Players start 0 A.D., choose **Multiplayer**, then **Join game**, and
+   enter the server's IP address and port 20595.
+
+6. The first player to join is the host: they pick the map and settings and
+   start the game. (A lobby game's host is the player who typed `hostme`.)
+   When a match ends, the server opens a fresh game on the same port, unless
+   `[server] exit_after_game` is set in the config file.
+
+7. Stop the server with Ctrl+C. Players get a "server shutdown" message
+   instead of just timing out.
+
+To host games from the in-game lobby instead, see
+[Hosting in the multiplayer lobby](#hosting-in-the-multiplayer-lobby).
+
+## Limitations
+
+- Lobby hosting needs your own lobby, or approval from the Wildfire Games
+  lobby operators to use the official one.
+- Map hacks are still possible. Every client runs the whole game, and a
+  relay server cannot hide anything from it.
+- Server-hosted AI gets none of the bonuses AI levels above Medium rely on
+  (they raise the AI's gather rate inside the simulation), so it plays
+  weaker than those levels.
+- Server-hosted AI needs "Explore map" turned on. The map is not revealed.
+- A saved game cannot be loaded from the game client. The server resumes
+  only its own saves, automatically.
+
+**Veredus is not affiliated with or endorsed by Wildfire Games.**
+
+## Links
+
+- [Releases](https://github.com/victorcrimea/veredus/releases) and
+  [0 A.D.](https://play0ad.com/)
+- On this page: [the sidecar](#extra-features-with-the-sidecar),
+  [restarts](#restarts), [lobby hosting](#hosting-in-the-multiplayer-lobby),
+  [configuration](#configuration), [running as a service](#running-as-a-service),
+  [building from source](#building-from-source) and
+  [building the sidecar](#building-the-sidecar).
+- `./veredus --help` lists every flag; `./veredus --gen-config` writes a
+  config file with every setting explained.
+- License: Veredus is Apache-2.0, see [LICENSE](LICENSE). The sidecar
+  patches in `sidecar/patches` change 0 A.D., so they are GPL-2.0 or later
+  like 0 A.D.'s code, see [sidecar/LICENSE](sidecar/LICENSE); 0 A.D.'s art is
+  CC BY-SA 3.0. The bundled ENet code is MIT, see
+  [src/enet/LICENSE.rusty_enet](src/enet/LICENSE.rusty_enet).
 
 ## Extra features with the sidecar
 
@@ -147,30 +187,32 @@ account hosts one game at a time.
 from the lobby's operators.** The server accounts behave like bots, and the
 lobby is a shared community space.
 
-Create a `lobby.json`:
+Write a config file with `./veredus --gen-config` (see
+[Configuration](#configuration)) and fill in its `[lobby]` table:
 
-```json
-{
-  "accounts": [
-    { "jid": "myserver1@lobby.wildfiregames.com", "password": "..." },
-    { "jid": "myserver2@lobby.wildfiregames.com", "password": "..." }
-  ],
-  "muc_room": "arena28@conference.lobby.wildfiregames.com",
-  "bot_jid": "wfgbot28@lobby.wildfiregames.com/CC",
-  "public_ip": "203.0.113.10",
-  "server_name": "My Veredus server"
-}
+```toml
+[lobby]
+enabled = true
+public_ip = "203.0.113.10"
+server_name = "My Veredus server"
+muc_room = "arena28@conference.lobby.wildfiregames.com"
+bot_jid = "wfgbot28@lobby.wildfiregames.com/CC"
+
+[[lobby.accounts]]
+jid = "myserver1@lobby.wildfiregames.com"
+password = "..."
+
+[[lobby.accounts]]
+jid = "myserver2@lobby.wildfiregames.com"
+password = "..."
 ```
 
+- `enabled = true` turns lobby hosting on.
 - `public_ip` is the address players connect to.
 - `game_password` is optional and sets a password for every game.
-- Keep this file private: it holds account passwords.
+- Keep `config.toml` private: it holds account passwords.
 
-Then run:
-
-```sh
-./veredus --lobby-config lobby.json
-```
+Then start the server as usual with `./veredus`.
 
 Lobby games use UDP ports **20595 to 20695**, so open that whole range.
 
@@ -267,11 +309,3 @@ make -C build/workspaces/gcc config=release -j"$(nproc)"
 The result is `binaries/system/pyrogenesis`. Keep it inside the cloned
 folder, because it loads the game data from there, and pass its path to
 `--pyrogenesis-path`.
-
-## License
-
-Veredus is licensed under Apache-2.0, see [LICENSE](LICENSE).
-
-The sidecar patches in `sidecar/patches` change 0 A.D., so they are
-licensed like 0 A.D.'s code, under GPL-2.0 or later, see
-[sidecar/LICENSE](sidecar/LICENSE). 0 A.D.'s art is CC BY-SA 3.0.
