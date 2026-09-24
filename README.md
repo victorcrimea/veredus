@@ -1,15 +1,6 @@
 # Veredus - 0 A.D. Dedicated Server
 
-```text
-__     __  _____   ____    _____   ____    _   _   ____
-\ \   / / | ____| |  _ \  | ____| |  _ \  | | | | / ___|
- \ \ / /  |  _|   | |_) | |  _|   | | | | | | | | \___ \
-  \ V /   | |___  |  _ <  | |___  | |_| | | |_| |  ___) |
-   \_/    |_____| |_| \_\ |_____| |____/   \___/  |____/
-
- o-------o-------o-------o-------o-------o-------o-------o
-                  0 A.D. Dedicated Server
-```
+![Veredus banner](banner.png)
 
 [![CI](https://github.com/victorcrimea/veredus/actions/workflows/ci.yml/badge.svg)](https://github.com/victorcrimea/veredus/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/victorcrimea/veredus?sort=semver)](https://github.com/victorcrimea/veredus/releases)
