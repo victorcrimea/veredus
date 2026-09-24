@@ -1,14 +1,28 @@
 name: Sidecar
 
-# Manual only: the build takes the better part of an hour, and it proves
-# that sidecar/patches still apply to 0 A.D. v0.28.0 and compile. Nothing
-# is uploaded, because an artifact on a public repo is a binary release.
+# Run by hand, it only proves that sidecar/patches still apply to 0 A.D.
+# v0.28.0 and compile: nothing is uploaded, because an artifact on a public
+# repo is a binary release. The release workflow calls it with upload set,
+# and then it also stages a relocatable sidecar tree for the archives.
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      upload:
+        type: boolean
+        default: false
 
 jobs:
-  linux-x64:
-    runs-on: ubuntu-latest
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     # Debian 12 is what upstream builds its own 0.28 Linux binaries on, so
     # the sidecar gets the same compiler and libraries as the players'
     # Linux clients.
@@ -42,7 +56,7 @@ jobs:
             python3-pip python-is-python3 libboost-filesystem-dev \
             libboost-system-dev libcurl4-gnutls-dev libenet-dev libfmt-dev \
             libfreetype-dev libgloox-dev libicu-dev libpng-dev libsdl2-dev \
-            libsodium-dev libxml2-dev zlib1g-dev zstd
+            libsodium-dev libxml2-dev zlib1g-dev zstd git-lfs patchelf
 
       # The toolchain is pinned, so one saved copy serves every later run.
       - name: Restore Rust and cbindgen
@@ -50,7 +64,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /usr/local/rust
-          key: sidecar-rust-1.76.0-cbindgen-0.29.0-debian12
+          key: sidecar-rust-1.76.0-cbindgen-0.29.0-debian12-${{ matrix.arch }}
 
       # Debian's Rust is too old for SpiderMonkey 128; these are the
       # versions upstream pins.
@@ -85,7 +99,7 @@ jobs:
             0ad/libraries/source/premake-core
             0ad/libraries/source/spidermonkey
             !0ad/libraries/source/**/*.tar.*
-          key: sidecar-libs-debian12-gcc12-${{ hashFiles('0ad/libraries/source/*/build.sh', '0ad/libraries/source/*/patches/**') }}
+          key: sidecar-libs-debian12-gcc12-${{ matrix.arch }}-${{ hashFiles('0ad/libraries/source/*/build.sh', '0ad/libraries/source/*/patches/**') }}
 
       # The library scripts are called one by one rather than through
       # build-source-libs.sh so NVTT is skipped, and SpiderMonkey runs with
@@ -115,3 +129,112 @@ jobs:
             --without-miniupnpc --without-nvtt
           make -C build/workspaces/gcc config=release -j"$(nproc)"
           ls -l binaries/system/pyrogenesis
+
+      # Only the map terrain is fetched from LFS: the rest of LFS is art,
+      # audio and fonts, which a headless engine never loads.
+      - name: Fetch map terrain
+        if: inputs.upload
+        working-directory: 0ad
+        run: |
+          git lfs install --local
+          git lfs pull --include="binaries/data/mods/public/maps/**"
+
+      # pyrogenesis looks for its data at ../data from its own directory
+      # and for its libraries in $ORIGIN, so this tree runs from wherever it
+      # is unpacked. Every library it links is bundled except the glibc
+      # core, and each gets $ORIGIN too, because the executable's RUNPATH
+      # does not apply to the dependencies of its dependencies. The media
+      # left in the clone are LFS pointer stubs; they are dropped so the
+      # tree holds no broken files.
+      - name: Stage the sidecar
+        if: inputs.upload
+        run: |
+          out="$PWD/stage/sidecar"
+          sys="$out/binaries/system"
+          mkdir -p "$sys"
+          cd 0ad
+          cp binaries/system/pyrogenesis binaries/system/libmozjs128-release.so \
+            binaries/system/libCollada.so "$sys/"
+          strip --strip-debug "$sys/pyrogenesis" "$sys/libmozjs128-release.so" \
+            "$sys/libCollada.so"
+          ldd "$sys/pyrogenesis" "$sys/libCollada.so" \
+            | awk '$2 == "=>" && $3 ~ /^\// {print $3}' | sort -u \
+            | while read -r lib; do
+                name="$(basename "$lib")"
+                case "$name" in
+                  ld-linux*|libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|libutil.so.*) continue ;;
+                esac
+                [ -e "$sys/$name" ] || cp -L "$lib" "$sys/"
+              done
+          for lib in "$sys"/*.so*; do patchelf --set-rpath '$ORIGIN' "$lib"; done
+          cp -a binaries/data "$out/binaries/data"
+          rm -rf "$out/binaries/data/tests" "$out/binaries/data/tools" \
+            "$out"/binaries/data/mods/_test.*
+          git lfs ls-files -n | grep '^binaries/data/' \
+            | grep -v '^binaries/data/mods/public/maps/' \
+            | (cd "$out" && xargs -d '\n' rm -f --)
+          cp LICENSE.md license_gpl-2.0.txt license_lgpl-2.1.txt license_mit.txt "$out/"
+          cp -r ../sidecar/COPYING ../sidecar/LICENSE ../sidecar/patches "$out/"
+          cat > "$out/SOURCE.txt" <<EOF
+          This is 0 A.D. (Pyrogenesis) built from the official v0.28.0 release,
+          https://gitea.wildfiregames.com/0ad/0ad/src/tag/v0.28.0
+          with the patches in patches/ applied. Those patches are the complete
+          set of changes. The build steps are .github/workflows/sidecar.yml in
+          ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY} at commit ${GITHUB_SHA}.
+
+          binaries/data is the same release's game data without its art, audio
+          and font files, which the headless engine does not load.
+          EOF
+
+      - name: Check that the bundle resolves its own libraries
+        if: inputs.upload
+        run: |
+          sys="$PWD/stage/sidecar/binaries/system"
+          ldd "$sys/pyrogenesis" "$sys/libCollada.so" > ldd.txt
+          if grep -q "not found" ldd.txt; then cat ldd.txt; exit 1; fi
+          outside="$(awk '$2 == "=>" && $3 ~ /^\// {print $3}' ldd.txt | sort -u \
+            | grep -v "^$sys/" | xargs -r -n1 basename \
+            | grep -vE '^(ld-linux|libc\.so|libm\.so|libdl\.so|libpthread\.so|librt\.so|libresolv\.so|libutil\.so)' || true)"
+          if [ -n "$outside" ]; then echo "Resolved outside the bundle:"; echo "$outside"; exit 1; fi
+
+      # upload-artifact drops the executable bit, so the tree travels as a
+      # tarball.
+      - name: Pack the sidecar
+        if: inputs.upload
+        run: tar -C stage -czf sidecar-linux-${{ matrix.arch }}.tar.gz sidecar
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.upload
+        with:
+          name: sidecar-linux-${{ matrix.arch }}
+          path: sidecar-linux-${{ matrix.arch }}.tar.gz
+          retention-days: 1
+
+  # The build container has every -dev package installed, so it cannot show
+  # a library the bundle forgot. A bare Debian 12 can: the dynamic loader
+  # runs before main, so reaching the missing-replay error proves it
+  # resolved everything.
+  smoke:
+    if: inputs.upload
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sidecar-linux-${{ matrix.arch }}
+
+      - name: Run the sidecar on a bare Debian 12
+        run: |
+          tar -xzf sidecar-linux-${{ matrix.arch }}.tar.gz
+          docker run --rm -v "$PWD/sidecar:/sidecar" debian:bookworm-slim \
+            /sidecar/binaries/system/pyrogenesis -replay=/nonexistent/commands.txt \
+            2>&1 | tee smoke.log
+          grep -q "does not exist" smoke.log

@@ -84,18 +84,66 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: release-${{ matrix.target }}
           path: |
             veredus-*.tar.gz
             veredus-*.zip
             veredus-*.sha256
 
-  release:
-    needs: build
+  sidecar:
+    uses: ./.github/workflows/sidecar.yml
+    with:
+      upload: true
+
+  # The sidecar is a glibc program in its own directory, so one x64 build
+  # serves both x64 server builds; Windows gets none.
+  package-sidecar:
+    needs: [build, sidecar]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x64
+          - target: x86_64-unknown-linux-gnu
+            arch: x64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
+          name: release-${{ matrix.target }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sidecar-linux-${{ matrix.arch }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          plain="veredus-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="$plain-sidecar"
+          tar xzf "$plain.tar.gz"
+          mv "$plain" "$name"
+          tar -C "$name" -xzf "sidecar-linux-${{ matrix.arch }}.tar.gz"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}-sidecar
+          path: |
+            veredus-*-sidecar.tar.gz
+            veredus-*-sidecar.tar.gz.sha256
+
+  release:
+    needs: [build, package-sidecar]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
           merge-multiple: true
 
       - name: Release
@@ -113,9 +161,15 @@ jobs:
             | `x86_64-unknown-linux-gnu` | Linux on x86_64 with glibc |
             | `x86_64-pc-windows-msvc` | Windows 10/11 and Server, 64-bit |
 
-            The optional sidecar (hosted AI, rejoin snapshots, match results)
-            is a patched 0 A.D. engine, built from source with the patches in
-            `sidecar/`. See "Building the sidecar" in the README.
+            The Linux downloads also come as `-sidecar` archives, which add a
+            ready-to-run sidecar (hosted AI, rejoin snapshots, match results):
+            0 A.D. 0.28.0 with the patches in `sidecar/`, in the `sidecar`
+            folder. Start the server with
+            `./veredus --pyrogenesis-path sidecar/binaries/system/pyrogenesis`.
+            The sidecar needs glibc 2.36 or newer (Debian 12, Ubuntu 24.04 or
+            later), also in the musl archives. There is no Windows sidecar
+            yet. Its source is `sidecar/patches` and 0 A.D.'s v0.28.0 tag, see
+            `sidecar/SOURCE.txt` in the archive.
           files: |
             veredus-*.tar.gz
             veredus-*.zip

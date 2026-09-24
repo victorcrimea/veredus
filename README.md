@@ -45,6 +45,10 @@ Get the latest build from the
 The server is a single file with nothing to install. Each download comes
 with a `.sha256` checksum if you want to verify it.
 
+Each Linux file also comes as a `-sidecar` version, for example
+`veredus-*-x86_64-unknown-linux-musl-sidecar.tar.gz`, which adds the
+[sidecar](#extra-features-with-the-sidecar) ready to run.
+
 ## Quick start
 
 1. Unpack the download and start the server.
@@ -87,9 +91,18 @@ the game engine running next to it, which we call the sidecar:
   [Restarts](#restarts).
 
 The sidecar is 0 A.D. 0.28.0 with a small set of patches, kept in this
-repository. There is no ready-made sidecar download yet, so you
-[build it from source](#building-the-sidecar) (Linux). Once it is built,
-point the server at it:
+repository. The easiest way to get it is a `-sidecar` download for Linux:
+it has the sidecar in its `sidecar` folder, next to the server. From that
+folder, start the server with:
+
+```sh
+./veredus --pyrogenesis-path sidecar/binaries/system/pyrogenesis
+```
+
+The ready-made sidecar needs a Linux with glibc 2.36 or newer, such as
+Debian 12 or Ubuntu 24.04 and later, even in the musl downloads. There is
+no Windows sidecar yet. On other systems you can
+[build it from source](#building-the-sidecar) and point the server at it:
 
 ```sh
 ./veredus --pyrogenesis-path /path/to/0ad/binaries/system/pyrogenesis
