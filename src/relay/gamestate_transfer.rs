@@ -37,6 +37,10 @@ pub enum Purpose {
     // `floor` is the last turn the source had hashed when asked: it serializes
     // only after that, so the snapshot cannot be older.
     JoinSnapshot { joiner: PeerID, floor: u32 },
+    // A snapshot pulled from a playing client for the match's save bundle,
+    // which is how a match without a sidecar can be resumed. `floor` is as
+    // for a join.
+    SaveSnapshot { floor: u32 },
     Savegame,
 }
 
@@ -88,19 +92,27 @@ impl Transfers {
         );
     }
 
+    // True while any client is serializing state for the server.
+    pub fn is_fetching(&self) -> bool {
+        !self.incoming.is_empty()
+    }
+
     pub fn purpose(&self, peer: PeerID, request_id: u32) -> Option<Purpose> {
         self.incoming.get(&(peer, request_id)).map(|rx| rx.purpose)
     }
 
     // A source may take as long as it likes overall, but not sit idle:
     // nothing on the wire would ever tell the joiner it was abandoned.
-    // Returns (source, joiner) for every join snapshot dropped here. A clock
-    // step backwards restarts the wait rather than firing early.
+    // Returns (source, joiner) for every join snapshot dropped here; a
+    // stalled save pull is just dropped. A clock step backwards restarts the
+    // wait rather than firing early.
     pub fn stalled(&mut self, now: DateTime<Utc>, limit: TimeDelta) -> Vec<(PeerID, PeerID)> {
         let mut dropped = Vec::new();
         self.incoming.retain(|(source, _), rx| {
-            let Purpose::JoinSnapshot { joiner, .. } = rx.purpose else {
-                return true;
+            let joiner = match rx.purpose {
+                Purpose::JoinSnapshot { joiner, .. } => Some(joiner),
+                Purpose::SaveSnapshot { .. } => None,
+                Purpose::Savegame => return true,
             };
             let since = *rx.last_progress.get_or_insert(now);
             let idle = now - since;
@@ -111,7 +123,9 @@ impl Transfers {
             if idle < limit {
                 return true;
             }
-            dropped.push((*source, joiner));
+            if let Some(joiner) = joiner {
+                dropped.push((*source, joiner));
+            }
             false
         });
         dropped

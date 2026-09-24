@@ -15,6 +15,7 @@ use crate::savegame::SaveSetup;
 use crate::savegame::SlotsSnapshot;
 use crate::savegame::Status;
 use crate::savegame::bundle;
+use crate::savegame::bundle::ClientStateMeta;
 use crate::savegame::bundle::FORMAT_VERSION;
 use crate::savegame::bundle::Lock;
 use crate::savegame::bundle::Manifest;
@@ -153,6 +154,9 @@ impl Writer {
             SaveItem::Hash { turn, hash } => self.append(&Record::Hash { turn, hash }),
             SaveItem::Slots(slots) => self.write_slots(slots),
             SaveItem::Checkpoint { turn, state } => self.write_state(turn, &state),
+            SaveItem::ClientState { first, last, state } => {
+                self.write_client_state(first, last, &state)
+            }
             SaveItem::Status { now, status } => self.set_status(now, status),
         }
     }
@@ -271,6 +275,19 @@ impl Writer {
         let meta = StateMeta::of(turn, state);
         if let Err(error) = bundle::write_json(&self.dir.join(bundle::STATE_META), &meta) {
             self.fail("cannot write the checkpoint turn", error);
+        }
+    }
+
+    fn write_client_state(&mut self, first: u32, last: u32, state: &[u8]) {
+        if self.manifest.is_none() {
+            return;
+        }
+        if let Err(error) = bundle::write_atomic(&self.dir.join(bundle::CLIENT_STATE), state) {
+            return self.fail("cannot write the client state", error);
+        }
+        let meta = ClientStateMeta::of(first, last, state);
+        if let Err(error) = bundle::write_json(&self.dir.join(bundle::CLIENT_STATE_META), &meta) {
+            self.fail("cannot write the client state turns", error);
         }
     }
 

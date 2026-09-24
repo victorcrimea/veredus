@@ -117,6 +117,11 @@ fn clone_effect(effect: &Effect) -> Effect {
         },
         Effect::SaveSlots(slots) => Effect::SaveSlots(slots.clone()),
         Effect::SaveStatus(status) => Effect::SaveStatus(*status),
+        Effect::SaveClientState { first, last, state } => Effect::SaveClientState {
+            first: *first,
+            last: *last,
+            state: state.clone(),
+        },
     }
 }
 

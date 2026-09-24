@@ -251,3 +251,39 @@ fn scan_finds_running_and_stopped_only() {
     assert!(scan(&setup.root.join("missing")).is_empty());
     std::fs::remove_dir_all(&setup.root).unwrap();
 }
+
+#[test]
+fn without_a_sidecar_a_saved_client_state_is_enough() {
+    let setup = setup();
+    let dir = stopped_match(&setup, Vec::new());
+    let mut no_sidecar = expect();
+    no_sidecar.sidecar = false;
+    assert!(matches!(load(&dir, &no_sidecar), Err(Skip::NoSidecar)));
+
+    write(
+        &setup,
+        None,
+        vec![
+            SaveItem::Started {
+                now: DateTime::UNIX_EPOCH,
+                settings: b"{}".to_vec(),
+                ai_settings: None,
+                ai_players: Vec::new(),
+            },
+            SaveItem::ClientState {
+                first: 3,
+                last: 5,
+                state: Arc::new(vec![8, 8]),
+            },
+        ],
+    );
+    let resumable = load(&dir, &no_sidecar).expect("resumable from the client state");
+    let seed = resumable.data.seed.clone().expect("seed");
+    assert_eq!(seed.turns, 3..=5);
+    assert_eq!(*seed.state, vec![8, 8]);
+    drop(resumable);
+
+    std::fs::write(dir.join(bundle::CLIENT_STATE), [1]).unwrap();
+    assert!(matches!(load(&dir, &no_sidecar), Err(Skip::NoSidecar)));
+    std::fs::remove_dir_all(&setup.root).unwrap();
+}

@@ -85,6 +85,7 @@ use crate::savegame::SavedPlayer;
 use crate::savegame::SlotsSnapshot;
 use crate::savegame::Status;
 use crate::savegame::resume::ResumeData;
+use crate::savegame::resume::Seed;
 use crate::sidecar::BaseState;
 use crate::sidecar::DumpRequest;
 
@@ -272,6 +273,13 @@ pub enum Effect {
     // who may take one back.
     SaveSlots(SlotsSnapshot),
     SaveStatus(Status),
+    // A state serialized by a playing client, somewhere in `first..=last`,
+    // which is what a match without a sidecar is resumed from.
+    SaveClientState {
+        first: u32,
+        last: u32,
+        state: Arc<Vec<u8>>,
+    },
 }
 
 // Values travel as the ENet disconnect `data` word; only the number reaches the client.
@@ -444,6 +452,12 @@ pub struct Config {
     // How long only the saved controller may restart a resumed match; after
     // that any original player may.
     pub resume_controller_grace: TimeDelta,
+    // Without a sidecar nothing can rebuild a saved match's state, so every
+    // this many released turns one playing client is asked for it. It
+    // freezes that client, and with it the match, while it serializes. 0
+    // turns it off; matches with AI players never do it, since their
+    // clients' state is not all a resumed match needs.
+    pub client_state_interval_turns: u32,
 }
 
 impl Default for Config {
@@ -496,6 +510,7 @@ impl Default for Config {
             saving: false,
             resume_wait: Some(TimeDelta::minutes(15)),
             resume_controller_grace: TimeDelta::minutes(5),
+            client_state_interval_turns: 0,
         }
     }
 }
@@ -612,8 +627,19 @@ pub(crate) struct Context {
     // The slot table as last saved. None until the match starts saving, so
     // no snapshot is taken of a table that is not a match yet.
     saved_slots: Option<SlotsSnapshot>,
+    // Present while this match pulls client states for its save.
+    client_pull: Option<ClientPull>,
     counters: Counters,
     effects: Vec<Effect>,
+}
+
+struct ClientPull {
+    interval: u32,
+    // The ready turn when the last pull was asked for.
+    last: u32,
+    // Whether the bundle holds a client state yet, which is what makes the
+    // match resumable without a sidecar.
+    saved: bool,
 }
 
 struct AiHost {
@@ -692,6 +718,10 @@ pub(crate) enum TransferDone {
         joiner: PeerID,
         floor: u32,
         snapshot: Arc<Vec<u8>>,
+    },
+    SaveSnapshot {
+        floor: u32,
+        state: Arc<Vec<u8>>,
     },
     Savegame(Vec<u8>),
 }
@@ -1156,6 +1186,23 @@ impl Context {
         }
     }
 
+    // Only a match with no AI player and no sidecar pulls client states:
+    // with a sidecar the checkpoints are better, and an AI's own memory is
+    // not in a stock client's state.
+    fn client_pull_for(&self, settings: &FrozenSettings, from: u32) -> Option<ClientPull> {
+        let interval = self.config.client_state_interval_turns;
+        let eligible = self.config.saving
+            && interval != 0
+            && !self.config.sidecar_dumps
+            && settings.ai_json.is_none()
+            && !has_ai_players(&settings.json);
+        eligible.then_some(ClientPull {
+            interval,
+            last: from,
+            saved: false,
+        })
+    }
+
     // Only once the match is saving, and only when something changed.
     fn save_slots(&mut self) {
         let Some(previous) = self.saved_slots.as_ref() else {
@@ -1240,6 +1287,9 @@ pub struct Resuming {
     announced: HashSet<String>,
     // Set once GameOver is pushed, so a second reason cannot push it again.
     abandoned: bool,
+    // Without a sidecar, the client state every returning client loads
+    // instead, and the turns it can be at.
+    seed: Option<Seed>,
 }
 
 // Setup handlers stay available while a savegame is being fetched.
@@ -1259,6 +1309,10 @@ pub trait PhaseMarker {
     }
     // Who the controller role goes back to, in a match rebuilt from its save.
     fn saved_controller(&self) -> Option<&SavedIdentity> {
+        None
+    }
+    // The saved client state a match rebuilt without a sidecar serves.
+    fn resume_seed(&self) -> Option<&Seed> {
         None
     }
 }
@@ -1296,6 +1350,9 @@ impl PhaseMarker for Resuming {
     }
     fn saved_controller(&self) -> Option<&SavedIdentity> {
         self.controller.as_ref()
+    }
+    fn resume_seed(&self) -> Option<&Seed> {
+        self.seed.as_ref()
     }
 }
 
@@ -1553,10 +1610,12 @@ impl<S> Server<S> {
 
     // The match is marked stopped before anyone is dropped, so the players
     // are only promised a restart that a later start can actually resume.
-    // Without a sidecar nothing can rebuild the state, so the line stays the
-    // plain one.
+    // Without a sidecar or a client state nothing can rebuild the state, so
+    // the line stays the plain one.
     fn stop_saved(mut self, reason: &str) -> Vec<Effect> {
-        if self.ctx.config.sidecar_dumps {
+        let resumable =
+            self.ctx.config.sidecar_dumps || self.ctx.client_pull.as_ref().is_some_and(|p| p.saved);
+        if resumable {
             let text = format!(
                 "Server is restarting. This match is saved at turn {} and will continue: reconnect in a minute.",
                 self.ctx.turns.ready_turn()
@@ -2446,6 +2505,15 @@ impl<S: PhaseMarker> Server<S> {
             self.ctx.checkpoints.waiting.push(joiner);
             return;
         }
+        // The replay stream then brings the joiner from wherever in its
+        // range the state is up to the stopped turn.
+        if let Some(seed) = self.st.resume_seed() {
+            let state = seed.state.clone();
+            let turns = seed.turns.clone();
+            self.ctx.counters.join_from_client += 1;
+            self.deliver_snapshot(joiner, state, turns);
+            return;
+        }
         let newest_usable = if joiner_delayed {
             self.ctx.feed.head()
         } else {
@@ -2761,6 +2829,20 @@ impl<S: PhaseMarker> Server<S> {
             self.refuse_unservable_join(joiner, msg.length as usize);
             return Ok(());
         }
+        // A save pull that cannot complete is dropped, so it does not block
+        // the next one until the stall limit.
+        if !gamestate_transfer::fits(msg.length as usize)
+            && let Some(Purpose::SaveSnapshot { .. }) =
+                self.ctx.transfers.purpose(peer, msg.request_id)
+        {
+            tracing::info!(
+                ?peer,
+                length = msg.length,
+                "save: client state cannot be pulled, skipped"
+            );
+            self.ctx.transfers.abandon(peer, msg.request_id);
+            return Ok(());
+        }
         self.ctx
             .transfers
             .on_response(peer, msg.request_id, msg.length)
@@ -2801,6 +2883,12 @@ impl<S: PhaseMarker> Server<S> {
                     joiner,
                     floor,
                     snapshot: Arc::new(bytes),
+                }))
+            }
+            Some((Purpose::SaveSnapshot { floor }, bytes)) => {
+                Ok(Some(TransferDone::SaveSnapshot {
+                    floor,
+                    state: Arc::new(bytes),
                 }))
             }
             Some((Purpose::Savegame, bytes)) => Ok(Some(TransferDone::Savegame(bytes))),
@@ -3010,6 +3098,7 @@ impl Server<Idle> {
                 ai_host: None,
                 lobby_map: None,
                 saved_slots: None,
+                client_pull: None,
                 counters: Counters::default(),
                 effects: Vec::new(),
             },
@@ -3037,6 +3126,7 @@ impl Server<Idle> {
             last_hint: None,
             announced: HashSet::new(),
             abandoned: false,
+            seed: None,
         });
         let ctx = &mut server.ctx;
         for saved in data.turns {
@@ -3058,6 +3148,14 @@ impl Server<Idle> {
         if ctx.config.saving {
             ctx.saved_slots = Some(slots);
         }
+        let mut pull = ctx.client_pull_for(&server.st.settings, turn);
+        if !ctx.config.sidecar_dumps {
+            server.st.seed = data.seed;
+            if let Some(pull) = pull.as_mut() {
+                pull.saved = server.st.seed.is_some();
+            }
+        }
+        ctx.client_pull = pull;
         tracing::info!(turn, "resuming a saved match");
         server.start_restore(data.base);
         server
@@ -3324,6 +3422,9 @@ impl Server<Loading> {
             self.ctx.saved_slots = Some(SlotsSnapshot::default());
             self.ctx.save_slots();
         }
+        self.ctx.client_pull = self
+            .ctx
+            .client_pull_for(&self.st.settings, INITIAL_READY_TURN);
         let settings = self.st.settings;
         Server {
             ctx: self.ctx,
@@ -3518,7 +3619,61 @@ impl Server<InGame> {
             return self.end_match(None).into();
         }
         self.maybe_checkpoint();
+        self.maybe_pull_client_state();
         self.into()
+    }
+
+    // Serializing freezes the source, and with it the whole match, so a pull
+    // waits for a moment nobody is paused and no other client is already
+    // serializing. The interval restarts even when no source is found, so a
+    // match with nobody to ask does not try on every input.
+    fn maybe_pull_client_state(&mut self) {
+        let turn = self.ctx.turns.ready_turn();
+        let Some(pull) = self.ctx.client_pull.as_ref() else {
+            return;
+        };
+        if turn < pull.last.saturating_add(pull.interval)
+            || self.ctx.transfers.is_fetching()
+            || self.ctx.pause_budget.auto_paused()
+            || self.ctx.pause_budget.pausing().next().is_some()
+        {
+            return;
+        }
+        let source = self
+            .ctx
+            .sessions
+            .iter()
+            .filter(|(p, s)| {
+                s.is_in_game()
+                    && !self.ctx.turns.is_delayed(**p)
+                    && !self.ctx.turns.is_out_of_sync(**p)
+                    && !self.ctx.is_ai_host(**p)
+                    && s.uuid
+                        .as_ref()
+                        .and_then(|u| self.ctx.slots.slot_of(u))
+                        .is_some_and(|slot| slot != UNASSIGNED)
+            })
+            .min_by_key(|(_, s)| s.mean_rtt)
+            .map(|(p, _)| *p);
+        if let Some(pull) = self.ctx.client_pull.as_mut() {
+            pull.last = turn;
+        }
+        let Some(source) = source else {
+            return;
+        };
+        let floor = self.ctx.turns.simulated_turn(source).unwrap_or(0);
+        let request_id = self.ctx.transfers.allocate();
+        self.ctx
+            .transfers
+            .expect(source, request_id, Purpose::SaveSnapshot { floor });
+        tracing::debug!(?source, turn, "save: pulling a client state");
+        self.ctx.send(
+            source,
+            WireMessage::GamestateRequest(GamestateRequest {
+                request_type: KIND_RUNNING_GAME,
+                request_id,
+            }),
+        );
     }
 
     // Certain without simulating: a resign is a defeat, and after a defeat
@@ -3689,11 +3844,31 @@ impl<S: MatchPhase> Server<S> {
 
     // A completed snapshot is what unblocks the joiner that asked for it.
     fn on_snapshot_chunk(&mut self, peer: PeerID, msg: GamestateChunk) -> Result<(), PeerFault> {
+        let done = self.on_gamestate_chunk(peer, msg)?;
+        // The source cannot have run past the ready turn, and the journal
+        // already holds every turn up to it.
+        if let Some(TransferDone::SaveSnapshot { floor, state }) = &done {
+            let last = self.ctx.turns.ready_turn();
+            tracing::info!(
+                first = floor,
+                last,
+                bytes = state.len(),
+                "save: client state pulled"
+            );
+            if let Some(pull) = self.ctx.client_pull.as_mut() {
+                pull.saved = true;
+            }
+            self.ctx.effects.push(Effect::SaveClientState {
+                first: *floor,
+                last,
+                state: state.clone(),
+            });
+        }
         if let Some(TransferDone::JoinSnapshot {
             joiner,
             floor,
             snapshot,
-        }) = self.on_gamestate_chunk(peer, msg)?
+        }) = done
         {
             // The snapshot cannot be past the last turn its source was
             // sealed, so a delayed joiner waits until the feed reaches that
@@ -4447,6 +4622,24 @@ fn frozen_settings(json: &[u8], turn_length_ms: u16) -> FrozenSettings {
         ai_json: None,
         ai_players: Vec::new(),
     }
+}
+
+// Unreadable settings count as having AI, which only ever skips a pull.
+fn has_ai_players(json: &[u8]) -> bool {
+    let Ok(attribs) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return true;
+    };
+    attribs
+        .get("settings")
+        .and_then(|s| s.get("PlayerData"))
+        .and_then(|pd| pd.as_array())
+        .is_some_and(|pd| {
+            pd.iter().any(|p| {
+                p.get("AI")
+                    .and_then(|ai| ai.as_str())
+                    .is_some_and(|ai| !ai.is_empty())
+            })
+        })
 }
 
 fn is_resume_command(message: &str) -> bool {

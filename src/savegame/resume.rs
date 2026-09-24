@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use crate::relay::turn::INITIAL_READY_TURN;
 use crate::savegame::SlotsSnapshot;
 use crate::savegame::Status;
 use crate::savegame::bundle;
+use crate::savegame::bundle::ClientStateMeta;
 use crate::savegame::bundle::FORMAT_VERSION;
 use crate::savegame::bundle::Lock;
 use crate::savegame::bundle::Manifest;
@@ -31,6 +33,14 @@ pub struct SavedTurn {
     pub commands: Vec<PlayerCommand>,
 }
 
+// A client state a match without a sidecar is resumed from, and the turns
+// it can be at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Seed {
+    pub turns: RangeInclusive<u32>,
+    pub state: Arc<Vec<u8>>,
+}
+
 // Everything the FSM needs to rebuild a saved match. Plain data: reading it
 // is IO, and that happens here, before the game thread exists (A2).
 #[derive(Debug, Clone)]
@@ -44,6 +54,8 @@ pub struct ResumeData {
     pub slots: SlotsSnapshot,
     // The newest checkpoint, when one was stored and still matches its turn.
     pub base: Option<BaseState>,
+    // The newest client state, for a server without a sidecar.
+    pub seed: Option<Seed>,
 }
 
 impl ResumeData {
@@ -121,7 +133,7 @@ pub enum Skip {
     Locked,
     #[error("incompatible: {0}")]
     Incompatible(String),
-    #[error("no sidecar to rebuild its state")]
+    #[error("no sidecar to rebuild its state, and no client state saved")]
     NoSidecar,
     #[error("given up after {0} resume attempts, marked abandoned")]
     Abandoned(u32),
@@ -171,7 +183,8 @@ pub fn load(dir: &Path, expect: &Expect) -> Result<Resumable, Skip> {
         .map_err(|e| Skip::Unreadable(e.to_string()))?
         .ok_or(Skip::Locked)?;
     check_compatible(&manifest, expect)?;
-    if !expect.sidecar {
+    let seed = read_client_state(dir);
+    if !expect.sidecar && seed.is_none() {
         return Err(Skip::NoSidecar);
     }
 
@@ -205,6 +218,7 @@ pub fn load(dir: &Path, expect: &Expect) -> Result<Resumable, Skip> {
         hashes,
         slots,
         base,
+        seed,
     };
     Ok(Resumable {
         game_id: manifest.game_id.clone(),
@@ -300,6 +314,19 @@ fn read_state(dir: &Path) -> Option<BaseState> {
     }
     Some(BaseState {
         turn: meta.turn,
+        state: Arc::new(state),
+    })
+}
+
+fn read_client_state(dir: &Path) -> Option<Seed> {
+    let state = std::fs::read(dir.join(bundle::CLIENT_STATE)).ok()?;
+    let meta: ClientStateMeta = bundle::read_json(&dir.join(bundle::CLIENT_STATE_META)).ok()?;
+    if !meta.matches(&state) || meta.first > meta.last {
+        tracing::warn!(dir = %dir.display(), "save: client state does not match its turns, not used");
+        return None;
+    }
+    Some(Seed {
+        turns: meta.first..=meta.last,
         state: Arc::new(state),
     })
 }

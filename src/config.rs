@@ -239,6 +239,9 @@ pub struct GameSection {
     pub auth_fail_interval_secs: u64,
     pub resume_wait_secs: u64,
     pub resume_controller_grace_secs: u64,
+    // Without a sidecar, how often one playing client is asked for the
+    // match state so the match can be resumed; 0 turns it off.
+    pub client_state_interval_secs: u64,
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
     pub enabled_mods: Vec<ModEntry>,
@@ -298,6 +301,7 @@ impl Default for GameSection {
                 .map_or(0, |d| d.num_seconds().max(0) as u64),
             resume_controller_grace_secs: config.resume_controller_grace.num_seconds().max(0)
                 as u64,
+            client_state_interval_secs: 0,
             buddies,
             enabled_mods: config
                 .enabled_mods
@@ -364,6 +368,11 @@ impl GameSection {
                 .then(|| secs_to_delta(self.auth_fail_interval_secs)),
             resume_wait: (self.resume_wait_secs != 0).then(|| secs_to_delta(self.resume_wait_secs)),
             resume_controller_grace: secs_to_delta(self.resume_controller_grace_secs),
+            client_state_interval_turns: client_state_interval_turns(
+                sidecar,
+                self.client_state_interval_secs,
+                self.turn_length_ms,
+            ),
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
             checkpoint_interval_turns,
@@ -563,6 +572,16 @@ impl FileConfig {
             .and_then(|()| file.write_all(body.as_bytes()))
             .map_err(|error| format!("failed to write '{}': {error}", path.display()))
     }
+}
+
+// Operators think in time, the match counts in turns. At least one turn, so
+// a short interval never means "every input". A sidecar makes it moot.
+fn client_state_interval_turns(sidecar: bool, secs: u64, turn_length_ms: u16) -> u32 {
+    if sidecar || secs == 0 || turn_length_ms == 0 {
+        return 0;
+    }
+    let turns = secs.saturating_mul(1000) / u64::from(turn_length_ms);
+    u32::try_from(turns).unwrap_or(u32::MAX).max(1)
 }
 
 fn non_empty_path(value: &Path) -> Option<PathBuf> {

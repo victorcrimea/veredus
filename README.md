@@ -119,7 +119,10 @@ time it starts, on the same port:
    five minutes, any returning player can.
 
 This needs the sidecar, and for now it works only outside the lobby and
-without AI opponents. To start fresh instead, run with `--no-resume`.
+without AI opponents. Without the sidecar, set
+`[game] client_state_interval_secs` (for example 300). Every so often the
+server then asks one player's game for a copy of the match, which pauses the
+game for a moment. To start fresh instead, run with `--no-resume`.
 
 ## Hosting in the multiplayer lobby
 

@@ -680,6 +680,10 @@ fn drain(
                 forward_save(save, SaveItem::Slots(slots));
                 continue;
             }
+            Effect::SaveClientState { first, last, state } => {
+                forward_save(save, SaveItem::ClientState { first, last, state });
+                continue;
+            }
             Effect::SaveStatus(status) => {
                 forward_save(
                     save,

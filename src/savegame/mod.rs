@@ -85,6 +85,11 @@ pub enum SaveItem {
         turn: u32,
         state: Arc<Vec<u8>>,
     },
+    ClientState {
+        first: u32,
+        last: u32,
+        state: Arc<Vec<u8>>,
+    },
     Status {
         now: DateTime<Utc>,
         status: Status,

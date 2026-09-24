@@ -74,3 +74,11 @@ fn generated_config_carries_the_flood_defaults() {
     assert_eq!(game.pause_min_charge, defaults.pause_min_charge);
     assert_eq!(game.flood_kick_multiple, defaults.flood_kick_multiple);
 }
+
+#[test]
+fn client_state_interval_is_counted_in_turns() {
+    assert_eq!(client_state_interval_turns(false, 300, 200), 1500);
+    assert_eq!(client_state_interval_turns(false, 0, 200), 0);
+    assert_eq!(client_state_interval_turns(true, 300, 200), 0);
+    assert_eq!(client_state_interval_turns(false, 1, 5000), 1);
+}
