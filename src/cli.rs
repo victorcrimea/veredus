@@ -59,6 +59,10 @@ struct Args {
     /// Port of the Prometheus /metrics endpoint; 0 disables it [default: 9091]
     #[arg(long)]
     metrics_port: Option<u16>,
+    /// Directory every running match is saved to, so it survives a restart;
+    /// an empty value turns saving off [default: saves]
+    #[arg(long)]
+    save_dir: Option<PathBuf>,
 }
 
 pub enum Command {
@@ -106,6 +110,9 @@ pub fn parse_args() -> Result<Command, String> {
     }
     if let Some(port) = args.metrics_port {
         config.server.metrics_port = port;
+    }
+    if let Some(path) = args.save_dir {
+        config.server.save_dir = path;
     }
 
     config.validate()?;

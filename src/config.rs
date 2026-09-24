@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::TimeDelta;
 use serde::Deserialize;
@@ -19,6 +20,7 @@ use crate::relay::enet_task::EnetLimits;
 use crate::relay::enet_task::PEER_LIMIT;
 use crate::relay::messages::EnabledMod;
 use crate::relay::server_fsm::Config;
+use crate::savegame::SaveSetup;
 
 // 0x5073, the port stock clients dial unless they are told otherwise.
 const DEFAULT_PORT: u16 = 20595;
@@ -41,6 +43,11 @@ const DEFAULT_ENET_MAX_PACKET_BYTES: usize = u16::MAX as usize;
 // reassembled or undelivered packets: a few maximum-size messages, which is
 // more than a stock client ever has in flight.
 const DEFAULT_ENET_MAX_WAITING_BYTES: usize = 256 * 1024;
+// Relative to the working directory, so a checkout saves next to itself.
+const DEFAULT_SAVE_DIR: &str = "saves";
+// A crash loses at most this much of a match, and the disk sees one fsync
+// per game this often.
+const DEFAULT_SAVE_FLUSH_MS: u64 = 1000;
 
 // One engine per core: a replay is CPU-bound, so running more at once than
 // there are cores only makes each one finish later. Read from the machine, which means a
@@ -90,6 +97,12 @@ pub struct ServerSection {
     // How many one-shot engine runs (dumps, checkpoints, outcome replays) the
     // whole process may have going at once; the rest queue. 0 lifts the cap.
     pub max_sidecar_runs: usize,
+    // Where every running match keeps its save bundle; empty turns saving
+    // off.
+    pub save_dir: PathBuf,
+    pub save_flush_ms: u64,
+    // Keep a decided match's bundle instead of deleting it.
+    pub keep_finished_saves: bool,
 }
 
 impl Default for ServerSection {
@@ -106,6 +119,9 @@ impl Default for ServerSection {
             enet_max_packet_bytes: DEFAULT_ENET_MAX_PACKET_BYTES,
             enet_max_waiting_bytes: DEFAULT_ENET_MAX_WAITING_BYTES,
             max_sidecar_runs: default_max_sidecar_runs(),
+            save_dir: PathBuf::from(DEFAULT_SAVE_DIR),
+            save_flush_ms: DEFAULT_SAVE_FLUSH_MS,
+            keep_finished_saves: false,
         }
     }
 }
@@ -117,6 +133,21 @@ impl ServerSection {
 
     pub fn outcome_dir(&self) -> Option<PathBuf> {
         non_empty_path(&self.outcome_dir)
+    }
+
+    pub fn save_dir(&self) -> Option<PathBuf> {
+        non_empty_path(&self.save_dir)
+    }
+
+    // None when saving is off. `lobby_account` names the account hosting
+    // the game, empty in standalone mode.
+    pub fn save_setup(&self, lobby_account: &str) -> Option<SaveSetup> {
+        Some(SaveSetup {
+            root: self.save_dir()?,
+            flush_interval: Duration::from_millis(self.save_flush_ms.max(1)),
+            keep_finished: self.keep_finished_saves,
+            lobby_account: lobby_account.to_string(),
+        })
     }
 
     pub fn enet_limits(&self) -> EnetLimits {

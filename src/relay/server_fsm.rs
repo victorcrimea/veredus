@@ -80,6 +80,10 @@ use crate::relay::slots::UNASSIGNED;
 use crate::relay::turn::INITIAL_READY_TURN;
 use crate::relay::turn::MatchLog;
 use crate::relay::turn::TurnManager;
+use crate::savegame::SavedIdentity;
+use crate::savegame::SavedPlayer;
+use crate::savegame::SlotsSnapshot;
+use crate::savegame::Status;
 use crate::sidecar::BaseState;
 use crate::sidecar::DumpRequest;
 
@@ -237,6 +241,29 @@ pub enum Effect {
     PasswordRejected {
         peer: PeerID,
     },
+    // The match has started, so its save bundle begins with the settings
+    // every joiner is sent and, with hosted AI, the AI host's own copy.
+    SaveStarted {
+        settings: Vec<u8>,
+        ai_settings: Option<Vec<u8>>,
+        ai_players: Vec<i32>,
+    },
+    // A turn was released, and with it every command it will ever carry.
+    SaveTurn {
+        turn: u32,
+        length: u16,
+        commands: Vec<PlayerCommand>,
+    },
+    // The players agreed on a turn's hash, which a resumed match checks its
+    // rebuilt state against.
+    SaveHash {
+        turn: u32,
+        hash: Vec<u8>,
+    },
+    // Who holds which slot changed, as a resumed match needs it to decide
+    // who may take one back.
+    SaveSlots(SlotsSnapshot),
+    SaveStatus(Status),
 }
 
 // Values travel as the ENet disconnect `data` word; only the number reaches the client.
@@ -399,6 +426,10 @@ pub struct Config {
     pub auth_fail_burst: u32,
     pub auth_fail_burst_per_addr: u32,
     pub auth_fail_interval: Option<TimeDelta>,
+    // When set, a running match is saved as it goes, so a restarted server
+    // can resume it. The IO side owns the files; this flag is what the FSM
+    // gates its save effects on.
+    pub saving: bool,
 }
 
 impl Default for Config {
@@ -448,6 +479,7 @@ impl Default for Config {
             auth_fail_burst: 3,
             auth_fail_burst_per_addr: 10,
             auth_fail_interval: Some(TimeDelta::minutes(5)),
+            saving: false,
         }
     }
 }
@@ -463,6 +495,12 @@ pub struct FrozenSettings {
     // With no victory condition the engine never declares anyone the
     // winner, so running out of opponents does not end the match.
     pub endless: bool,
+    // The AI host's copy of the settings, which keeps the AI slots every
+    // stock client's copy has stripped, and the player ids it plays. Kept
+    // for the whole match because a saved match needs it to bring the AI
+    // host back.
+    pub ai_json: Option<Vec<u8>>,
+    pub ai_players: Vec<i32>,
 }
 
 // The server-wide phase, as the authentication rules see it. It is derived
@@ -553,6 +591,9 @@ pub(crate) struct Context {
     // (Sec. 17.3). None until the controller has sent one; a decode failure
     // keeps whatever was last decoded rather than clearing it.
     lobby_map: Option<LobbyMap>,
+    // The slot table as last saved. None until the match starts saving, so
+    // no snapshot is taken of a table that is not a match yet.
+    saved_slots: Option<SlotsSnapshot>,
     counters: Counters,
     effects: Vec<Effect>,
 }
@@ -691,6 +732,7 @@ impl Context {
         });
         let msg = WireMessage::PlayerSlots(slots);
         self.broadcast(&msg, |s| s.is_setup() || s.is_syncing() || s.is_in_game());
+        self.save_slots();
     }
 
     // Sec. 17.3: nbp/players are the connected player slots, not sessions;
@@ -941,6 +983,13 @@ impl Context {
         let released = self.turns.release(self.config.observer_lag_limit);
         for turn in released {
             self.log.record_turn_length(turn, turn_length_ms);
+            if self.config.saving {
+                self.effects.push(Effect::SaveTurn {
+                    turn,
+                    length: turn_length_ms,
+                    commands: self.log.commands_for(turn).to_vec(),
+                });
+            }
             let msg = WireMessage::TurnSealed(TurnSealed {
                 turn,
                 turn_length: turn_length_ms,
@@ -1009,6 +1058,94 @@ impl Context {
                 self.broadcast(&msg, |s| s.is_in_game());
             }
         }
+    }
+
+    // Drained even with saving off, so the turn manager never holds on to
+    // them.
+    fn save_settled_hashes(&mut self) {
+        for (turn, hash) in self.turns.take_settled() {
+            if self.config.saving {
+                self.effects.push(Effect::SaveHash { turn, hash });
+            }
+        }
+    }
+
+    // The table as a resumed match needs it. A player who has left keeps the
+    // lobby name last seen for it, and the controller is remembered after it
+    // leaves: the match may be resumed while nobody holds the role.
+    fn slots_snapshot(&self, previous: &SlotsSnapshot) -> SlotsSnapshot {
+        let lobby_name = |uuid: &Guid| {
+            self.sessions
+                .values()
+                .find(|s| s.uuid.as_ref() == Some(uuid))
+                .and_then(|s| s.lobby_name.clone())
+                .or_else(|| {
+                    previous
+                        .players
+                        .iter()
+                        .find(|p| p.uuid == uuid.0)
+                        .map(|p| p.lobby_name.clone())
+                })
+                .unwrap_or_default()
+        };
+        let mut players: Vec<SavedPlayer> = self
+            .slots
+            .entries()
+            .filter(|e| e.slot != UNASSIGNED)
+            .map(|e| SavedPlayer {
+                player_id: i32::from(e.slot),
+                uuid: e.uuid.0.clone(),
+                name: e.name.clone(),
+                lobby_name: lobby_name(&e.uuid),
+            })
+            .collect();
+        players.sort_by(|a, b| (a.player_id, &a.uuid).cmp(&(b.player_id, &b.uuid)));
+        let mut observers: Vec<String> = self
+            .slots
+            .entries()
+            .filter(|e| e.slot == UNASSIGNED && !self.is_ai_host_uuid(&e.uuid))
+            .map(|e| e.name.clone())
+            .collect();
+        observers.sort();
+        observers.dedup();
+        let controller = self
+            .controller
+            .as_ref()
+            .and_then(|uuid| {
+                let name = self.slots.name_of(uuid)?.to_string();
+                Some(SavedIdentity {
+                    name,
+                    lobby_name: lobby_name(uuid),
+                })
+            })
+            .or_else(|| previous.controller.clone());
+        let mut banned_names: Vec<String> = self.banned_names.iter().cloned().collect();
+        banned_names.sort();
+        let mut resigned: Vec<i32> = self.resigned.iter().copied().collect();
+        resigned.sort_unstable();
+        let mut forfeited: Vec<String> = self.forfeited.iter().map(|g| g.0.clone()).collect();
+        forfeited.sort();
+        SlotsSnapshot {
+            players,
+            observers,
+            controller,
+            banned_names,
+            resigned,
+            forfeited,
+        }
+    }
+
+    // Only once the match is saving, and only when something changed.
+    fn save_slots(&mut self) {
+        let Some(previous) = self.saved_slots.as_ref() else {
+            return;
+        };
+        let snapshot = self.slots_snapshot(previous);
+        if &snapshot == previous {
+            return;
+        }
+        self.saved_slots = Some(snapshot.clone());
+        self.effects.push(Effect::SaveSlots(snapshot));
     }
 }
 
@@ -1291,6 +1428,25 @@ impl AnyServer {
         }
     }
 
+    // True when a stop keeps the match for a restart instead of ending it:
+    // only a running match is worth resuming.
+    pub fn saved_on_stop(&self) -> bool {
+        self.ctx().config.saving && matches!(self, AnyServer::InGame(_))
+    }
+
+    // The operator's stop, as opposed to the game ending on its own. A
+    // running match is saved and the players are told it will continue.
+    pub fn stop(self) -> Vec<Effect> {
+        const REASON: &str = "the server is closing this game";
+        if !self.saved_on_stop() {
+            return self.shutdown(REASON);
+        }
+        match self {
+            AnyServer::InGame(s) => s.stop_saved(REASON),
+            other => other.shutdown(REASON),
+        }
+    }
+
     pub fn shutdown(self, reason: &str) -> Vec<Effect> {
         match self {
             AnyServer::Idle(s) => s.shutdown(reason),
@@ -1318,6 +1474,29 @@ impl<S> Server<S> {
     pub fn shutdown(mut self, reason: &str) -> Vec<Effect> {
         self.ctx
             .server_chat(None, &format!("Server shutdown: {reason}"));
+        self.disconnect_everyone()
+    }
+
+    // The match is marked stopped before anyone is dropped, so the players
+    // are only promised a restart that a later start can actually resume.
+    // Without a sidecar nothing can rebuild the state, so the line stays the
+    // plain one.
+    fn stop_saved(mut self, reason: &str) -> Vec<Effect> {
+        if self.ctx.config.sidecar_dumps {
+            let text = format!(
+                "Server is restarting. This match is saved at turn {} and will continue: reconnect in a minute.",
+                self.ctx.turns.ready_turn()
+            );
+            self.ctx.server_chat(None, &text);
+        } else {
+            self.ctx
+                .server_chat(None, &format!("Server shutdown: {reason}"));
+        }
+        self.ctx.effects.push(Effect::SaveStatus(Status::Stopped));
+        self.disconnect_everyone()
+    }
+
+    fn disconnect_everyone(mut self) -> Vec<Effect> {
         let peers: Vec<PeerID> = self.ctx.sessions.keys().copied().collect();
         for peer in peers {
             self.ctx.effects.push(Effect::DisconnectNow {
@@ -1505,6 +1684,7 @@ impl<S: PhaseMarker> Server<S> {
         for mismatch in self.ctx.turns.recheck_pending() {
             self.ctx.report_mismatch(mismatch);
         }
+        self.ctx.save_settled_hashes();
     }
 
     fn on_lobby_auth(&mut self, username: String, token: String) {
@@ -1546,6 +1726,11 @@ impl<S: PhaseMarker> Server<S> {
         }
 
         if self.idle_shutdown_due(now) {
+            // Everyone gave up on it, so it ends here like a decided match
+            // and is not kept for a restart.
+            if S::PHASE == Phase::InGame && self.ctx.config.saving {
+                self.ctx.effects.push(Effect::SaveStatus(Status::Finished));
+            }
             self.ctx.effects.push(Effect::GameOver);
         }
 
@@ -2404,6 +2589,8 @@ impl<S: PhaseMarker> Server<S> {
         self.ctx.broadcast(&relayed, |s| {
             s.is_setup() || s.is_syncing() || s.is_in_game()
         });
+        // The forfeit is recorded after the slot broadcast went out.
+        self.ctx.save_slots();
         Ok(())
     }
 
@@ -2620,6 +2807,8 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
             turn_length_ms: self.ctx.config.turn_length_ms,
             player_ids,
             endless,
+            ai_json: None,
+            ai_players: Vec::new(),
         }
     }
 
@@ -2727,6 +2916,7 @@ impl Server<Idle> {
                 ai_host_name: format!("AI host {}", &Guid::new().0[..8]),
                 ai_host: None,
                 lobby_map: None,
+                saved_slots: None,
                 counters: Counters::default(),
                 effects: Vec::new(),
             },
@@ -2811,7 +3001,11 @@ impl Server<Setup> {
         // The start goes out only once the AI host is in, so that it loads
         // with everyone else and holds its place in turn release from turn 1.
         tracing::info!(ai_players = ?split.players, "sidecar: holding start for the AI host");
-        let settings = self.freeze(&split.stock);
+        let mut settings = self.freeze(&split.stock);
+        settings.ai_json = Some(split.ai_host.clone());
+        let mut ai_players: Vec<i32> = split.players.iter().copied().collect();
+        ai_players.sort_unstable();
+        settings.ai_players = ai_players;
         self.ctx.ai_host = Some(AiHost {
             peer: None,
             players: split.players,
@@ -2984,7 +3178,17 @@ impl Server<AwaitAiHost> {
 }
 
 impl Server<Loading> {
-    pub fn all_loaded(self) -> Server<InGame> {
+    pub fn all_loaded(mut self) -> Server<InGame> {
+        if self.ctx.config.saving {
+            let settings = &self.st.settings;
+            self.ctx.effects.push(Effect::SaveStarted {
+                settings: settings.json.clone(),
+                ai_settings: settings.ai_json.clone(),
+                ai_players: settings.ai_players.clone(),
+            });
+            self.ctx.saved_slots = Some(SlotsSnapshot::default());
+            self.ctx.save_slots();
+        }
         let settings = self.st.settings;
         Server {
             ctx: self.ctx,
@@ -3210,6 +3414,9 @@ impl Server<InGame> {
         ctx.effects.push(Effect::MatchEnded {
             checkpoint: resolved_by,
         });
+        if ctx.config.saving {
+            ctx.effects.push(Effect::SaveStatus(Status::Finished));
+        }
         let text = format!(
             "The match is over. This server closes in {}, or once everyone has left.",
             describe_span(ctx.config.post_game_linger)
@@ -3593,6 +3800,7 @@ impl<S: MatchPhase> Server<S> {
             && PlayerCommand::extract_command_type(&msg.data).as_deref() == Some("resign")
         {
             self.ctx.resigned.insert(msg.player);
+            self.ctx.save_slots();
             // The resign takes effect at the turn it is scheduled for, so
             // that is the earliest turn a replay could show the match over.
             self.ctx.checkpoints.probe_at(msg.turn);
@@ -3671,6 +3879,7 @@ impl<S: MatchPhase> Server<S> {
         {
             self.ctx.report_mismatch(mismatch);
         }
+        self.ctx.save_settled_hashes();
         Ok(())
     }
 

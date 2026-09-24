@@ -69,6 +69,9 @@ pub struct TurnManager {
     // Tracked apart from `out_of_sync`, so that one observer going out of sync
     // neither suspends the players' comparison nor anybody else's.
     observers_out_of_sync: HashSet<PeerID>,
+    // Turns agreed since the last take_settled, so the caller can record
+    // them as they happen without scanning the whole map.
+    settled: Vec<(u32, Vec<u8>)>,
 }
 
 // The result of a completed comparison. Names live on the sessions, so the
@@ -94,6 +97,7 @@ impl Default for TurnManager {
             references: HashMap::new(),
             observer_pending: HashMap::new(),
             observers_out_of_sync: HashSet::new(),
+            settled: Vec::new(),
         }
     }
 }
@@ -106,6 +110,10 @@ impl TurnManager {
     // The hash the players agreed on for `turn`, None while it is uncompared.
     pub fn reference(&self, turn: u32) -> Option<&[u8]> {
         self.references.get(&turn).map(Vec::as_slice)
+    }
+
+    pub fn take_settled(&mut self) -> Vec<(u32, Vec<u8>)> {
+        std::mem::take(&mut self.settled)
     }
 
     pub fn is_registered(&self, peer: PeerID) -> bool {
@@ -319,6 +327,7 @@ impl TurnManager {
         self.pending.retain(|t, _| *t > turn);
         self.last_compared = self.last_compared.max(turn);
         self.references.insert(turn, reference.clone());
+        self.settled.push((turn, reference.clone()));
 
         if !mismatched.is_empty() {
             self.out_of_sync.extend(mismatched.iter().copied());

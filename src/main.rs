@@ -23,6 +23,7 @@ use veredus::lobby::LobbyManager;
 use veredus::lobby::link::LobbyLink;
 use veredus::relay::password;
 use veredus::relay::server_fsm::Config;
+use veredus::savegame::SaveSetup;
 
 // Default directive when neither the environment nor the config file sets one.
 // Rocket logs every request and its launch banner at info through `log`,
@@ -85,6 +86,7 @@ async fn main() {
         veredus::sidecar::init_work_root();
     }
     let outcome_dir = config.server.outcome_dir();
+    let save = config.server.save_setup("");
     let base = config.game.server_config(
         pyrogenesis_path.is_some(),
         config.server.checkpoint_interval_turns,
@@ -96,7 +98,15 @@ async fn main() {
                 idle_shutdown: config.lobby.idle_shutdown(),
                 ..base
             };
-            run_pool_lobby_mode(&mut pool, lobby_config, base, pyrogenesis_path, outcome_dir).await;
+            run_pool_lobby_mode(
+                &mut pool,
+                lobby_config,
+                base,
+                pyrogenesis_path,
+                outcome_dir,
+                save,
+            )
+            .await;
             Ok(())
         }
         None => {
@@ -106,6 +116,7 @@ async fn main() {
                 base,
                 pyrogenesis_path,
                 outcome_dir,
+                save,
                 config.server.exit_after_game,
             )
             .await
@@ -290,6 +301,7 @@ async fn run_standalone(
     server_config: Config,
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
+    save: Option<SaveSetup>,
     exit_after_game: bool,
 ) -> Result<(), String> {
     // One future for the whole run, so a signal that arrives between two
@@ -304,6 +316,7 @@ async fn run_standalone(
             lobby: None,
             pyrogenesis_path: pyrogenesis_path.clone(),
             outcome_dir: outcome_dir.clone(),
+            save: save.clone(),
         })?;
         tracing::info!(game_id = %game_id, port, "game running");
 
@@ -343,6 +356,7 @@ async fn run_pool_lobby_mode(
     base: Config,
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
+    save: Option<SaveSetup>,
 ) {
     tracing::info!(
         accounts = lobby_config.accounts.len(),
@@ -353,6 +367,12 @@ async fn run_pool_lobby_mode(
     let engine_version = lobby_config.engine_version.clone();
     let game_password = lobby_config.game_password.clone();
     let server_name = lobby_config.server_name.clone();
+    // The node of each account's JID, recorded in its games' save bundles.
+    let account_nodes: Vec<String> = lobby_config
+        .accounts
+        .iter()
+        .map(|a| a.jid.split('@').next().unwrap_or_default().to_string())
+        .collect();
 
     let mut lobby_mgr = LobbyManager::new(lobby_config);
     let mut events = lobby_mgr.start();
@@ -439,6 +459,10 @@ async fn run_pool_lobby_mode(
                     lobby: Some(LobbyLink { auth_rx, events_tx }),
                     pyrogenesis_path: pyrogenesis_path.clone(),
                     outcome_dir: outcome_dir.clone(),
+                    save: save.clone().map(|setup| SaveSetup {
+                        lobby_account: account_nodes.get(account).cloned().unwrap_or_default(),
+                        ..setup
+                    }),
                 }) {
                     Ok((game_id, port)) => {
                         tracing::info!(

@@ -31,6 +31,7 @@ use crate::relay::server_fsm::Effect;
 use crate::relay::server_fsm::Idle;
 use crate::relay::server_fsm::Input;
 use crate::relay::server_fsm::Server;
+use crate::savegame::SaveItem;
 use crate::sidecar::AiHostProcess;
 use crate::sidecar::DumpRequest;
 
@@ -179,10 +180,13 @@ fn ai_host_event(outcome: &str) {
 // one-shot state dumps, the AI host and the outcome replay; None means dump
 // effects answer at once. `ai_host_connect` is where the AI host dials back
 // to. `outcome_path` is where the match outcome is written; None only logs it.
+// `save` is the game's save writer, None when saving is off; it rides here
+// because checkpoint states are saved from the same place they arrive.
 pub struct SidecarSetup {
     pub pyrogenesis_path: Option<PathBuf>,
     pub ai_host_connect: Option<SocketAddrV4>,
     pub outcome_path: Option<PathBuf>,
+    pub save: Option<Sender<SaveItem>>,
 }
 
 // The ENet thread feeds decoded events in over `event_rx` and takes effects out
@@ -206,6 +210,7 @@ pub fn run_game_server(
         pyrogenesis_path,
         ai_host_connect,
         outcome_path,
+        save,
     } = sidecar;
     // Parked in the listening state, which is the phase a relay spends its
     // whole idle life in.
@@ -282,6 +287,12 @@ pub fn run_game_server(
                     json,
                 }) => {
                     runs.last_result = Some((id, turn, json));
+                    if let Some(save) = &save {
+                        let _ = save.send(SaveItem::Checkpoint {
+                            turn,
+                            state: Arc::new(state.clone()),
+                        });
+                    }
                     (Some(state), players)
                 }
                 None => (None, Vec::new()),
@@ -370,6 +381,7 @@ pub fn run_game_server(
                 current.take_effects(),
                 &send_tx,
                 lobby.as_ref(),
+                save.as_ref(),
                 &mut runs,
                 &mut ai_host,
                 metrics,
@@ -396,6 +408,7 @@ pub fn run_game_server(
                     effects,
                     &send_tx,
                     lobby.as_ref(),
+                    save.as_ref(),
                     &mut runs,
                     &mut ai_host,
                     metrics,
@@ -408,13 +421,17 @@ pub fn run_game_server(
             tracing::info!("shutdown requested, dropping every peer");
             metrics.ended("shutdown");
             let current = server.take().expect("server is always present");
-            outcome_request = current.outcome_request();
+            // A saved match has not ended, so it has no outcome to replay.
+            if !current.saved_on_stop() {
+                outcome_request = current.outcome_request();
+            }
             observe_final(&current, &latest_stats, &latest_loss, metrics);
-            let effects = current.shutdown("the server is closing this game");
+            let effects = current.stop();
             drain(
                 effects,
                 &send_tx,
                 lobby.as_ref(),
+                save.as_ref(),
                 &mut runs,
                 &mut ai_host,
                 metrics,
@@ -513,6 +530,7 @@ fn drain(
     effects: Vec<Effect>,
     send_tx: &Sender<OutboundNetworkMessage>,
     lobby: Option<&LobbyLink>,
+    save: Option<&Sender<SaveItem>>,
     runs: &mut OneShotRuns,
     ai_host: &mut AiHostSlot,
     metrics: &mut GameMetrics,
@@ -618,6 +636,55 @@ fn drain(
                 continue;
             }
             Effect::PasswordRejected { .. } => continue,
+            Effect::SaveStarted {
+                settings,
+                ai_settings,
+                ai_players,
+            } => {
+                forward_save(
+                    save,
+                    SaveItem::Started {
+                        now: Utc::now(),
+                        settings,
+                        ai_settings,
+                        ai_players,
+                    },
+                );
+                continue;
+            }
+            Effect::SaveTurn {
+                turn,
+                length,
+                commands,
+            } => {
+                forward_save(
+                    save,
+                    SaveItem::Turn {
+                        turn,
+                        length,
+                        commands,
+                    },
+                );
+                continue;
+            }
+            Effect::SaveHash { turn, hash } => {
+                forward_save(save, SaveItem::Hash { turn, hash });
+                continue;
+            }
+            Effect::SaveSlots(slots) => {
+                forward_save(save, SaveItem::Slots(slots));
+                continue;
+            }
+            Effect::SaveStatus(status) => {
+                forward_save(
+                    save,
+                    SaveItem::Status {
+                        now: Utc::now(),
+                        status,
+                    },
+                );
+                continue;
+            }
         };
         if send_tx.send(outbound).is_err() {
             tracing::info!("ENet send channel closed, shutting down");
@@ -627,6 +694,14 @@ fn drain(
     }
 
     outcome
+}
+
+// A writer that has gone is already logged by itself, so a failed send says
+// nothing new.
+fn forward_save(save: Option<&Sender<SaveItem>>, item: SaveItem) {
+    if let Some(save) = save {
+        let _ = save.send(item);
+    }
 }
 
 // A dump runs on its own thread because the replay takes far longer than one

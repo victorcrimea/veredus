@@ -93,6 +93,30 @@ fn clone_effect(effect: &Effect) -> Effect {
             checkpoint: *checkpoint,
         },
         Effect::PasswordRejected { peer } => Effect::PasswordRejected { peer: *peer },
+        Effect::SaveStarted {
+            settings,
+            ai_settings,
+            ai_players,
+        } => Effect::SaveStarted {
+            settings: settings.clone(),
+            ai_settings: ai_settings.clone(),
+            ai_players: ai_players.clone(),
+        },
+        Effect::SaveTurn {
+            turn,
+            length,
+            commands,
+        } => Effect::SaveTurn {
+            turn: *turn,
+            length: *length,
+            commands: commands.clone(),
+        },
+        Effect::SaveHash { turn, hash } => Effect::SaveHash {
+            turn: *turn,
+            hash: hash.clone(),
+        },
+        Effect::SaveSlots(slots) => Effect::SaveSlots(slots.clone()),
+        Effect::SaveStatus(status) => Effect::SaveStatus(*status),
     }
 }
 
@@ -293,6 +317,11 @@ impl Harness {
             .take()
             .expect("harness server missing")
             .shutdown("test")
+    }
+
+    // Consumes the harness, because AnyServer::stop consumes the server.
+    pub fn stop(mut self) -> Vec<Effect> {
+        self.server.take().expect("harness server missing").stop()
     }
 
     // Admits each named entry in order (the first becomes controller),

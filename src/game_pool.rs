@@ -22,6 +22,13 @@ use crate::relay::enet_task::run_enet_host;
 use crate::relay::game_server::SidecarSetup;
 use crate::relay::game_server::run_game_server;
 use crate::relay::server_fsm::Config;
+use crate::relay::server_fsm::SIMULATION_VERSION;
+use crate::savegame::SaveItem;
+use crate::savegame::SaveSetup;
+use crate::savegame::bundle::ModRecord;
+use crate::savegame::bundle::Mode;
+use crate::savegame::writer;
+use crate::savegame::writer::BundleMeta;
 
 // A 100-port window above the default port lets one process host several games
 // without asking the operator for a range.
@@ -48,6 +55,8 @@ pub struct GameConfig {
     // Where the match outcome is written, as `<game_id>.json`. None only logs
     // it.
     pub outcome_dir: Option<PathBuf>,
+    // Where the match is saved as it runs. None turns saving off.
+    pub save: Option<SaveSetup>,
 }
 
 struct GameHandle {
@@ -59,6 +68,7 @@ struct GameHandle {
     // Yields the outcome replay's thread, if the match got that far.
     server_thread: Option<JoinHandle<Option<JoinHandle<()>>>>,
     enet_thread: Option<JoinHandle<()>>,
+    save_thread: Option<JoinHandle<()>>,
 }
 
 pub struct GamePool {
@@ -112,11 +122,13 @@ impl GamePool {
     pub fn create_game(&mut self, config: GameConfig) -> Result<(GameId, u16), String> {
         let GameConfig {
             port,
-            server: server_config,
+            server: mut server_config,
             lobby,
             pyrogenesis_path,
             outcome_dir,
+            save,
         } = config;
+        server_config.saving = save.is_some();
         // Bound here rather than in the ENet thread: a bind failure has to reach
         // the caller as an error, not a panic in a thread nobody joins until
         // shutdown.
@@ -155,6 +167,41 @@ impl GamePool {
             run_enet_host(socket, enet_limits, event_tx, send_rx);
         });
 
+        // Its own thread, so a slow disk or an fsync never stalls the tick
+        // loop. It ends once the server thread drops its sender.
+        let (save_tx, save_thread) = match save {
+            Some(setup) => {
+                let (tx, rx) = mpsc::channel::<SaveItem>();
+                let meta = BundleMeta {
+                    mode: if server_config.lobby_mode {
+                        Mode::Lobby
+                    } else {
+                        Mode::Standalone
+                    },
+                    lobby_account: setup.lobby_account.clone(),
+                    lobby_host_name: server_config.lobby_host_name.clone(),
+                    engine_version: SIMULATION_VERSION.to_string(),
+                    mods: server_config
+                        .enabled_mods
+                        .iter()
+                        .map(|m| ModRecord {
+                            name: m.name.clone(),
+                            version: m.version.clone(),
+                        })
+                        .collect(),
+                    turn_length_ms: server_config.turn_length_ms,
+                };
+                let save_game_id = game_id.to_string();
+                let thread = std::thread::spawn(move || {
+                    let span = tracing::info_span!("game", game_id = %save_game_id, port);
+                    let _guard = span.entered();
+                    writer::run(setup, meta, save_game_id.clone(), None, rx);
+                });
+                (Some(tx), Some(thread))
+            }
+            None => (None, None),
+        };
+
         let server_game_id = game_id.to_string();
         let shutdown_requested = Arc::new(AtomicBool::new(false));
         let shutdown_requested_for_thread = Arc::clone(&shutdown_requested);
@@ -175,6 +222,7 @@ impl GamePool {
                         pyrogenesis_path,
                         ai_host_connect,
                         outcome_path,
+                        save: save_tx,
                     },
                     &mut metrics,
                 )
@@ -202,6 +250,7 @@ impl GamePool {
                 shutdown_requested,
                 server_thread: Some(server_thread),
                 enet_thread: Some(enet_thread),
+                save_thread,
             },
         );
 
@@ -228,6 +277,12 @@ impl GamePool {
             self.outcomes.push(outcome);
         }
         if let Some(thread) = handle.enet_thread.take() {
+            let _ = thread.join();
+        }
+        // After the server thread, whose exit is what closes the writer's
+        // channel: once this returns, the bundle's last flush and status
+        // are on disk.
+        if let Some(thread) = handle.save_thread.take() {
             let _ = thread.join();
         }
         self.outcomes.retain(|outcome| !outcome.is_finished());
