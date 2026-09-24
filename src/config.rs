@@ -7,11 +7,16 @@ use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::TimeDelta;
+use documented::Documented;
+use documented::DocumentedFields;
 use serde::Deserialize;
 use serde::Serialize;
+use toml_edit::Decor;
+use toml_edit::DocumentMut;
 
 use crate::lobby::LobbyConfig;
 use crate::lobby::XmppCredentials;
@@ -77,36 +82,63 @@ pub struct FileConfig {
     pub log: LogSection,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Network, engine runs and saving.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerSection {
-    // IPv4 only: the stock client cannot reach an IPv6 address, and a
-    // dual-stack socket would hand IPv4 clients over as v4-mapped IPv6.
+    /// IPv4 only: the stock client cannot reach an IPv6 address, and a
+    /// dual-stack socket would hand IPv4 clients over as v4-mapped IPv6.
     pub host: Ipv4Addr,
-    // Standalone mode only; a lobby game picks its own.
+    /// Standalone mode only; a lobby game picks its own.
     pub port: u16,
+    /// Empty disables the sidecar. When set, joiners no live client can
+    /// serve get a snapshot from a one-shot replay instead of a drop, and
+    /// AI slots are played by a headless pyrogenesis.
     pub pyrogenesis_path: PathBuf,
+    /// Directory each finished match's outcome is written to, as
+    /// <game_id>.json; empty only logs it. Needs pyrogenesis_path, which
+    /// replays the match to work the outcome out.
     pub outcome_dir: PathBuf,
+    /// Released turns between two sidecar checkpoints, each resumed from
+    /// the last; joiners are served the newest one. 600 is two minutes of
+    /// play at the default turn length. 0 disables them.
     pub checkpoint_interval_turns: u32,
-    // Where the Prometheus endpoint listens; port 0 turns it off.
+    /// Where the Prometheus endpoint listens. Loopback by default: the
+    /// endpoint names players, so exposing it further is the operator's
+    /// decision, not a default.
     pub metrics_host: IpAddr,
+    /// Port of the Prometheus endpoint; 0 disables it.
     pub metrics_port: u16,
-    // Standalone mode only: stop the process once its game ends instead of
-    // hosting a fresh one on the same port, for a supervisor that restarts it.
+    /// Standalone mode only: stop the process once its game ends instead
+    /// of hosting a fresh one on the same port, for a supervisor that
+    /// restarts it.
     pub exit_after_game: bool,
+    /// Largest packet the host sends or reassembles. The floor is 65535:
+    /// the message header counts length in 16 bits, and a lower cap would
+    /// drop the biggest legitimate game settings.
     pub enet_max_packet_bytes: usize,
+    /// What one peer, authenticated or not, may make the relay hold in
+    /// half reassembled or undelivered packets: a few maximum-size
+    /// messages, which is more than a stock client ever has in flight.
     pub enet_max_waiting_bytes: usize,
-    // How many one-shot engine runs (dumps, checkpoints, outcome replays) the
-    // whole process may have going at once; the rest queue. 0 lifts the cap.
+    /// How many one-shot engine runs (dumps, checkpoints, outcome
+    /// replays) the whole process may have going at once; the rest queue.
+    /// 0 lifts the cap. Defaults to the host core count, since a replay
+    /// is CPU-bound.
     pub max_sidecar_runs: usize,
-    // Where every running match keeps its save bundle; empty turns saving
-    // off.
+    /// Where every running match keeps its save bundle; empty turns
+    /// saving off. Relative to the working directory, so a checkout saves
+    /// next to itself.
     pub save_dir: PathBuf,
-    // Resume the saved matches found in save_dir at startup.
+    /// Resume the saved matches found in save_dir at startup.
     pub resume: bool,
+    /// A crash loses at most this much of a match, and the disk sees one
+    /// fsync per game this often.
     pub save_flush_ms: u64,
-    // Keep a decided match's bundle instead of deleting it.
+    /// Keep a decided match's bundle instead of deleting it.
     pub keep_finished_saves: bool,
+    /// A match that crashes the server on every resume must not crash it
+    /// forever.
     pub max_resume_attempts: u32,
 }
 
@@ -115,8 +147,8 @@ impl Default for ServerSection {
         ServerSection {
             host: Ipv4Addr::UNSPECIFIED,
             port: DEFAULT_PORT,
-            pyrogenesis_path: PathBuf::new(),
-            outcome_dir: PathBuf::new(),
+            pyrogenesis_path: PathBuf::from_str("../0ad/binaries/system/pyrogenesis").unwrap(),
+            outcome_dir: PathBuf::from_str("./outcome").unwrap(),
             checkpoint_interval_turns: DEFAULT_CHECKPOINT_INTERVAL_TURNS,
             metrics_host: DEFAULT_METRICS_HOST,
             metrics_port: DEFAULT_METRICS_PORT,
@@ -202,48 +234,119 @@ pub struct ModEntry {
     pub version: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Match rules, admission and flood limits.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
 #[serde(default, deny_unknown_fields)]
 pub struct GameSection {
+    /// Milliseconds between released turns. At least 1: a zero-length
+    /// turn would release turns as fast as the tick loop runs.
     pub turn_length_ms: u16,
+    /// The name the relay speaks under. It occupies an observer row in
+    /// the slot list, where a client looks a chat sender's name up.
     pub server_name: String,
+    /// Sent to each arriving client; empty greets them with nothing.
     pub welcome_message: String,
+    /// Empty means the first client to authenticate becomes controller,
+    /// since that is the secret every stock client sends.
     pub controller_secret: String,
+    /// When set, two clients may play under the same name outside lobby
+    /// mode.
     pub allow_duplicate_names: bool,
+    /// Who may watch a match already in progress: everyone, buddies or
+    /// deny.
     pub late_observer_policy: ObserverPolicy,
+    /// How many observers a match holds at once.
     pub observer_limit: usize,
+    /// How far an observer may lag before it is dropped. 0 means an
+    /// observer never blocks turn release.
     pub observer_lag_limit: u32,
+    /// How many turns behind the players observers watch. 0 puts them on
+    /// the live stream, where they may not pause.
     pub observer_delay_turns: u32,
+    /// Cap the FSM enforces at admission, 2 to 200. The arriving session
+    /// counts, so 1 would refuse everyone.
     pub max_sessions: usize,
+    /// Losing the controller is permanent in the stock server, which
+    /// strands the match with nobody able to start it; when set, someone
+    /// else can take over.
     pub release_controller_on_leave: bool,
+    /// How long a player may hold the match paused across the whole
+    /// game. Longer than any match is how the policy is turned off.
     pub pause_budget_secs: u64,
+    /// When set, the match is held for a player who drops or goes silent
+    /// mid-match, charged to that player's pause budget.
     pub afk_pause: bool,
+    /// How long a decided match keeps running for the players who stay
+    /// to watch or chat before the game shuts down.
     pub post_game_linger_secs: u64,
+    /// How long a client serializing a snapshot for a joiner may go
+    /// without sending anything before the joiner is re-sourced
+    /// elsewhere. 0 waits forever.
     pub join_source_stall_secs: u64,
+    /// How long a connected peer may take to be admitted before it is
+    /// dropped. 0 waits forever.
     pub handshake_timeout_secs: u64,
+    /// How many peers from one address may be connected but not yet
+    /// admitted at once. 0 means no cap.
     pub max_pending_per_ip: usize,
+    /// How long the loading screen may last before whoever is still on
+    /// it is dropped. Must cover a large map on a slow machine. 0 waits
+    /// forever.
     pub loading_timeout_secs: u64,
+    /// Per-peer chat limit: what one peer may fan out to every session.
+    /// A stock client stays far below it. 0 turns that bucket off.
     pub chat_per_sec: u32,
+    /// Chat messages that fit in the bucket at once; at least 1 when the
+    /// rate above is set.
     pub chat_burst: u32,
+    /// Longer chat is dropped.
     pub chat_max_chars: usize,
+    /// Per-peer flare limit, as for chat. 0 turns that bucket off.
     pub flare_per_sec: u32,
+    /// Flares that fit in the bucket at once; at least 1 when the rate
+    /// above is set.
     pub flare_burst: u32,
+    /// Counted per turn a command is scheduled for, because that is what
+    /// the match log and every replay of it grow by. 0 turns that cap
+    /// off.
     pub commands_per_turn: u32,
+    /// Byte twin of the cap above. 0 turns that cap off.
     pub command_bytes_per_turn: usize,
+    /// What a pause costs however soon it is lifted.
     pub pause_min_charge_secs: u64,
+    /// How many times its limit a peer may send before it is disconnected
+    /// rather than merely dropped. 0 never disconnects.
     pub flood_kick_multiple: u32,
+    /// How many joins into a running match one address, or one lobby
+    /// name, may make before it has to wait. Every join makes a player or
+    /// a sidecar serialize the match.
     pub join_burst: u32,
+    /// How long each join past the burst waits. 0 turns the limit off.
     pub join_interval_secs: u64,
+    /// How many wrong passwords one lobby name may send before it is
+    /// turned away.
     pub auth_fail_burst: u32,
+    /// How many wrong passwords one address may send. More than the name
+    /// above, because players behind one NAT share it and only one of
+    /// them may be guessing.
     pub auth_fail_burst_per_addr: u32,
+    /// How long each wrong password past the bursts waits. 0 turns the
+    /// limit off.
     pub auth_fail_interval_secs: u64,
+    /// How long a resumed match waits with no original player back before
+    /// it is given up. 0 waits forever.
     pub resume_wait_secs: u64,
+    /// How long only the saved controller may restart a resumed match;
+    /// after that any original player may.
     pub resume_controller_grace_secs: u64,
-    // Without a sidecar, how often one playing client is asked for the
-    // match state so the match can be resumed; 0 turns it off.
+    /// Without a sidecar, how often one playing client is asked for the
+    /// match state so the match can be resumed; 0 turns it off.
     pub client_state_interval_secs: u64,
+    /// Names that count as buddies under the buddies observer policy.
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
+    /// The list admission enforces against every client, so it is
+    /// provably what the game runs.
     pub enabled_mods: Vec<ModEntry>,
 }
 
@@ -388,18 +491,32 @@ pub struct AccountEntry {
     pub password: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Pool-lobby mode: accounts that wait for hostme.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
 #[serde(default, deny_unknown_fields)]
 pub struct LobbySection {
+    /// Set to run pool-lobby mode off this table.
     pub enabled: bool,
+    /// A lobby run with this empty could never be listed.
     pub muc_room: String,
+    /// A lobby run with this empty could never log in.
     pub bot_jid: String,
+    /// The address players connect to. A lobby run with this empty could
+    /// never be listed.
     pub public_ip: String,
+    /// Shown in the lobby game list.
     pub server_name: String,
+    /// Must match the clients.
     pub engine_version: String,
+    /// Optional password set on every lobby game.
     pub game_password: String,
+    /// How long a pooled-lobby game may sit with nobody ever having
+    /// joined, or with everybody gone, before it shuts itself down and
+    /// frees its account. 0 means never.
     pub idle_shutdown_secs: u64,
     // Last: TOML refuses a plain value after an array of tables.
+    /// One-shot XMPP accounts waiting in the room; each hosts one game at
+    /// a time. Keep this file private: it holds account passwords.
     pub accounts: Vec<AccountEntry>,
 }
 
@@ -462,13 +579,19 @@ impl LobbySection {
 
 // Every field here loses to its environment variable, which is how a single
 // debugging session turns logging up without editing the file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Every field loses to its environment variable.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
 #[serde(default, deny_unknown_fields)]
 pub struct LogSection {
+    /// Tracing directives for stdout; RUST_LOG wins over this.
     pub directives: String,
+    /// Tracing directives for the Loki sink; LOKI_LOG wins over this.
     pub loki_directives: String,
+    /// The Loki sink exists only when this (or LOKI_URL) is set.
     pub loki_url: String,
+    /// Stream label; LOKI_INSTANCE wins over this.
     pub loki_instance: String,
+    /// Stream label; LOKI_ENV wins over this.
     pub loki_env: String,
 }
 
@@ -562,6 +685,12 @@ impl FileConfig {
     pub fn write_default(path: &Path) -> Result<(), String> {
         let body = toml::to_string_pretty(&FileConfig::default())
             .map_err(|error| format!("failed to serialize the default config: {error}"))?;
+        // Serializing drops every comment, so each section's doc comments are
+        // attached afterwards; values and prose then share one source each.
+        let mut doc: DocumentMut = body
+            .parse()
+            .map_err(|error| format!("failed to parse the default config: {error}"))?;
+        decorate_default(&mut doc);
         // create_new, so a regenerate never wipes a tuned config.
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -569,9 +698,90 @@ impl FileConfig {
             .open(path)
             .map_err(|error| format!("failed to create '{}': {error}", path.display()))?;
         file.write_all(GENERATED_HEADER.as_bytes())
-            .and_then(|()| file.write_all(body.as_bytes()))
+            .and_then(|()| file.write_all(doc.to_string().as_bytes()))
             .map_err(|error| format!("failed to write '{}': {error}", path.display()))
     }
+}
+
+// The operator reads a section's doc comments as the generated file's
+// comments, so prose written for rustdoc is never retyped for TOML.
+fn decorate_default(doc: &mut DocumentMut) {
+    decorate_section::<ServerSection>(doc, "server");
+    decorate_section::<GameSection>(doc, "game");
+    decorate_section::<LobbySection>(doc, "lobby");
+    decorate_section::<LogSection>(doc, "log");
+}
+
+fn decorate_section<T: Documented + DocumentedFields>(doc: &mut DocumentMut, table: &str) {
+    set_table_comment(doc, table, T::DOCS);
+    for (key, comment) in T::FIELD_NAMES.iter().zip(T::FIELD_DOCS) {
+        set_key_comment(doc, table, key, comment);
+    }
+}
+
+// A comment above a [table] header. The blank line between tables lives in
+// the old prefix, so it is kept, or the tables would run together.
+fn set_table_comment(doc: &mut DocumentMut, table: &str, comment: &str) {
+    let Some(item) = doc.get_mut(table) else {
+        return;
+    };
+    let Some(as_table) = item.as_table_mut() else {
+        return;
+    };
+    prepend_comment(as_table.decor_mut(), comment);
+}
+
+// A comment above one key. Arrays of tables carry no key decor of their own:
+// a prefix there would land inside the brackets, so the first entry's table
+// decor holds it instead.
+fn set_key_comment(doc: &mut DocumentMut, table: &str, key: &str, comment: &str) {
+    let Some(item) = doc.get_mut(table) else {
+        return;
+    };
+    let Some(as_table) = item.as_table_mut() else {
+        return;
+    };
+    let Some(child) = as_table.get_mut(key) else {
+        return;
+    };
+    if let Some(first) = child
+        .as_array_of_tables_mut()
+        .and_then(|aot| aot.get_mut(0))
+    {
+        prepend_comment(first.decor_mut(), comment);
+        return;
+    }
+    if let Some(child_table) = child.as_table_mut() {
+        prepend_comment(child_table.decor_mut(), comment);
+        return;
+    }
+    let Some(mut key_handle) = as_table.key_mut(key) else {
+        return;
+    };
+    set_key_prefix(key_handle.leaf_decor_mut(), comment);
+}
+
+fn prepend_comment(decor: &mut Decor, comment: &str) {
+    let old = decor
+        .prefix()
+        .and_then(|raw| raw.as_str())
+        .unwrap_or_default();
+    let gap = if old.starts_with('\n') { "\n" } else { "" };
+    decor.set_prefix(format!("{gap}{}", comment_text(comment)));
+}
+
+fn set_key_prefix(decor: &mut Decor, comment: &str) {
+    decor.set_prefix(comment_text(comment));
+}
+
+fn comment_text(comment: &str) -> String {
+    let mut out = String::new();
+    for line in comment.lines() {
+        out.push_str("# ");
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 // Operators think in time, the match counts in turns. At least one turn, so
