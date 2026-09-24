@@ -1,0 +1,969 @@
+From efba8d1b561d48fe1ae15aa3ccff8d52efef8f8e Mon Sep 17 00:00:00 2001
+From: Viktor Semenov <suit.uanic@gmail.com>
+Date: Tue, 22 Sep 2026 00:49:47 +0000
+Subject: [PATCH 5/6] Host AI in a headless sidecar client and add sidecar
+ replay debug modes
+
+Adds -autostart-ai-host: a headless client that joins over the network,
+computes AI for the slots the server strips from every stock client, and
+sends its moves as ordinary network commands. The per-player AI flag stays
+false everywhere so command processing is identical on every client.
+
+Also adds -sidecar-replay and -replay-ai-host for OOS hunting, the
+hashbreakdown debug log, and CLI.md documenting the command line.
+---
+ .../public/autostart/autostart_ai_host.js     | 60 ++++++++++++
+ .../data/mods/public/autostart/entrypoint.js  |  5 +
+ .../mods/public/simulation/ai/petra/config.js | 17 ++++
+ .../public/simulation/helpers/InitGame.js     | 12 ++-
+ source/main.cpp                               | 19 +++-
+ source/network/NetClient.cpp                  | 11 ++-
+ source/network/NetClient.h                    | 12 +++
+ source/network/NetClientTurnManager.cpp       | 11 +++
+ .../network/scripting/JSInterface_Network.cpp | 12 +++
+ source/ps/GameSetup/GameSetup.cpp             |  7 +-
+ source/ps/Replay.cpp                          | 95 +++++++++++++++++--
+ source/ps/Replay.h                            | 34 ++++++-
+ source/simulation2/Simulation2.cpp            | 38 ++++++++
+ source/simulation2/Simulation2.h              | 31 ++++++
+ .../simulation2/components/CCmpAIManager.cpp  | 73 +++++++++++++-
+ .../simulation2/system/ComponentManager.cpp   | 15 +++
+ source/simulation2/system/ComponentManager.h  | 10 ++
+ .../system/ComponentManagerSerialization.cpp  | 39 ++++++++
+ source/simulation2/system/TurnManager.h       | 15 +++
+ 19 files changed, 494 insertions(+), 22 deletions(-)
+ create mode 100644 binaries/data/mods/public/autostart/autostart_ai_host.js
+
+diff --git a/binaries/data/mods/public/autostart/autostart_ai_host.js b/binaries/data/mods/public/autostart/autostart_ai_host.js
+new file mode 100644
+index 0000000000..249e562916
+--- /dev/null
++++ b/binaries/data/mods/public/autostart/autostart_ai_host.js
+@@ -0,0 +1,60 @@
++class AutoStartAiHost
++{
++	constructor(cmdLineArgs)
++	{
++		this.playerAssignments = {};
++
++		try
++		{
++			const playerName = cmdLineArgs['autostart-playername'] || "ai-host";
++			const ip = cmdLineArgs['autostart-client'] ?? "127.0.0.1";
++			const port = +(cmdLineArgs['autostart-port'] ?? 5073);
++			Engine.StartNetworkJoin(playerName, ip, port, !('autostart-disable-replay' in cmdLineArgs));
++			// Marks this client so CNetClient::StartGame computes AI locally
++			// even though it isn't (and must never become) the controller.
++			Engine.SetAIHost();
++		}
++		catch (e)
++		{
++			const message = sprintf(translate("Cannot join game: %(message)s."), { "message": e.message });
++			messageBox(400, 200, message, translate("Error"));
++		}
++	}
++
++	onTick()
++	{
++		while (true)
++		{
++			const message = Engine.PollNetworkClient();
++			if (!message)
++				break;
++
++			switch (message.type)
++			{
++			case "players":
++				this.playerAssignments = message.newAssignments;
++				Engine.SendNetworkReady(2);
++				break;
++			case "start":
++				this.onLaunch(message);
++				// Process further pending netmessages in the session page.
++				return true;
++			default:
++			}
++		}
++		return false;
++	}
++
++	/**
++	 * In the visual autostart path, we need to show the loading screen.
++	 * Overload this as appropriate, the default implementation works for the public mod.
++	 */
++	onLaunch(message)
++	{
++		Engine.SwitchGuiPage("page_loading.xml", {
++			"attribs": message.initAttributes,
++			"isRejoining": true,
++			"playerAssignments": this.playerAssignments
++		});
++	}
++}
+diff --git a/binaries/data/mods/public/autostart/entrypoint.js b/binaries/data/mods/public/autostart/entrypoint.js
+index cc782fdcfd..e459a0746e 100644
+--- a/binaries/data/mods/public/autostart/entrypoint.js
++++ b/binaries/data/mods/public/autostart/entrypoint.js
+@@ -27,6 +27,11 @@ function autostartClient(cmdLineArgs)
+ 	autostartInstance = new AutoStartClient(cmdLineArgs);
+ }
+ 
++function autostartAiHost(cmdLineArgs)
++{
++	autostartInstance = new AutoStartAiHost(cmdLineArgs);
++}
++
+ /**
+  * This path depends on files currently stored under gui/, which should be moved.
+  * The best place would probably be a new 'engine' mod, independent from the 'mod' mod and the public mod.
+diff --git a/binaries/data/mods/public/simulation/ai/petra/config.js b/binaries/data/mods/public/simulation/ai/petra/config.js
+index cef0eb992c..063abf05a3 100644
+--- a/binaries/data/mods/public/simulation/ai/petra/config.js
++++ b/binaries/data/mods/public/simulation/ai/petra/config.js
+@@ -324,6 +324,23 @@ Config.prototype.setConfig = function(gameState)
+ 
+ Config.prototype.Cheat = function(gameState)
+ {
++	// SIDECAR.md 1.3: the per-player AI field is stripped from the game-start
++	// data every stock client receives, so the hosted-AI sidecar is the only
++	// process in the match that ever registers Petra -- and so the only one
++	// that would ever reach this. The AI runs in the simulation's own
++	// compartment and is handed the sim globals as Sim/SimEngine
++	// (CAIWorker::Init, ../../../../../../source/simulation2/components/CCmpAIManager.cpp),
++	// so the AddModifiers below is a real mutation of simulation state, not
++	// bot-local bookkeeping. Applying it here alone is a guaranteed
++	// divergence: a different Cost/BuildTime makes foundations and training
++	// complete on a different turn on the sidecar than on every client,
++	// which moves both the entity-id counter and the unit positions that the
++	// reduced state hash covers. The cost of skipping it is that hosted AI
++	// plays every difficulty on the Medium economy (rate/time 1.00); all the
++	// behavioural difficulty scaling above is unaffected.
++	if (SimEngine.IsAIHost())
++		return;
++
+ 	// Sandbox, Very Easy, Easy, Medium, Hard, Very Hard
+ 	// rate apply on resource stockpiling as gathering and trading
+ 	// time apply on building, upgrading, packing, training and technologies
+diff --git a/binaries/data/mods/public/simulation/helpers/InitGame.js b/binaries/data/mods/public/simulation/helpers/InitGame.js
+index 1af2bd9645..2248a22ec7 100644
+--- a/binaries/data/mods/public/simulation/helpers/InitGame.js
++++ b/binaries/data/mods/public/simulation/helpers/InitGame.js
+@@ -56,7 +56,17 @@ function InitGame(settings)
+ 			else if (settings.PlayerData[i].AI)
+ 			{
+ 				cmpAIManager.AddPlayer(settings.PlayerData[i].AI, i, +settings.PlayerData[i].AIDiff, settings.PlayerData[i].AIBehavior || "random");
+-				cmpPlayer.SetAI(true);
++				// SIDECAR.md 1.3/1.3.1: the dedicated server's hosted-AI
++				// sidecar registers the bot here like any other client, but
++				// must not set the per-player AI flag -- it has to read
++				// false on every client (this one included) for command
++				// processing to stay identical everywhere. Only the
++				// sidecar's own session ever sees an AI slot here at all
++				// (the server strips it from what every other client
++				// receives), so `Engine.IsAIHost()` alone is enough to tell
++				// the two situations apart.
++				if (!Engine.IsAIHost())
++					cmpPlayer.SetAI(true);
+ 			}
+ 		}
+ 
+diff --git a/source/main.cpp b/source/main.cpp
+index 961bb3340c..0ddd3c35de 100644
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -581,6 +581,11 @@ static void RunGameOrAtlas(const std::span<const char* const> argv)
+ 
+ 	const bool isVisualReplay = args.Has("replay-visual");
+ 	const bool isNonVisualReplay = args.Has("replay");
++	// Debug-only: same as -replay=, but drives the simulation through
++	// CTurnManager::Update() (as a live client/sidecar does) instead of a
++	// direct CSimulation2::Update() call. See CReplayPlayer::Replay()'s
++	// viaTurnManager parameter.
++	const bool isSidecarReplay = args.Has("sidecar-replay");
+ 	const bool isVisual = !args.Has("autostart-nonvisual");
+ 
+ 	const int fixedFrameFrequency{args.Has("fixed-frame-frequency")
+@@ -588,9 +593,10 @@ static void RunGameOrAtlas(const std::span<const char* const> argv)
+ 
+ 	const OsPath replayFile(
+ 		isVisualReplay ? args.Get("replay-visual") :
+-		isNonVisualReplay ? args.Get("replay") : "");
++		isNonVisualReplay ? args.Get("replay") :
++		isSidecarReplay ? args.Get("sidecar-replay") : "");
+ 
+-	if (isVisualReplay || isNonVisualReplay)
++	if (isVisualReplay || isNonVisualReplay || isSidecarReplay)
+ 	{
+ 		if (!FileExists(replayFile))
+ 		{
+@@ -637,7 +643,7 @@ static void RunGameOrAtlas(const std::span<const char* const> argv)
+ 	if (ATLAS_RunIfOnCmdLine(args, false))
+ 		return;
+ 
+-	if (isNonVisualReplay)
++	if (isNonVisualReplay || isSidecarReplay)
+ 	{
+ 		Paths paths(args);
+ 		g_VFS = CreateVfs();
+@@ -652,7 +658,12 @@ static void RunGameOrAtlas(const std::span<const char* const> argv)
+ 				args.Has("rejointest") ? args.Get("rejointest").ToInt() : -1,
+ 				args.Has("ooslog"),
+ 				!args.Has("hashtest-full") || args.Get("hashtest-full") == "true",
+-				args.Has("hashtest-quick") && args.Get("hashtest-quick") == "true");
++				args.Has("hashtest-quick") && args.Get("hashtest-quick") == "true",
++				// SIDECAR.md 1.10.4: dedicated-server rejoin-state dump mode.
++				args.Has("dump-state-at-turn") ? args.Get("dump-state-at-turn").ToInt() : -1,
++				OsPath(args.Get("dump-state-out")),
++				isSidecarReplay,
++				args.Has("replay-ai-host"));
+ 		}
+ 
+ 		g_VFS.reset();
+diff --git a/source/network/NetClient.cpp b/source/network/NetClient.cpp
+index dcbc4f7948..813083ae8b 100644
+--- a/source/network/NetClient.cpp
++++ b/source/network/NetClient.cpp
+@@ -674,10 +674,17 @@ void CNetClient::StartGame(const JS::MutableHandleValue initAttributes, const st
+ 	m_ClientTurnManager = new CNetClientTurnManager{*m_Game->GetSimulation2(), *this,
+ 		static_cast<int>(m_HostID), m_Game->GetReplayLogger()};
+ 
+-	// Only the controller (host) runs AI; non-host clients skip AI entirely.
+-	if (!m_IsController)
++	// Only the controller (host) or a designated AI-host sidecar runs AI;
++	// every other client skips AI entirely.
++	if (!m_IsController && !m_IsAIHost)
+ 		m_Game->GetSimulation2()->SetAISkipped(true);
+ 
++	// Let the simulation itself know it's the sidecar (SIDECAR.md chapter 1)
++	// -- InitGame.js and CCmpAIManager::PushCommands both need this to
++	// implement the "AI flag false everywhere but here" shape (SIDECAR.md
++	// 1.3/1.4.4), which is otherwise unrelated to whether AI is skipped.
++	m_Game->GetSimulation2()->SetAIHost(m_IsAIHost);
++
+ 	m_Game->SetPlayerID(player);
+ 	m_Game->StartGame(initAttributes, savedState);
+ }
+diff --git a/source/network/NetClient.h b/source/network/NetClient.h
+index a83e82c0a5..6784625556 100644
+--- a/source/network/NetClient.h
++++ b/source/network/NetClient.h
+@@ -109,6 +109,12 @@ public:
+ 
+ 	bool IsController() const { return m_IsController; }
+ 
++	/**
++	 * Mark this client as the headless AI-host sidecar (see m_IsAIHost).
++	 * Must be called before StartGame.
++	 */
++	void SetAIHost(bool isAIHost) { m_IsAIHost = isAIHost; }
++
+ 	/**
+ 	 * Set the game password.
+ 	 * Must be called after SetUserName, as that is used to hash further.
+@@ -353,6 +359,12 @@ private:
+ 	/// Note that this is just a "gui hint" with no actual impact on being controller.
+ 	bool m_IsController = false;
+ 
++	/// Whether this client is a headless AI-host sidecar: it should compute
++	/// AI and send the resulting moves as network commands even though it
++	/// is not the controller. Set locally at connection time (from
++	/// -autostart-ai-host), never learned from the network.
++	bool m_IsAIHost = false;
++
+ 	/// Current network session (or NULL if not connected)
+ 	CNetClientSession* m_Session;
+ 
+diff --git a/source/network/NetClientTurnManager.cpp b/source/network/NetClientTurnManager.cpp
+index 81faef63cb..175f5fca75 100644
+--- a/source/network/NetClientTurnManager.cpp
++++ b/source/network/NetClientTurnManager.cpp
+@@ -25,6 +25,7 @@
+ #include "lib/utf8.h"
+ #include "network/NetMessage.h"
+ #include "ps/CLogger.h"
++#include "ps/ConfigDB.h"
+ #include "ps/Profile.h"
+ #include "ps/Pyrogenesis.h"
+ #include "ps/Replay.h"
+@@ -91,6 +92,16 @@ void CNetClientTurnManager::NotifyFinishedUpdate(u32 turn)
+ 
+ 	NETCLIENTTURN_LOG("NotifyFinishedUpdate(%d, %hs)\n", turn, Hexify(hash).c_str());
+ 
++	// OOS hunting aid, off unless `-conf=hashbreakdown:true` is passed (see
++	// CComponentManager::DebugQuickHashBreakdown). Run it on the AI-host
++	// sidecar and on one client and diff the two logs: the first turn whose
++	// lines differ says *which* of the reduced hash's three inputs drifted,
++	// which the combined digest can't. Read once -- this is on the per-turn
++	// path.
++	if (DebugHashBreakdownEnabled())
++		debug_printf("hashbreakdown turn=%u quick=%d hash=%s %s\n", turn, quick ? 1 : 0,
++			Hexify(hash).c_str(), m_Simulation2.DebugQuickHashBreakdown().c_str());
++
+ 	m_Replay.Hash(hash, quick);
+ 
+ 	// Send message to the server
+diff --git a/source/network/scripting/JSInterface_Network.cpp b/source/network/scripting/JSInterface_Network.cpp
+index 29b437681e..79c5f2df56 100644
+--- a/source/network/scripting/JSInterface_Network.cpp
++++ b/source/network/scripting/JSInterface_Network.cpp
+@@ -164,6 +164,17 @@ void StartNetworkJoin(const CStrW& playerName, const CStr& serverAddress, u16 se
+ 	}
+ }
+ 
++/**
++ * Mark the current (already-joined) client as a headless AI-host sidecar:
++ * it should compute AI and send the resulting moves as network commands even
++ * though it is not the controller. Must be called after StartNetworkJoin.
++ */
++void SetAIHost()
++{
++	ENSURE(g_NetClient);
++	g_NetClient->SetAIHost(true);
++}
++
+ /**
+  * Requires XmppClient to send iq request to the server to get server's ip and port based on passed password.
+  * This is needed to not force server to share it's public ip with all potential clients in the lobby.
+@@ -341,6 +352,7 @@ void RegisterScriptFunctions(const ScriptRequest& rq)
+ 	ScriptFunction::Register<&HasNetClient>(rq, "HasNetClient");
+ 	ScriptFunction::Register<&StartNetworkHost>(rq, "StartNetworkHost");
+ 	ScriptFunction::Register<&StartNetworkJoin>(rq, "StartNetworkJoin");
++	ScriptFunction::Register<&SetAIHost>(rq, "SetAIHost");
+ 	ScriptFunction::Register<&StartNetworkJoinLobby>(rq, "StartNetworkJoinLobby");
+ 	ScriptFunction::Register<&DisconnectNetworkGame>(rq, "DisconnectNetworkGame");
+ 	ScriptFunction::Register<&GetPlayerGUID>(rq, "GetPlayerGUID");
+diff --git a/source/ps/GameSetup/GameSetup.cpp b/source/ps/GameSetup/GameSetup.cpp
+index e547c4757b..e42bbabc4b 100644
+--- a/source/ps/GameSetup/GameSetup.cpp
++++ b/source/ps/GameSetup/GameSetup.cpp
+@@ -766,6 +766,8 @@ CStr8 LoadSettingsOfScenarioMap(const VfsPath &mapPath)
+  * -autostart=MAP		to enable regular autostart / host mode autostart
+  * -autostart-client=IP	to enable 'MP client' autostart.
+  * -autostart-host		to enable 'MP host' autostart.
++ * -autostart-ai-host	alongside -autostart-client, to join as a headless
++ *						AI-host sidecar instead of a plain client.
+  * -autostart-nonvisual	to start in non-visual mode.
+  *  TODO: it might be nice to move these to JS too.
+  */
+@@ -848,7 +850,10 @@ bool Autostart(const CmdLineArgs& args)
+ 			Script::SetProperty(rq, cmdLineArgs, "autostart-port", PS_DEFAULT_PORT);
+ 
+ 		JS::RootedValue global(rq.cx, rq.globalValue());
+-		if (!ScriptFunction::CallVoid(rq, global, args.Has("autostart-client") ? "autostartClient" : "autostartHost", cmdLineArgs, true))
++		const char* autostartFunction = "autostartHost";
++		if (args.Has("autostart-client"))
++			autostartFunction = args.Has("autostart-ai-host") ? "autostartAiHost" : "autostartClient";
++		if (!ScriptFunction::CallVoid(rq, global, autostartFunction, cmdLineArgs, true))
+ 			return false;
+ 
+ 		bool shouldQuit = false;
+diff --git a/source/ps/Replay.cpp b/source/ps/Replay.cpp
+index 47fc884571..eadf95404c 100644
+--- a/source/ps/Replay.cpp
++++ b/source/ps/Replay.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include "Replay.h"
+ 
++#include "lib/byte_order.h"
+ #include "lib/code_generation.h"
+ #include "lib/debug.h"
+ #include "lib/file/file_system.h"
+@@ -26,6 +27,7 @@
+ #include "lib/timer.h"
+ #include "ps/CLogger.h"
+ #include "ps/CStr.h"
++#include "ps/Compress.h"
+ #include "ps/Errors.h"
+ #include "ps/Game.h"
+ #include "ps/GameSetup/CmdLineArgs.h"
+@@ -51,6 +53,7 @@
+ #include "simulation2/helpers/SimulationCommand.h"
+ #include "simulation2/system/Component.h"
+ #include "simulation2/system/Entity.h"
++#include "simulation2/system/TurnManager.h"
+ 
+ #include <ctime>
+ #include <fstream>
+@@ -192,7 +195,8 @@ void CheckReplayMods(const std::vector<Mod::ModData>& replayMods)
+ }
+ } // anonymous namespace
+ 
+-void CReplayPlayer::Replay(const bool serializationtest, const int rejointestturn, const bool ooslog, const bool testHashFull, const bool testHashQuick)
++void CReplayPlayer::Replay(const bool serializationtest, const int rejointestturn, const bool ooslog, const bool testHashFull, const bool testHashQuick,
++	const int dumpStateAtTurn, const OsPath& dumpStateOut, const bool viaTurnManager, const bool aiHost)
+ {
+ 	ENSURE(m_Stream);
+ 
+@@ -208,6 +212,7 @@ void CReplayPlayer::Replay(const bool serializationtest, const int rejointesttur
+ 	std::vector<SimulationCommand> commands;
+ 	u32 turn = 0;
+ 	u32 turnLength = 0;
++	bool dumpedState = false;
+ 
+ 	{
+ 	std::string type;
+@@ -263,6 +268,16 @@ void CReplayPlayer::Replay(const bool serializationtest, const int rejointesttur
+ 			ENSURE(Script::ParseJSON(rq, attribsStr, &attribs));
+ 			g_Game->StartGame(&attribs, "");
+ 
++			// -sidecar-replay: mirror the one flag a live -autostart-ai-host
++			// client sets that plain replay never does (CNetClient::StartGame),
++			// to test whether it's the CTurnManager::Update() path itself
++			// (rather than this flag) causing the live-only OOS.
++			// -replay-ai-host sets the same flag on its own, so an
++			// AI-host-gated behaviour can be tested against a recording
++			// without also changing how commands are scheduled.
++			if (viaTurnManager || aiHost)
++				g_Game->GetSimulation2()->SetAIHost(true);
++
+ 			// TODO: Non progressive load can fail - need a decent way to handle this
+ 			LDR_NonprogressiveLoad();
+ 
+@@ -285,7 +300,13 @@ void CReplayPlayer::Replay(const bool serializationtest, const int rejointesttur
+ 			JS::RootedValue data(rq.cx);
+ 			Script::ParseJSON(rq, line, &data);
+ 			Script::DeepFreezeObject(rq, data);
+-			commands.emplace_back(SimulationCommand(player, rq.cx, data));
++			if (viaTurnManager)
++				// Block label `turn` maps to wire turn `turn + 1` (the next
++				// turn CTurnManager will process), matching the convention
++				// this replay file's own "turn"/"end" framing already uses.
++				g_Game->GetTurnManager()->DebugAddCommand(0, player, data, turn + 1);
++			else
++				commands.emplace_back(SimulationCommand(player, rq.cx, data));
+ 		}
+ 		else if (type == "hash" || type == "hash-quick")
+ 		{
+@@ -301,14 +322,30 @@ void CReplayPlayer::Replay(const bool serializationtest, const int rejointesttur
+ 				g_Profiler2.IncrementFrameNumber();
+ 				PROFILE2_ATTR("%d", g_Profiler2.GetFrameNumber());
+ 
+-				g_Game->GetSimulation2()->Update(turnLength, commands);
+-				commands.clear();
++				if (viaTurnManager)
++					g_Game->GetTurnManager()->Update(turnLength / 1000.0f, 1);
++				else
++				{
++					g_Game->GetSimulation2()->Update(turnLength, commands);
++					commands.clear();
++				}
+ 			}
+ 
+ 			g_Profiler.Frame();
+ 
+ 			if (turn % PROFILE_TURN_INTERVAL == 0)
+ 				g_ProfileViewer.SaveToFile();
++
++			// SIDECAR.md 1.10.4: this replay run's only job is to produce
++			// rejoin state at a specific turn, not to resolve a match
++			// outcome -- stop here instead of processing the rest of the
++			// file.
++			if (dumpStateAtTurn >= 0 && turn == static_cast<u32>(dumpStateAtTurn))
++			{
++				DumpState(dumpStateOut, turn);
++				dumpedState = true;
++				break;
++			}
+ 		}
+ 		else
+ 			debug_printf("Unrecognized replay token %s\n", type.c_str());
+@@ -317,14 +354,15 @@ void CReplayPlayer::Replay(const bool serializationtest, const int rejointesttur
+ 
+ 	SAFE_DELETE(m_Stream);
+ 
+-	g_Profiler2.SaveToFile();
++	if (!dumpedState)
++	{
++		g_Profiler2.SaveToFile();
+ 
+-	std::string hash;
+-	bool ok = g_Game->GetSimulation2()->ComputeStateHash(hash, false);
+-	ENSURE(ok);
+-	debug_printf("# Final state: %s\n", Hexify(hash).c_str());
++		std::string hash;
++		bool ok = g_Game->GetSimulation2()->ComputeStateHash(hash, false);
++		ENSURE(ok);
++		debug_printf("# Final state: %s\n", Hexify(hash).c_str());
+ 
+-	{
+ 		CmpPtr<ICmpGuiInterface> cmpGuiInterface(*g_Game->GetSimulation2(), SYSTEM_ENTITY);
+ 		if (cmpGuiInterface)
+ 		{
+@@ -356,6 +394,34 @@ void CReplayPlayer::Replay(const bool serializationtest, const int rejointesttur
+ 	SAFE_DELETE(g_ScriptStatsTable);
+ }
+ 
++void CReplayPlayer::DumpState(const OsPath& outPath, u32 turn) const
++{
++	std::stringstream stream;
++
++	// `commands.txt`'s "turn N" blocks are offset by one from wire-turn
++	// numbering: wire turn 0 never gets its own executed simulation step
++	// (CTurnManager::AddCommand rejects turn <= m_CurrentTurn, which starts
++	// at 0), so the dedicated server's `write_commands_txt` writes wire turn
++	// N+1's commands under block label N. Having just executed block `turn`,
++	// the simulation is therefore at wire turn `turn + 1` -- write that, to
++	// match what CNetClient::OnFileTransferRequest's live rejoin-state
++	// producer writes and CNetClient::LoadFinished's consumer expects.
++	u32 wireTurn = to_le32(turn + 1);
++	stream.write(reinterpret_cast<const char*>(&wireTurn), sizeof(wireTurn));
++
++	bool ok = g_Game->GetSimulation2()->SerializeState(stream);
++	ENSURE(ok);
++
++	std::string compressed;
++	CompressZLib(stream.str(), compressed, true);
++
++	std::ofstream outStream(OsString(outPath), std::ofstream::out | std::ofstream::trunc | std::ofstream::binary);
++	outStream << compressed;
++	outStream.close();
++
++	debug_printf("FILES| Rejoin state dumped at wire turn %u to '%s'\n", turn + 1, outPath.string8().c_str());
++}
++
+ void CReplayPlayer::TestHash(const std::string& hashType, const std::string& replayHash, const bool testHashFull, const bool testHashQuick)
+ {
+ 	bool quick = (hashType == "hash-quick");
+@@ -371,4 +437,13 @@ void CReplayPlayer::TestHash(const std::string& hashType, const std::string& rep
+ 		debug_printf("%s ok (%s)\n", hashType.c_str(), hexHash.c_str());
+ 	else
+ 		debug_printf("%s MISMATCH (%s != %s)\n", hashType.c_str(), hexHash.c_str(), replayHash.c_str());
++
++	// Same OOS-hunting aid as the live path (`-conf=hashbreakdown:true`, see
++	// CComponentManager::DebugQuickHashBreakdown): on a reduced-hash mismatch
++	// the combined digest can't say whether the simulation RNG, the entity-id
++	// counter or an actual unit position drifted. Printed for matches too, so
++	// two replay runs can be diffed line for line.
++	if (DebugHashBreakdownEnabled())
++		debug_printf("hashbreakdown quick=%d %s\n", quick ? 1 : 0,
++			g_Game->GetSimulation2()->DebugQuickHashBreakdown().c_str());
+ }
+diff --git a/source/ps/Replay.h b/source/ps/Replay.h
+index cb7034386b..4ade4834ce 100644
+--- a/source/ps/Replay.h
++++ b/source/ps/Replay.h
+@@ -114,11 +114,43 @@ public:
+ 	~CReplayPlayer();
+ 
+ 	void Load(const OsPath& path);
+-	void Replay(const bool serializationtest, const int rejointestturn, const bool ooslog, const bool testHashFull, const bool testHashQuick);
++
++	/**
++	 * @param dumpStateAtTurn if >= 0, stop after executing the "turn
++	 * dumpStateAtTurn" block and write serialized simulation state to
++	 * dumpStateOut instead of computing the final hash / REPLAY_RESULT
++	 * (SIDECAR.md 1.10.4: used by the dedicated server to reconstruct
++	 * rejoin state for a match it isn't simulating live).
++	 * @param dumpStateOut destination path, required if dumpStateAtTurn >= 0.
++	 * @param viaTurnManager debug-only (-sidecar-replay): drive the simulation
++	 * through CTurnManager::Update() (as a live client does) instead of a
++	 * direct CSimulation2::Update() call, and set SetAIHost(true) the way a
++	 * live -autostart-ai-host sidecar would. Used to test whether that code
++	 * path, rather than the AI-host flag itself, explains a live-only OOS.
++	 * @param aiHost debug-only (-replay-ai-host): set SetAIHost(true) without
++	 * also switching to the CTurnManager path, so a recorded match can be
++	 * replayed under exactly the flag the live sidecar had while the
++	 * commands stay the ones that were actually executed. Separating the two
++	 * is what makes an AI-host-gated behaviour testable offline; -sidecar-replay
++	 * bundles them and so can only test both at once. Implied by viaTurnManager.
++	 */
++	void Replay(const bool serializationtest, const int rejointestturn, const bool ooslog, const bool testHashFull, const bool testHashQuick,
++		const int dumpStateAtTurn = -1, const OsPath& dumpStateOut = OsPath(), const bool viaTurnManager = false,
++		const bool aiHost = false);
+ 
+ private:
+ 	std::istream* m_Stream;
+ 	void TestHash(const std::string& hashType, const std::string& replayHash, const bool testHashFull, const bool testHashQuick);
++
++	/**
++	 * Writes the same wire-turn-prefixed, zlib-compressed serialized state
++	 * that CNetClient::OnFileTransferRequest produces for a live rejoin, so
++	 * a client can consume `outPath`'s contents exactly as it would that
++	 * message's payload. `turn` is this replay's own block-label turn
++	 * counter (see the "turn"/"end" tokens in Replay()), which is one less
++	 * than the wire-turn it represents -- see the comment at the call site.
++	 */
++	void DumpState(const OsPath& outPath, u32 turn) const;
+ };
+ 
+ #endif // INCLUDED_REPLAY
+diff --git a/source/simulation2/Simulation2.cpp b/source/simulation2/Simulation2.cpp
+index 58194c028f..b9c280ddcb 100644
+--- a/source/simulation2/Simulation2.cpp
++++ b/source/simulation2/Simulation2.cpp
+@@ -150,6 +150,13 @@ public:
+ 
+ 	bool m_SkipAI{false};
+ 
++	// Whether this is a headless AI-host sidecar: it computes AI and sends
++	// the resulting moves as network commands even though it isn't (and
++	// must never become) the controller. Set locally at connection time
++	// (CNetClient::StartGame, from -autostart-ai-host), never learned from
++	// the network -- see SIDECAR.md chapter 1.
++	bool m_IsAIHost{false};
++
+ 	// Functions and data for the serialization test mode: (see Update() for relevant comments)
+ 
+ 	bool m_EnableSerializationTest{false};
+@@ -885,6 +892,27 @@ bool CSimulation2::ComputeStateHash(std::string& outHash, bool quick)
+ 	return m->m_ComponentManager.ComputeStateHash(outHash, quick);
+ }
+ 
++std::string CSimulation2::DebugQuickHashBreakdown() const
++{
++	return m->m_ComponentManager.DebugQuickHashBreakdown();
++}
++
++bool DebugHashBreakdownEnabled()
++{
++	// Two gates because the two code paths that log this don't share a
++	// configuration mechanism: live play has an initialised CConfigDB (so
++	// `-conf=hashbreakdown:true` works, like `-conf=ooslog:true`), but the
++	// `-replay=` path in main.cpp mounts the VFS by hand and never
++	// initialises it -- which is why Replay.cpp has to call EnableOOSLog()
++	// explicitly rather than reading the config. The environment variable
++	// covers both, and is also the easier one to hand to a sidecar the relay
++	// spawns.
++	static const bool enabled =
++		CConfigDB::GetIfInitialised("hashbreakdown", false) ||
++		std::getenv("PYROGENESIS_HASH_BREAKDOWN") != nullptr;
++	return enabled;
++}
++
+ bool CSimulation2::DumpDebugState(std::ostream& stream)
+ {
+ 	stream << "sim turn: " << m->m_TurnNumber << std::endl;
+@@ -995,6 +1023,16 @@ bool CSimulation2::IsAISkipped() const
+ 	return m->m_SkipAI;
+ }
+ 
++void CSimulation2::SetAIHost(bool isAIHost)
++{
++	m->m_IsAIHost = isAIHost;
++}
++
++bool CSimulation2::IsAIHost() const
++{
++	return m->m_IsAIHost;
++}
++
+ std::string CSimulation2::GetAIData()
+ {
+ 	const ScriptInterface& scriptInterface = GetScriptInterface();
+diff --git a/source/simulation2/Simulation2.h b/source/simulation2/Simulation2.h
+index 4b3799c009..2ce33b12a4 100644
+--- a/source/simulation2/Simulation2.h
++++ b/source/simulation2/Simulation2.h
+@@ -237,7 +237,18 @@ public:
+ 	ScriptInterface& GetScriptInterface() const;
+ 
+ 	bool ComputeStateHash(std::string& outHash, bool quick);
++
++	/**
++	 * Debug aid for out-of-sync hunting: the reduced hash's three inputs
++	 * (simulation RNG, entity-id counter, positions-only sub-hash) as one
++	 * line, so the cause of a divergence can be narrowed in a single run.
++	 * Enable the per-turn logging with `-conf=hashbreakdown:true` on every
++	 * process being compared; see `CNetClientTurnManager::NotifyFinishedUpdate`.
++	 */
++	std::string DebugQuickHashBreakdown() const;
++
+ 	bool DumpDebugState(std::ostream& stream);
++
+ 	bool SerializeState(std::ostream& stream);
+ 	bool DeserializeState(std::istream& stream);
+ 
+@@ -287,6 +298,18 @@ public:
+ 	void SetAISkipped(bool skip);
+ 	bool IsAISkipped() const;
+ 
++	/**
++	 * Mark this simulation as running in a headless AI-host sidecar
++	 * (SIDECAR.md chapter 1): it computes AI and sends the resulting moves
++	 * as network commands even though it isn't the controller. Read by
++	 * `InitGame.js` to decide whether to set the per-player AI flag when
++	 * registering an AI player (SIDECAR.md 1.3.1) and by
++	 * `CCmpAIManager::PushCommands` to promotion-resolve outgoing `train`
++	 * commands before they reach the wire (SIDECAR.md 1.4.4).
++	 */
++	void SetAIHost(bool isAIHost);
++	bool IsAIHost() const;
++
+ 	/**
+ 	 * Get AI data
+ 	 *
+@@ -298,4 +321,12 @@ private:
+ 	const std::unique_ptr<CSimulation2Impl> m;
+ };
+ 
++/**
++ * Whether to log CSimulation2::DebugQuickHashBreakdown() every turn. Enabled by
++ * `-conf=hashbreakdown:true` (live play) or by setting the environment variable
++ * PYROGENESIS_HASH_BREAKDOWN to anything (works in replay mode too, where the
++ * config database is never initialised). Read once.
++ */
++bool DebugHashBreakdownEnabled();
++
+ #endif // INCLUDED_SIMULATION2
+diff --git a/source/simulation2/components/CCmpAIManager.cpp b/source/simulation2/components/CCmpAIManager.cpp
+index 5d1c5a15ec..ac2240bf58 100644
+--- a/source/simulation2/components/CCmpAIManager.cpp
++++ b/source/simulation2/components/CCmpAIManager.cpp
+@@ -895,6 +895,23 @@ public:
+ 
+ 	void Serialize(ISerializer& serialize) override
+ 	{
++		// Deliberately NOT skipped when hashing (SIDECAR.md 1.9.4): a real
++		// stock client has no such skip, so its hash always includes this
++		// component's contribution -- omitting it here would only guarantee
++		// a mismatch against every stock client instead of the intended
++		// "matches everywhere" (an earlier version of this code tried
++		// exactly that and broke full-hash agreement with stock builds,
++		// including the dedicated server's own post-match replay
++		// verification). When no AI is registered (`m_Players` empty, e.g.
++		// on every client but the hosted-AI sidecar, since the per-player
++		// `AI` field is stripped for them -- see SIDECAR.md 1.3), this
++		// writes only "num ais: 0" and `m_Worker.Serialize()` below is a
++		// no-op (`CAIWorker::SerializeState` returns immediately for empty
++		// `m_Players`), so the contribution is trivially identical across
++		// every client that isn't running AI. The sidecar's own non-empty
++		// contribution still won't match anyone else's -- that's expected
++		// and handled by excluding it from full-hash comparison entirely
++		// (SIDECAR.md 1.9.5, `TurnManager::notify_finished_client_update`).
+ 		serialize.NumberU32_Unbounded("num ais", m_Worker.getPlayerSize());
+ 
+ 		// Because the AI worker uses its own ScriptInterface, we can't use the
+@@ -929,9 +946,29 @@ public:
+ 		// AI players can cheat and see through FoW/SoD, since that greatly simplifies
+ 		// their implementation.
+ 		// (TODO: maybe cleverer AIs should be able to optionally retain FoW/SoD)
+-		CmpPtr<ICmpRangeManager> cmpRangeManager(GetSystemEntity());
+-		if (cmpRangeManager)
+-			cmpRangeManager->SetLosRevealAll(player, true);
++		//
++		// Skipped on the hosted-AI sidecar (SIDECAR.md chapter 1): real
++		// players run a fixed stock build we cannot patch (SIDECAR.md 0.4),
++		// so a stock client never reaches this call at all for this player
++		// (the per-player `AI` field, and so this whole AddPlayer call, is
++		// stripped from what every client but the sidecar receives -- see
++		// SIDECAR.md 1.3). If the sidecar alone revealed this player's fog
++		// of war, that would be a real, permanent difference in
++		// simulation-tracked visibility between it and every real client --
++		// not itself part of the reduced position hash, but capable of
++		// making this player's units take different native, vision-gated
++		// actions (UnitAI targeting, etc.) on the sidecar than everywhere
++		// else, which can surface later as a genuine position divergence.
++		// The AI's own reasoning doesn't need this: it already receives the
++		// complete terrain and full entity list independently of RangeManager
++		// visibility (SIDECAR.md 1.7.1), so skipping it here only removes an
++		// asymmetry, not information the AI actually relies on.
++		if (!(g_Game && g_Game->GetSimulation2()->IsAIHost()))
++		{
++			CmpPtr<ICmpRangeManager> cmpRangeManager(GetSystemEntity());
++			if (cmpRangeManager)
++				cmpRangeManager->SetLosRevealAll(player, true);
++		}
+ 	}
+ 
+ 	void SetRNGSeed(u32 seed) override
+@@ -1053,11 +1090,41 @@ public:
+ 		ScriptRequest rq(scriptInterface);
+ 		JS::RootedValue clonedCommandVal(rq.cx);
+ 
++		const bool isAIHost = g_Game && g_Game->GetSimulation2()->IsAIHost();
++		JS::RootedValue global(rq.cx, isAIHost ? rq.globalValue() : JS::UndefinedValue());
++
+ 		for (size_t i = 0; i < commands.size(); ++i)
+ 		{
+ 			for (size_t j = 0; j < commands[i].commands.size(); ++j)
+ 			{
+ 				Script::ReadStructuredClone(rq, commands[i].commands[j], &clonedCommandVal);
++
++				// SIDECAR.md 1.4.4: on the hosted-AI sidecar, the per-player
++				// AI flag never gets set on any client (1.3.1), so the
++				// promotion resolution `Commands.js`'s "train" handler
++				// normally does for AI-flagged players (checking
++				// `data.cmpPlayer.IsAI()`) never runs. Without it, a
++				// promoted unit's template name doesn't match anything the
++				// building can train and the command is silently discarded
++				// -- do the resolution here instead, before the command
++				// reaches the wire, so every client processes an
++				// already-resolved command identically and the AI flag is
++				// never involved.
++				if (isAIHost)
++				{
++					std::string cmdType;
++					std::string templateName;
++					if (Script::GetProperty(rq, clonedCommandVal, "type", cmdType) &&
++						cmdType == "train" &&
++						Script::GetProperty(rq, clonedCommandVal, "template", templateName))
++					{
++						std::string upgradedTemplate;
++						if (ScriptFunction::Call(rq, global, "GetUpgradedTemplate", upgradedTemplate, commands[i].player, templateName) &&
++							upgradedTemplate != templateName)
++							Script::SetProperty(rq, clonedCommandVal, "template", upgradedTemplate);
++					}
++				}
++
+ 				// In multiplayer, route AI commands through the network so all
+ 				// clients receive them. In singleplayer, push locally.
+ 				if (g_Game && !g_Game->GetSimulation2()->IsAISkipped())
+diff --git a/source/simulation2/system/ComponentManager.cpp b/source/simulation2/system/ComponentManager.cpp
+index 825ecffb05..ac3bdd170c 100644
+--- a/source/simulation2/system/ComponentManager.cpp
++++ b/source/simulation2/system/ComponentManager.cpp
+@@ -25,6 +25,7 @@
+ #include "ps/CStr.h"
+ #include "ps/Errors.h"
+ #include "ps/Filesystem.h"
++#include "ps/Game.h"
+ #include "ps/Profiler2.h"
+ #include "ps/algorithm.h"
+ #include "ps/scripting/JSInterface_VFS.h"
+@@ -32,6 +33,7 @@
+ #include "scriptinterface/Object.h"
+ #include "scriptinterface/ScriptRequest.h"
+ #include "simulation2/MessageTypes.h"
++#include "simulation2/Simulation2.h"
+ #include "simulation2/components/ICmpTemplateManager.h"
+ #include "simulation2/helpers/Player.h"
+ #include "simulation2/system/DynamicSubscription.h"
+@@ -107,6 +109,7 @@ CComponentManager::CComponentManager(CSimContext& context, ScriptContext& cx, bo
+ 		ScriptFunction::Register<&CComponentManager::DestroyComponentsSoon, Getter>(rq, "DestroyEntity");
+ 		ScriptFunction::Register<&CComponentManager::FlushDestroyedComponents, Getter>(rq, "FlushDestroyedEntities");
+ 		ScriptFunction::Register<&CComponentManager::Script_GetTemplate, Getter>(rq, "GetTemplate");
++		ScriptFunction::Register<&CComponentManager::Script_IsAIHost, Getter>(rq, "IsAIHost");
+ 
+ 	}
+ 
+@@ -426,6 +429,18 @@ const CParamNode& CComponentManager::Script_GetTemplate(const std::string& templ
+ 	return *tmpl;
+ }
+ 
++/**
++ * Whether this is the headless AI-host sidecar (SIDECAR.md chapter 1),
++ * mirroring `CSimulation2::IsAIHost()`. `InitGame.js` reads this to decide
++ * whether to set the per-player AI flag when registering an AI player
++ * (SIDECAR.md 1.3.1: the bot is still registered either way -- only the
++ * flag is conditional).
++ */
++bool CComponentManager::Script_IsAIHost() const
++{
++	return g_Game && g_Game->GetSimulation2()->IsAIHost();
++}
++
+ std::vector<int> CComponentManager::Script_GetEntitiesWithInterface(int iid)
+ {
+ 	std::vector<int> ret;
+diff --git a/source/simulation2/system/ComponentManager.h b/source/simulation2/system/ComponentManager.h
+index b344c8d3aa..05a8a175c2 100644
+--- a/source/simulation2/system/ComponentManager.h
++++ b/source/simulation2/system/ComponentManager.h
+@@ -291,6 +291,15 @@ public:
+ 
+ 	// Various state serialization functions:
+ 	bool ComputeStateHash(std::string& outHash, bool quick) const;
++
++	/**
++	 * Debug aid: the reduced ("quick") hash's three inputs -- the simulation
++	 * RNG, the entity-id counter and a positions-only sub-hash -- as one
++	 * human-readable line, so a divergence can be attributed to one of them
++	 * instead of only to the combined digest. Never sent over the wire and
++	 * never folded back into any hash.
++	 */
++	std::string DebugQuickHashBreakdown() const;
+ 	bool DumpDebugState(std::ostream& stream, bool includeDebugInfo) const;
+ 	// FlushDestroyedComponents must be called before SerializeState (since the destruction queue
+ 	// won't get serialized)
+@@ -317,6 +326,7 @@ private:
+ 	int Script_AddEntity(const std::wstring& templateName);
+ 	int Script_AddLocalEntity(const std::wstring& templateName);
+ 	const CParamNode& Script_GetTemplate(const std::string& templateName);
++	bool Script_IsAIHost() const;
+ 
+ 	CMessage* ConstructMessage(int mtid, JS::HandleValue data);
+ 	void SendGlobalMessage(entity_id_t ent, const CMessage& msg);
+diff --git a/source/simulation2/system/ComponentManagerSerialization.cpp b/source/simulation2/system/ComponentManagerSerialization.cpp
+index 686e8fb4e8..43e461aea2 100644
+--- a/source/simulation2/system/ComponentManagerSerialization.cpp
++++ b/source/simulation2/system/ComponentManagerSerialization.cpp
+@@ -20,6 +20,7 @@
+ #include "lib/debug.h"
+ #include "ps/CLogger.h"
+ #include "ps/Profiler2.h"
++#include "ps/Util.h"
+ #include "simulation2/MessageTypes.h"
+ #include "simulation2/components/ICmpTemplateManager.h"
+ #include "simulation2/serialization/DebugSerializer.h"
+@@ -149,6 +150,44 @@ bool CComponentManager::ComputeStateHash(std::string& outHash, bool quick) const
+ 	return true;
+ }
+ 
++std::string CComponentManager::DebugQuickHashBreakdown() const
++{
++	PROFILE2("DebugQuickHashBreakdown");
++
++	// The reduced ("quick") hash above folds three independent things into one
++	// digest: the simulation RNG, the entity-id counter, and every non-local
++	// Position. Two of those are global counters, so a single asymmetric
++	// Math.random() in the simulation realm or a single asymmetric non-local
++	// Engine.AddEntity diverges the digest permanently while the visible game
++	// stays identical -- which makes the digest alone nearly useless for
++	// telling those three causes apart after the fact. Emitting them
++	// separately turns "OOS on turn N" into "the entity-id counter drifted on
++	// turn N", which is a different quality of clue. Debug aid only: nothing
++	// reads this value, it never goes on the wire, and it must not be folded
++	// back into the hash.
++	CHashSerializer positions(m_ScriptInterface);
++
++	std::map<ComponentTypeId, std::map<entity_id_t, IComponent*> >::const_iterator cit =
++		m_ComponentsByTypeId.find(CID_Position);
++	size_t count = 0;
++	if (cit != m_ComponentsByTypeId.end())
++		for (std::map<entity_id_t, IComponent*>::const_iterator eit = cit->second.begin(); eit != cit->second.end(); ++eit)
++		{
++			if (ENTITY_IS_LOCAL(eit->first))
++				continue;
++			positions.NumberU32_Unbounded("entity id", eit->first);
++			eit->second->Serialize(positions);
++			++count;
++		}
++
++	std::stringstream out;
++	out << "rng=" << SerializeRNG(m_RNG)
++		<< " nextEntityId=" << m_NextEntityId
++		<< " positions=" << Hexify(std::string((const char*)positions.ComputeHash(), positions.GetHashLength()))
++		<< " positionCount=" << count;
++	return out.str();
++}
++
+ /*
+  * Simulation state serialization format:
+  *
+diff --git a/source/simulation2/system/TurnManager.h b/source/simulation2/system/TurnManager.h
+index 19687fedd2..7454a03b0b 100644
+--- a/source/simulation2/system/TurnManager.h
++++ b/source/simulation2/system/TurnManager.h
+@@ -167,6 +167,21 @@ public:
+ 	 */
+ 	u32 GetPendingTurns() const { return m_ReadyTurn - m_CurrentTurn; }
+ 
++	/**
++	 * Debug-only: inject a command at an explicit absolute turn, bypassing
++	 * the normal PostCommand()-computed (m_CurrentTurn + m_CommandDelay)
++	 * scheduling. Used by the -sidecar-replay debug CLI mode
++	 * (CReplayPlayer::ReplayViaTurnManager, ../0ad/source/ps/Replay.cpp) to
++	 * replay a recorded commands.txt through the real CTurnManager::Update()
++	 * path instead of a direct CSimulation2::Update() call, so its command
++	 * scheduling matches exactly what was recorded rather than being
++	 * re-derived from a fresh current-turn count.
++	 */
++	void DebugAddCommand(int client, int player, JS::HandleValue data, u32 turn)
++	{
++		AddCommand(client, player, data, turn);
++	}
++
+ protected:
+ 	/**
+ 	 * Store a command to be executed at a given turn.

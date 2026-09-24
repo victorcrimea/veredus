@@ -8,6 +8,7 @@ description = "Dedicated server for 0 A.D. multiplayer games"
 homepage = "https://github.com/victorcrimea/veredus"
 repository = "https://github.com/victorcrimea/veredus"
 readme = "README.md"
+exclude = ["sidecar/"]
 keywords = ["0ad", "enet", "game-server", "multiplayer"]
 categories = ["network-programming", "game-development"]
 

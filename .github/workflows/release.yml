@@ -114,8 +114,8 @@ jobs:
             | `x86_64-pc-windows-msvc` | Windows 10/11 and Server, 64-bit |
 
             The optional sidecar (hosted AI, rejoin snapshots, match results)
-            is a patched 0 A.D. engine, built from source:
-            https://gitea.wildfiregames.com/victorcrimea/0ad/src/branch/feature/server-sidecar/
+            is a patched 0 A.D. engine, built from source with the patches in
+            `sidecar/`. See "Building the sidecar" in the README.
           files: |
             veredus-*.tar.gz
             veredus-*.zip

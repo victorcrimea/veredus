@@ -1,0 +1,45 @@
+From f5861caff013b763ce50a477f948fe5042af1b85 Mon Sep 17 00:00:00 2001
+From: Viktor Semenov <suit.uanic@gmail.com>
+Date: Wed, 26 Aug 2026 10:27:37 +0000
+Subject: [PATCH 4/6] Include AI component state in the synchronized state hash
+ again
+
+Reverts the previous skip of CID_AIManager/AIInterface when computing
+the simulation state hash, so AI state is hashed like any other
+component.
+---
+ .../system/ComponentManagerSerialization.cpp       | 14 --------------
+ 1 file changed, 14 deletions(-)
+
+diff --git a/source/simulation2/system/ComponentManagerSerialization.cpp b/source/simulation2/system/ComponentManagerSerialization.cpp
+index 0784dd8dfa..686e8fb4e8 100644
+--- a/source/simulation2/system/ComponentManagerSerialization.cpp
++++ b/source/simulation2/system/ComponentManagerSerialization.cpp
+@@ -118,12 +118,6 @@ bool CComponentManager::ComputeStateHash(std::string& outHash, bool quick) const
+ 	serializer.StringASCII("rng", SerializeRNG(m_RNG), 0, 32);
+ 	serializer.NumberU32_Unbounded("next entity id", m_NextEntityId);
+ 
+-	// Resolve the dynamic CID for AIInterface at runtime. Scripted components
+-	// get dynamic CIDs (>= CID__LastNative) when registered via JS, so the
+-	// static CID_AIInterfaceScripted enum value doesn't match the actual key
+-	// in m_ComponentsByTypeId.
+-	const ComponentTypeId cidAIInterface = LookupCID("AIInterface");
+-
+ 	std::map<ComponentTypeId, std::map<entity_id_t, IComponent*> >::const_iterator cit = m_ComponentsByTypeId.begin();
+ 	for (; cit != m_ComponentsByTypeId.end(); ++cit)
+ 	{
+@@ -131,14 +125,6 @@ bool CComponentManager::ComputeStateHash(std::string& outHash, bool quick) const
+ 		if (quick && !(cit->first == CID_Position))
+ 			continue;
+ 
+-		// Always skip AI components - AI state is not part of the synchronized
+-		// simulation. AIInterface accumulates events for AI consumption and
+-		// its state diverges when AI computation is skipped on non-host clients.
+-		// AI commands reach all clients via CommandQueue (which IS hashed),
+-		// so game effects are already captured.
+-		if (cit->first == CID_AIManager || (cidAIInterface != CID__Invalid && cit->first == cidAIInterface))
+-			continue;
+-
+ 		// Only emit component types if they have a component that will be serialized
+ 		bool hasEmittedComponent = false;
+ 		for (std::map<entity_id_t, IComponent*>::const_iterator eit = cit->second.begin(); eit != cit->second.end(); ++eit)

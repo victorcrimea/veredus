@@ -1,0 +1,11 @@
+The patches in this directory modify 0 A.D. and its Pyrogenesis engine.
+Like the files they change, they are licensed under the GNU General Public
+License, version 2 or (at your option) any later version. The full text is
+in COPYING.
+
+They apply to the official 0 A.D. release tag v0.28.0:
+https://gitea.wildfiregames.com/0ad/0ad
+
+This license covers only the sidecar/ directory. The rest of this
+repository is licensed under Apache-2.0 (see ../LICENSE), except the
+vendored ENet code under src/enet/, which is MIT.

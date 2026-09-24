@@ -1,0 +1,765 @@
+From 54619460d42712fbfe687f56bab491f22ddbe97b Mon Sep 17 00:00:00 2001
+From: Viktor Semenov <suit.uanic@gmail.com>
+Date: Tue, 3 Mar 2026 16:46:34 +0000
+Subject: [PATCH 1/6] Route AI through network and fix non-host saves
+
+This also allows to rejoin multiplayer games with AI.
+
+Only the controller (host) runs AI computation.
+Non-host clients skip AI entirely via SetAISkipped.
+AI commands route through PostNetworkCommand so all
+clients receive them via the server. The server
+validates that the controller may only send commands
+for unassigned (AI) players.
+
+Non-host clients fetch the controller's full game
+state before saving, ensuring AI state is preserved.
+The save request reuses the existing REJOIN file
+transfer path: the server requests serialized state
+from the controller, then forwards it to the
+requesting client, which strips the turn prefix and
+writes the save.
+
+AIManager and AIInterface components are excluded
+from the state hash since AI state diverges across
+clients while game effects are captured through
+CommandQueue.
+---
+ source/network/NetClient.cpp                  | 59 ++++++++++++++++++
+ source/network/NetClient.h                    | 17 ++++++
+ source/network/NetClientTurnManager.cpp       |  7 ++-
+ source/network/NetClientTurnManager.h         |  2 +-
+ source/network/NetServer.cpp                  | 60 ++++++++++++++++++-
+ source/ps/Game.cpp                            |  1 +
+ source/ps/SavedGame.cpp                       | 34 ++++++++---
+ source/ps/SavedGame.h                         | 13 ++++
+ source/ps/scripting/JSInterface_SavedGame.cpp | 24 ++++++++
+ source/rlinterface/RLInterface.cpp            |  2 +-
+ source/simulation2/Simulation2.cpp            | 17 +++++-
+ source/simulation2/Simulation2.h              |  8 +++
+ .../simulation2/components/CCmpAIManager.cpp  | 10 +++-
+ .../components/CCmpCommandQueue.cpp           |  5 +-
+ .../components/ICmpCommandQueue.cpp           |  5 +-
+ .../simulation2/components/ICmpCommandQueue.h | 15 ++++-
+ .../system/ComponentManagerSerialization.cpp  | 14 +++++
+ .../simulation2/system/LocalTurnManager.cpp   |  9 +--
+ source/simulation2/system/LocalTurnManager.h  |  3 +-
+ source/simulation2/system/TurnManager.h       |  5 +-
+ 20 files changed, 276 insertions(+), 34 deletions(-)
+
+diff --git a/source/network/NetClient.cpp b/source/network/NetClient.cpp
+index 0b4929d934..dcbc4f7948 100644
+--- a/source/network/NetClient.cpp
++++ b/source/network/NetClient.cpp
+@@ -37,6 +37,7 @@
+ #include "ps/Compress.h"
+ #include "ps/Game.h"
+ #include "ps/Hashing.h"
++#include "ps/SavedGame.h"
+ #include "ps/Profile.h"
+ #include "ps/Threading.h"
+ #include "scriptinterface/JSON.h"
+@@ -133,6 +134,7 @@ CNetClient::CNetClient(CGame* game) :
+ 	AddTransition(NCS_INGAME, (uint)NMT_FLARE, NCS_INGAME, &OnFlare, this);
+ 	AddTransition(NCS_INGAME, (uint)NMT_SYNC_ERROR, NCS_INGAME, &OnInGame, this);
+ 	AddTransition(NCS_INGAME, (uint)NMT_END_COMMAND_BATCH, NCS_INGAME, &OnInGame, this);
++	AddTransition(NCS_INGAME, (uint)NMT_JOIN_SYNC_START, NCS_INGAME, &OnSaveGameStateReceived, this);
+ 
+ 	// Set first state
+ 	SetFirstState(NCS_UNCONNECTED);
+@@ -469,6 +471,8 @@ void CNetClient::HandleDisconnect(u32 reason)
+ 
+ 	DestroyConnection();
+ 
++	m_PendingSave.reset();
++
+ 	// Update the state immediately to UNCONNECTED (don't bother with FSM transitions since
+ 	// we'd need one for every single state, and we don't need to use per-state actions)
+ 	SetCurrState(NCS_UNCONNECTED);
+@@ -670,6 +674,10 @@ void CNetClient::StartGame(const JS::MutableHandleValue initAttributes, const st
+ 	m_ClientTurnManager = new CNetClientTurnManager{*m_Game->GetSimulation2(), *this,
+ 		static_cast<int>(m_HostID), m_Game->GetReplayLogger()};
+ 
++	// Only the controller (host) runs AI; non-host clients skip AI entirely.
++	if (!m_IsController)
++		m_Game->GetSimulation2()->SetAISkipped(true);
++
+ 	m_Game->SetPlayerID(player);
+ 	m_Game->StartGame(initAttributes, savedState);
+ }
+@@ -1070,3 +1078,54 @@ bool CNetClient::OnFlare(CNetClient* client, CFsmEvent<CNetMessage*>* event)
+ 
+ 	return true;
+ }
++
++void CNetClient::RequestSaveGame(const CStrW& filename, const CStrW& description, const Script::StructuredClone& guiMetadataClone)
++{
++	if (m_PendingSave)
++		return;
++
++	m_PendingSave = PendingSave{filename, description, guiMetadataClone};
++
++	// Send NMT_SAVED_GAME_START with empty initAttributes to signal a save request
++	CGameSavedStartMessage gameSavedStart;
++	gameSavedStart.m_InitAttributes = "";
++	SendMessage(&gameSavedStart);
++}
++
++bool CNetClient::OnSaveGameStateReceived(CNetClient* client, CFsmEvent<CNetMessage*>* event)
++{
++	ENSURE(event->GetType() == static_cast<uint>(NMT_JOIN_SYNC_START));
++
++	if (!client->m_PendingSave)
++		return true;
++
++	client->m_Session->GetFileTransferer().StartTask(CNetFileTransferer::RequestType::REJOIN,
++		[client](std::string buffer)
++		{
++			if (!client->m_PendingSave)
++				return;
++
++			std::string state;
++			DecompressZLib(buffer, state, true);
++
++			// Strip the 4-byte turn number prefix
++			if (state.size() < 4)
++			{
++				client->m_PendingSave.reset();
++				return;
++			}
++
++			std::string simState(state.begin() + 4, state.end());
++
++			SavedGames::SaveWithState(
++				client->m_PendingSave->m_Filename,
++				client->m_PendingSave->m_Description,
++				*client->m_Game->GetSimulation2(),
++				client->m_PendingSave->m_GuiMetadataClone,
++				simState);
++
++			client->m_PendingSave.reset();
++		});
++
++	return true;
++}
+diff --git a/source/network/NetClient.h b/source/network/NetClient.h
+index c34835d5e0..a83e82c0a5 100644
+--- a/source/network/NetClient.h
++++ b/source/network/NetClient.h
+@@ -27,6 +27,7 @@
+ #include "ps/CStr.h"
+ #include "scriptinterface/Object.h"
+ #include "scriptinterface/ScriptRequest.h"
++#include "scriptinterface/StructuredClone.h"
+ 
+ #include <ctime>
+ #include <deque>
+@@ -274,6 +275,12 @@ public:
+ 	 */
+ 	void SendPausedMessage(bool pause);
+ 
++	/**
++	 * Request a save game. For non-controller clients, this fetches the
++	 * controller's game state before saving.
++	 */
++	void RequestSaveGame(const CStrW& filename, const CStrW& description, const Script::StructuredClone& guiMetadataClone);
++
+ 	/**
+ 	 * @return Whether the NetClient is shutting down.
+ 	 */
+@@ -310,6 +317,7 @@ private:
+ 	static bool OnClientsLoading(CNetClient* client, CFsmEvent<CNetMessage*>* event);
+ 	static bool OnClientPaused(CNetClient* client, CFsmEvent<CNetMessage*>* event);
+ 	static bool OnLoadedGame(CNetClient* client, CFsmEvent<CNetMessage*>* event);
++	static bool OnSaveGameStateReceived(CNetClient* client, CFsmEvent<CNetMessage*>* event);
+ 
+ 	/**
+ 	 * Take ownership of a session object, and use it for all network communication.
+@@ -371,6 +379,15 @@ private:
+ 	/// Serialized game state received when joining an in-progress game
+ 	std::string m_JoinSyncBuffer;
+ 
++	/// Pending save info for non-controller save requests
++	struct PendingSave
++	{
++		CStrW m_Filename;
++		CStrW m_Description;
++		Script::StructuredClone m_GuiMetadataClone;
++	};
++	std::optional<PendingSave> m_PendingSave;
++
+ 	std::string m_SavedState;
+ 
+ 	/// Time when the server was last checked for timeouts and bad latency
+diff --git a/source/network/NetClientTurnManager.cpp b/source/network/NetClientTurnManager.cpp
+index 9c5cf20a36..81faef63cb 100644
+--- a/source/network/NetClientTurnManager.cpp
++++ b/source/network/NetClientTurnManager.cpp
+@@ -50,12 +50,13 @@ CNetClientTurnManager::CNetClientTurnManager(CSimulation2& simulation, CNetClien
+ {
+ }
+ 
+-void CNetClientTurnManager::PostCommand(JS::HandleValue data)
++void CNetClientTurnManager::PostCommand(JS::HandleValue data, std::optional<player_id_t> player)
+ {
+-	NETCLIENTTURN_LOG("PostCommand()\n");
++	NETCLIENTTURN_LOG("PostCommand(player=%d)\n", player.value_or(m_PlayerId));
+ 
+ 	// Transmit command to server
+-	CSimulationMessage msg(m_Simulation2.GetScriptInterface(), m_ClientId, m_PlayerId, m_CurrentTurn + m_CommandDelay, data);
++	CSimulationMessage msg(m_Simulation2.GetScriptInterface(), m_ClientId,
++		player.value_or(m_PlayerId), m_CurrentTurn + m_CommandDelay, data);
+ 	m_NetClient.SendMessage(&msg);
+ 
+ 	// Add to our local queue
+diff --git a/source/network/NetClientTurnManager.h b/source/network/NetClientTurnManager.h
+index 03cb4956c6..1b6fe18058 100644
+--- a/source/network/NetClientTurnManager.h
++++ b/source/network/NetClientTurnManager.h
+@@ -42,7 +42,7 @@ public:
+ 
+ 	void OnSimulationMessage(CSimulationMessage* msg) override;
+ 
+-	void PostCommand(JS::HandleValue data) override;
++	void PostCommand(JS::HandleValue data, std::optional<player_id_t> player = std::nullopt) override;
+ 
+ 	/**
+ 	 * Notify the server that all commands are sent to prepare the connection for termination.
+diff --git a/source/network/NetServer.cpp b/source/network/NetServer.cpp
+index 98ed8f7631..38120b6c0d 100644
+--- a/source/network/NetServer.cpp
++++ b/source/network/NetServer.cpp
+@@ -711,6 +711,7 @@ void CNetServerWorker::SetupSession(CNetServerSession* session)
+ 	session->AddTransition(NSS_INGAME, (uint)NMT_FLARE, NSS_INGAME, &OnFlare, session);
+ 	session->AddTransition(NSS_INGAME, (uint)NMT_SYNC_CHECK, NSS_INGAME, &OnSyncCheck, session);
+ 	session->AddTransition(NSS_INGAME, (uint)NMT_END_COMMAND_BATCH, NSS_INGAME, &OnEndCommandBatch, session);
++	session->AddTransition(NSS_INGAME, (uint)NMT_SAVED_GAME_START, NSS_INGAME, &OnSavedGameStart, session);
+ 
+ 	// Set first state
+ 	session->SetFirstState(NSS_HANDSHAKE);
+@@ -1213,8 +1214,26 @@ bool CNetServerWorker::OnSimulationCommand(CNetServerSession* session, CFsmEvent
+ 
+ 	PlayerAssignmentMap::iterator it = server.m_PlayerAssignments.find(session->GetGUID());
+ 	// When cheating is disabled, fail if the player the message claims to
+-	// represent does not exist or does not match the sender's player name
+-	if (!cheatsEnabled && (it == server.m_PlayerAssignments.end() || it->second.m_PlayerID != message->m_Player))
++	// represent does not exist or does not match the sender's player name.
++	// Exception: the controller (host) may send commands on behalf of AI players,
++	// but only if the target player is not assigned to any human client.
++	bool isController = session->GetGUID() == server.m_ControllerGUID;
++	if (!cheatsEnabled && it != server.m_PlayerAssignments.end() &&
++		it->second.m_PlayerID != message->m_Player)
++	{
++		if (!isController)
++			return true;
++
++		// Verify the target player is not assigned to any human client
++		if (std::any_of(server.m_PlayerAssignments.begin(),
++			server.m_PlayerAssignments.end(),
++			[&](const auto& p) {
++				return p.second.m_Enabled
++					&& p.second.m_PlayerID == message->m_Player;
++			}))
++			return true;
++	}
++	else if (!cheatsEnabled && it == server.m_PlayerAssignments.end())
+ 		return true;
+ 
+ 	// Send it back to all clients that have finished
+@@ -1380,7 +1399,44 @@ bool CNetServerWorker::OnSavedGameStart(CNetServerSession* session, CFsmEvent<CN
+ 	CNetServerWorker& server{session->GetServer()};
+ 
+ 	if (session->GetGUID() != server.m_ControllerGUID)
++	{
++		// Non-controller client wants to save: fetch state from controller
++		CNetServerSession* controllerSession = nullptr;
++		for (CNetServerSession* s : server.m_Sessions)
++		{
++			if (s->GetGUID() == server.m_ControllerGUID)
++			{
++				controllerSession = s;
++				break;
++			}
++		}
++
++		if (!controllerSession)
++			return true;
++
++		u32 requestingHostID = session->GetHostID();
++		controllerSession->GetFileTransferer().StartTask(CNetFileTransferer::RequestType::REJOIN,
++			[&server, requestingHostID](std::string buffer)
++			{
++				const auto sessionIt = std::find_if(server.m_Sessions.begin(), server.m_Sessions.end(),
++					[requestingHostID](const CNetServerSession* s)
++					{
++						return s->GetHostID() == requestingHostID;
++					});
++
++				if (sessionIt == server.m_Sessions.end())
++					return;
++
++				server.m_JoinSyncFile = std::move(buffer);
++
++				CJoinSyncStartMessage message;
++				message.m_InitAttributes = Script::StringifyJSON(
++					ScriptRequest{server.GetScriptInterface()}, &server.m_InitAttributes);
++				(*sessionIt)->SendMessage(&message);
++			});
++
+ 		return true;
++	}
+ 
+ 	CGameSavedStartMessage* message = static_cast<CGameSavedStartMessage*>(event->GetParamRef());
+ 	session->GetFileTransferer().StartTask(CNetFileTransferer::RequestType::LOADGAME,
+diff --git a/source/ps/Game.cpp b/source/ps/Game.cpp
+index e612effa19..a6f2064090 100644
+--- a/source/ps/Game.cpp
++++ b/source/ps/Game.cpp
+@@ -193,6 +193,7 @@ bool CGame::StartVisualReplay(const OsPath& replayPath)
+ 	debug_printf("Starting to replay %s\n", replayPath.string8().c_str());
+ 
+ 	m_IsVisualReplay = true;
++	m_Simulation2->SetAISkipped(true);
+ 
+ 	SetTurnManager(new CReplayTurnManager(*m_Simulation2, GetReplayLogger()));
+ 
+diff --git a/source/ps/SavedGame.cpp b/source/ps/SavedGame.cpp
+index 6e7ea7bc1b..de42644c68 100644
+--- a/source/ps/SavedGame.cpp
++++ b/source/ps/SavedGame.cpp
+@@ -76,7 +76,7 @@ Status SavedGames::SavePrefix(const CStrW& prefix, const CStrW& description, CSi
+ 	return Save(filename.Filename().string(), description, simulation, guiMetadataClone);
+ }
+ 
+-Status SavedGames::Save(const CStrW& name, const CStrW& description, CSimulation2& simulation, const Script::StructuredClone& guiMetadataClone)
++static Status SaveInternal(const CStrW& name, const CStrW& description, CSimulation2& simulation, const Script::StructuredClone& guiMetadataClone, const std::string* externalSimState)
+ {
+ 	ScriptRequest rq(simulation.GetScriptInterface());
+ 
+@@ -97,11 +97,21 @@ Status SavedGames::Save(const CStrW& name, const CStrW& description, CSimulation
+ 
+ 	time_t now = time(NULL);
+ 
+-	// Construct the serialized state to be saved
+-
+-	std::stringstream simStateStream;
+-	if (!simulation.SerializeState(simStateStream))
+-		WARN_RETURN(ERR::FAIL);
++	// Get the simulation state - either serialize locally or use provided bytes
++	const std::string* simStateData;
++	std::string localSimState;
++	if (externalSimState)
++	{
++		simStateData = externalSimState;
++	}
++	else
++	{
++		std::stringstream simStateStream;
++		if (!simulation.SerializeState(simStateStream))
++			WARN_RETURN(ERR::FAIL);
++		localSimState = simStateStream.str();
++		simStateData = &localSimState;
++	}
+ 
+ 	JS::RootedValue initAttributes(rq.cx, simulation.GetInitAttributes());
+ 	JS::RootedValue mods(rq.cx);
+@@ -151,7 +161,7 @@ Status SavedGames::Save(const CStrW& name, const CStrW& description, CSimulation
+ 		WARN_RETURN(ERR::FAIL);
+ 
+ 	WARN_RETURN_STATUS_IF_ERR(archiveWriter->AddMemory((const u8*)metadataString.c_str(), metadataString.length(), now, "metadata.json"));
+-	WARN_RETURN_STATUS_IF_ERR(archiveWriter->AddMemory((const u8*)simStateStream.str().c_str(), simStateStream.str().length(), now, "simulation.dat"));
++	WARN_RETURN_STATUS_IF_ERR(archiveWriter->AddMemory((const u8*)simStateData->c_str(), simStateData->length(), now, "simulation.dat"));
+ 	archiveWriter.reset(); // close the file
+ 
+ 	WriteBuffer buffer;
+@@ -169,6 +179,16 @@ Status SavedGames::Save(const CStrW& name, const CStrW& description, CSimulation
+ 	return INFO::OK;
+ }
+ 
++Status SavedGames::Save(const CStrW& name, const CStrW& description, CSimulation2& simulation, const Script::StructuredClone& guiMetadataClone)
++{
++	return SaveInternal(name, description, simulation, guiMetadataClone, nullptr);
++}
++
++Status SavedGames::SaveWithState(const CStrW& name, const CStrW& description, CSimulation2& simulation, const Script::StructuredClone& guiMetadataClone, const std::string& simState)
++{
++	return SaveInternal(name, description, simulation, guiMetadataClone, &simState);
++}
++
+ /**
+  * Helper class for retrieving data from saved game archives
+  */
+diff --git a/source/ps/SavedGame.h b/source/ps/SavedGame.h
+index a9958c4760..e50aa8fe5a 100644
+--- a/source/ps/SavedGame.h
++++ b/source/ps/SavedGame.h
+@@ -65,6 +65,19 @@ namespace SavedGames
+ 	 */
+ 	Status SavePrefix(const CStrW& prefix, const CStrW& description, CSimulation2& simulation, const Script::StructuredClone& guiMetadataClone);
+ 
++	/**
++	 * Create new saved game archive using pre-serialized simulation state.
++	 * Metadata (camera, mods, initAttributes) is still taken from the local simulation.
++	 *
++	 * @param name Name to save the game with
++	 * @param description A user-given description of the save
++	 * @param simulation Used for metadata (initAttributes, scriptInterface) but NOT for serialization
++	 * @param guiMetadataClone if not NULL, store some UI-related data with the saved game
++	 * @param simState Pre-serialized simulation state bytes
++	 * @return INFO::OK if successfully saved, else an error Status
++	 */
++	Status SaveWithState(const CStrW& name, const CStrW& description, CSimulation2& simulation, const Script::StructuredClone& guiMetadataClone, const std::string& simState);
++
+ 	struct LoadResult
+ 	{
+ 		// Object containing metadata associated with saved game,
+diff --git a/source/ps/scripting/JSInterface_SavedGame.cpp b/source/ps/scripting/JSInterface_SavedGame.cpp
+index ba60cefadf..44af8c3b06 100644
+--- a/source/ps/scripting/JSInterface_SavedGame.cpp
++++ b/source/ps/scripting/JSInterface_SavedGame.cpp
+@@ -20,10 +20,13 @@
+ #include "JSInterface_SavedGame.h"
+ 
+ #include "lib/debug.h"
++#include "lib/file/vfs/vfs_path.h"
++#include "lib/file/vfs/vfs_util.h"
+ #include "network/NetClient.h"
+ #include "network/NetServer.h"
+ #include "ps/CLogger.h"
+ #include "ps/CStr.h"
++#include "ps/Filesystem.h"
+ #include "ps/Game.h"
+ #include "ps/SavedGame.h"
+ #include "scriptinterface/FunctionWrapper.h"
+@@ -56,6 +59,13 @@ bool DeleteSavedGame(const std::wstring& name)
+ void SaveGame(const ScriptRequest& rq, const std::wstring& filename, const std::wstring& description, JS::HandleValue GUIMetadata)
+ {
+ 	Script::StructuredClone GUIMetadataClone = Script::WriteStructuredClone(rq, GUIMetadata);
++
++	if (g_NetClient && !g_NetClient->IsController())
++	{
++		g_NetClient->RequestSaveGame(filename, description, GUIMetadataClone);
++		return;
++	}
++
+ 	if (SavedGames::Save(filename, description, *g_Game->GetSimulation2(), GUIMetadataClone) < 0)
+ 		LOGERROR("Failed to save game");
+ }
+@@ -63,6 +73,20 @@ void SaveGame(const ScriptRequest& rq, const std::wstring& filename, const std::
+ void SaveGamePrefix(const ScriptRequest& rq, const std::wstring& prefix, const std::wstring& description, JS::HandleValue GUIMetadata)
+ {
+ 	Script::StructuredClone GUIMetadataClone = Script::WriteStructuredClone(rq, GUIMetadata);
++
++	if (g_NetClient && !g_NetClient->IsController())
++	{
++		// Resolve the prefix to a filename locally, then route through NetClient
++		const VfsPath basenameFormat(L"saves/" + prefix + L"-%04d");
++		const VfsPath filenameFormat = basenameFormat.ChangeExtension(L".0adsave");
++		VfsPath resolvedFilename;
++		size_t nextSaveNumber = 0;
++		vfs::NextNumberedFilename(g_VFS, filenameFormat, nextSaveNumber, resolvedFilename);
++
++		g_NetClient->RequestSaveGame(resolvedFilename.Filename().string(), description, GUIMetadataClone);
++		return;
++	}
++
+ 	if (SavedGames::SavePrefix(prefix, description, *g_Game->GetSimulation2(), GUIMetadataClone) < 0)
+ 		LOGERROR("Failed to save game");
+ }
+diff --git a/source/rlinterface/RLInterface.cpp b/source/rlinterface/RLInterface.cpp
+index a4328e164e..6a89028e76 100644
+--- a/source/rlinterface/RLInterface.cpp
++++ b/source/rlinterface/RLInterface.cpp
+@@ -402,7 +402,7 @@ void Interface::ApplyMessage(const GameMessage& msg)
+ 				ScriptRequest rq(scriptInterface);
+ 				JS::RootedValue commandJSON(rq.cx);
+ 				Script::ParseJSON(rq, command.json_cmd, &commandJSON);
+-				turnMgr->PostCommand(command.playerID, commandJSON);
++				turnMgr->PostCommand(commandJSON, command.playerID);
+ 			}
+ 
+ 			const u32 deltaRealTime = DEFAULT_TURN_LENGTH;
+diff --git a/source/simulation2/Simulation2.cpp b/source/simulation2/Simulation2.cpp
+index 64a7fdce0b..58194c028f 100644
+--- a/source/simulation2/Simulation2.cpp
++++ b/source/simulation2/Simulation2.cpp
+@@ -34,6 +34,7 @@
+ #include "maths/MathUtil.h"
+ #include "ps/CLogger.h"
+ #include "ps/CStr.h"
++#include "ps/Game.h"
+ #include "ps/ConfigDB.h"
+ #include "ps/Errors.h"
+ #include "ps/Filesystem.h"
+@@ -147,6 +148,8 @@ public:
+ 	bool m_EnableOOSLog{false};
+ 	OsPath m_OOSLogPath;
+ 
++	bool m_SkipAI{false};
++
+ 	// Functions and data for the serialization test mode: (see Update() for relevant comments)
+ 
+ 	bool m_EnableSerializationTest{false};
+@@ -577,9 +580,9 @@ void CSimulation2Impl::UpdateComponents(CSimContext& simContext, fixed turnLengt
+ 	// Clean up any entities destroyed during the simulation update
+ 	componentManager.FlushDestroyedComponents();
+ 
+-	// Compute AI immediately at turn's end.
++	// Compute AI immediately at turn's end (only on the AI host).
+ 	CmpPtr<ICmpAIManager> cmpAIManager(simContext, SYSTEM_ENTITY);
+-	if (cmpAIManager)
++	if (cmpAIManager && (!g_Game || !g_Game->GetSimulation2()->IsAISkipped()))
+ 	{
+ 		cmpAIManager->StartComputation();
+ 		cmpAIManager->PushCommands();
+@@ -982,6 +985,16 @@ std::string CSimulation2::GetMapSizes()
+ 	return ReadJSON(L"simulation/data/settings/map_sizes.json");
+ }
+ 
++void CSimulation2::SetAISkipped(bool skip)
++{
++	m->m_SkipAI = skip;
++}
++
++bool CSimulation2::IsAISkipped() const
++{
++	return m->m_SkipAI;
++}
++
+ std::string CSimulation2::GetAIData()
+ {
+ 	const ScriptInterface& scriptInterface = GetScriptInterface();
+diff --git a/source/simulation2/Simulation2.h b/source/simulation2/Simulation2.h
+index 7b1c79dbcc..4b3799c009 100644
+--- a/source/simulation2/Simulation2.h
++++ b/source/simulation2/Simulation2.h
+@@ -279,6 +279,14 @@ public:
+ 	 */
+ 	std::string GetMapSizes();
+ 
++	/**
++	 * Skip AI computation on this machine.
++	 * Set to true for non-host multiplayer clients and during replay.
++	 * When false (default), this machine is the AI host.
++	 */
++	void SetAISkipped(bool skip);
++	bool IsAISkipped() const;
++
+ 	/**
+ 	 * Get AI data
+ 	 *
+diff --git a/source/simulation2/components/CCmpAIManager.cpp b/source/simulation2/components/CCmpAIManager.cpp
+index 1cc2b51642..5d1c5a15ec 100644
+--- a/source/simulation2/components/CCmpAIManager.cpp
++++ b/source/simulation2/components/CCmpAIManager.cpp
+@@ -34,6 +34,7 @@
+ #include "maths/FixedVector2D.h"
+ #include "ps/CLogger.h"
+ #include "ps/Filesystem.h"
++#include "ps/Game.h"
+ #include "ps/Profile.h"
+ #include "ps/Profiler2.h"
+ #include "ps/TemplateLoader.h"
+@@ -48,6 +49,7 @@
+ #include "scriptinterface/ScriptInterface.h"
+ #include "scriptinterface/ScriptRequest.h"
+ #include "scriptinterface/StructuredClone.h"
++#include "simulation2/Simulation2.h"
+ #include "simulation2/components/ICmpAIInterface.h"
+ #include "simulation2/components/ICmpCommandQueue.h"
+ #include "simulation2/components/ICmpPathfinder.h"
+@@ -909,6 +911,7 @@ public:
+ 
+ 		u32 numAis;
+ 		deserialize.NumberU32_Unbounded("num ais", numAis);
++
+ 		if (numAis > 0)
+ 			LoadUsedEntityTemplates();
+ 
+@@ -1055,7 +1058,12 @@ public:
+ 			for (size_t j = 0; j < commands[i].commands.size(); ++j)
+ 			{
+ 				Script::ReadStructuredClone(rq, commands[i].commands[j], &clonedCommandVal);
+-				cmpCommandQueue->PushLocalCommand(commands[i].player, clonedCommandVal);
++				// In multiplayer, route AI commands through the network so all
++				// clients receive them. In singleplayer, push locally.
++				if (g_Game && !g_Game->GetSimulation2()->IsAISkipped())
++					cmpCommandQueue->PostNetworkCommand(clonedCommandVal, commands[i].player);
++				else
++					cmpCommandQueue->PushLocalCommand(commands[i].player, clonedCommandVal);
+ 			}
+ 		}
+ 	}
+diff --git a/source/simulation2/components/CCmpCommandQueue.cpp b/source/simulation2/components/CCmpCommandQueue.cpp
+index 54631abc2b..cb71c2d905 100644
+--- a/source/simulation2/components/CCmpCommandQueue.cpp
++++ b/source/simulation2/components/CCmpCommandQueue.cpp
+@@ -33,6 +33,7 @@
+ 
+ #include <cstddef>
+ #include <js/RootingAPI.h>
++#include <optional>
+ #include <js/TypeDecls.h>
+ #include <js/Value.h>
+ #include <string>
+@@ -98,7 +99,7 @@ public:
+ 		m_LocalQueue.emplace_back(SimulationCommand(player, rq.cx, cmd));
+ 	}
+ 
+-	void PostNetworkCommand(JS::HandleValue cmd1) override
++	void PostNetworkCommand(JS::HandleValue cmd1, std::optional<player_id_t> player = std::nullopt) override
+ 	{
+ 		ScriptRequest rq(GetSimContext().GetScriptInterface());
+ 
+@@ -110,7 +111,7 @@ public:
+ 
+ 		// TODO: would be nicer to not use globals
+ 		if (g_Game && g_Game->GetTurnManager())
+-			g_Game->GetTurnManager()->PostCommand(cmd);
++			g_Game->GetTurnManager()->PostCommand(cmd, player);
+ 	}
+ 
+ 	void FlushTurn(const std::vector<SimulationCommand>& commands) override
+diff --git a/source/simulation2/components/ICmpCommandQueue.cpp b/source/simulation2/components/ICmpCommandQueue.cpp
+index 1637da66e7..2c8517a538 100644
+--- a/source/simulation2/components/ICmpCommandQueue.cpp
++++ b/source/simulation2/components/ICmpCommandQueue.cpp
+@@ -1,4 +1,4 @@
+-/* Copyright (C) 2021 Wildfire Games.
++/* Copyright (C) 2026 Wildfire Games.
+  * This file is part of 0 A.D.
+  *
+  * 0 A.D. is free software: you can redistribute it and/or modify
+@@ -23,6 +23,5 @@
+ 
+ BEGIN_INTERFACE_WRAPPER(CommandQueue)
+ DEFINE_INTERFACE_METHOD("PushLocalCommand", ICmpCommandQueue, PushLocalCommand)
+-DEFINE_INTERFACE_METHOD("PostNetworkCommand", ICmpCommandQueue, PostNetworkCommand)
+-// Excluded: FlushTurn (doesn't make sense for scripts to call it)
++DEFINE_INTERFACE_METHOD("PostNetworkCommand", ICmpCommandQueue, PostNetworkCommandFromScript)
+ END_INTERFACE_WRAPPER(CommandQueue)
+diff --git a/source/simulation2/components/ICmpCommandQueue.h b/source/simulation2/components/ICmpCommandQueue.h
+index 230909b568..5c2b700bd4 100644
+--- a/source/simulation2/components/ICmpCommandQueue.h
++++ b/source/simulation2/components/ICmpCommandQueue.h
+@@ -24,6 +24,7 @@
+ 
+ #include <js/TypeDecls.h>
+ #include <js/Value.h>
++#include <optional>
+ #include <vector>
+ 
+ struct SimulationCommand;
+@@ -49,9 +50,19 @@ public:
+ 	virtual void PushLocalCommand(player_id_t player, JS::HandleValue cmd) = 0;
+ 
+ 	/**
+-	 * Send a command associated with the current player to the networking system.
++	 * Send a command to the networking system.
++	 * When @p player is set, the command is sent on behalf of that player (used for AI commands on the host).
++	 * When std::nullopt, the current player is used.
+ 	 */
+-	virtual void PostNetworkCommand(JS::HandleValue cmd) = 0;
++	virtual void PostNetworkCommand(JS::HandleValue cmd, std::optional<player_id_t> player = std::nullopt) = 0;
++
++	/**
++	 * Script-facing wrapper that calls PostNetworkCommand with no explicit player.
++	 */
++	void PostNetworkCommandFromScript(JS::HandleValue cmd)
++	{
++		PostNetworkCommand(cmd);
++	}
+ 
+ 	/**
+ 	 * Calls the ProcessCommand(player, cmd) global script function for each command in the
+diff --git a/source/simulation2/system/ComponentManagerSerialization.cpp b/source/simulation2/system/ComponentManagerSerialization.cpp
+index 686e8fb4e8..0784dd8dfa 100644
+--- a/source/simulation2/system/ComponentManagerSerialization.cpp
++++ b/source/simulation2/system/ComponentManagerSerialization.cpp
+@@ -118,6 +118,12 @@ bool CComponentManager::ComputeStateHash(std::string& outHash, bool quick) const
+ 	serializer.StringASCII("rng", SerializeRNG(m_RNG), 0, 32);
+ 	serializer.NumberU32_Unbounded("next entity id", m_NextEntityId);
+ 
++	// Resolve the dynamic CID for AIInterface at runtime. Scripted components
++	// get dynamic CIDs (>= CID__LastNative) when registered via JS, so the
++	// static CID_AIInterfaceScripted enum value doesn't match the actual key
++	// in m_ComponentsByTypeId.
++	const ComponentTypeId cidAIInterface = LookupCID("AIInterface");
++
+ 	std::map<ComponentTypeId, std::map<entity_id_t, IComponent*> >::const_iterator cit = m_ComponentsByTypeId.begin();
+ 	for (; cit != m_ComponentsByTypeId.end(); ++cit)
+ 	{
+@@ -125,6 +131,14 @@ bool CComponentManager::ComputeStateHash(std::string& outHash, bool quick) const
+ 		if (quick && !(cit->first == CID_Position))
+ 			continue;
+ 
++		// Always skip AI components - AI state is not part of the synchronized
++		// simulation. AIInterface accumulates events for AI consumption and
++		// its state diverges when AI computation is skipped on non-host clients.
++		// AI commands reach all clients via CommandQueue (which IS hashed),
++		// so game effects are already captured.
++		if (cit->first == CID_AIManager || (cidAIInterface != CID__Invalid && cit->first == cidAIInterface))
++			continue;
++
+ 		// Only emit component types if they have a component that will be serialized
+ 		bool hasEmittedComponent = false;
+ 		for (std::map<entity_id_t, IComponent*>::const_iterator eit = cit->second.begin(); eit != cit->second.end(); ++eit)
+diff --git a/source/simulation2/system/LocalTurnManager.cpp b/source/simulation2/system/LocalTurnManager.cpp
+index 2fb6b6d70f..87071b86c1 100644
+--- a/source/simulation2/system/LocalTurnManager.cpp
++++ b/source/simulation2/system/LocalTurnManager.cpp
+@@ -32,14 +32,9 @@ CLocalTurnManager::CLocalTurnManager(CSimulation2& simulation, IReplayLogger& re
+ {
+ }
+ 
+-void CLocalTurnManager::PostCommand(player_id_t playerid, JS::HandleValue data)
++void CLocalTurnManager::PostCommand(JS::HandleValue data, std::optional<player_id_t> player)
+ {
+-	AddCommand(m_ClientId, playerid, data, m_CurrentTurn + m_CommandDelay);
+-}
+-
+-void CLocalTurnManager::PostCommand(JS::HandleValue data)
+-{
+-	AddCommand(m_ClientId, m_PlayerId, data, m_CurrentTurn + m_CommandDelay);
++	AddCommand(m_ClientId, player.value_or(m_PlayerId), data, m_CurrentTurn + m_CommandDelay);
+ }
+ 
+ void CLocalTurnManager::NotifyFinishedOwnCommands(u32 turn)
+diff --git a/source/simulation2/system/LocalTurnManager.h b/source/simulation2/system/LocalTurnManager.h
+index f6afe5d631..a6503fd989 100644
+--- a/source/simulation2/system/LocalTurnManager.h
++++ b/source/simulation2/system/LocalTurnManager.h
+@@ -37,8 +37,7 @@ public:
+ 
+ 	void OnSimulationMessage(CSimulationMessage* msg) override;
+ 
+-	void PostCommand(JS::HandleValue data) override;
+-	void PostCommand(player_id_t playerid, JS::HandleValue data);
++	void PostCommand(JS::HandleValue data, std::optional<player_id_t> player = std::nullopt) override;
+ 
+ protected:
+ 	void NotifyFinishedOwnCommands(u32 turn) override;
+diff --git a/source/simulation2/system/TurnManager.h b/source/simulation2/system/TurnManager.h
+index b4a724dc99..19687fedd2 100644
+--- a/source/simulation2/system/TurnManager.h
++++ b/source/simulation2/system/TurnManager.h
+@@ -30,6 +30,7 @@
+ #include <js/Value.h>
+ #include <list>
+ #include <map>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -132,8 +133,10 @@ public:
+ 
+ 	/**
+ 	 * Called by simulation code, to add a new command to be distributed to all clients and executed soon.
++	 * When @p player is set, the command is sent on behalf of that player (used for AI commands on the host).
++	 * When std::nullopt, the current player (m_PlayerId) is used.
+ 	 */
+-	virtual void PostCommand(JS::HandleValue data) = 0;
++	virtual void PostCommand(JS::HandleValue data, std::optional<player_id_t> player = std::nullopt) = 0;
+ 
+ 	/**
+ 	 * Called when all commands for a given turn have been received.

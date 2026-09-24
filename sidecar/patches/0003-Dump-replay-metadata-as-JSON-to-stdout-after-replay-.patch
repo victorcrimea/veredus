@@ -1,0 +1,53 @@
+From 24ab9689e200ea1eb21d0eff8db739d3d85cecd4 Mon Sep 17 00:00:00 2001
+From: Viktor Semenov <suit.uanic@gmail.com>
+Date: Wed, 26 Aug 2026 10:27:30 +0000
+Subject: [PATCH 3/6] Dump replay metadata as JSON to stdout after replay
+ playback
+
+debug_printf's formatting buffer is a fixed 16KB and silently drops
+output that doesn't fit, which GetReplayMetadata's JSON routinely
+exceeds for a whole match. Write it directly to stdout instead,
+prefixed with REPLAY_RESULT for consumers to parse.
+---
+ source/ps/Replay.cpp | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/source/ps/Replay.cpp b/source/ps/Replay.cpp
+index 19aadb4088..47fc884571 100644
+--- a/source/ps/Replay.cpp
++++ b/source/ps/Replay.cpp
+@@ -54,6 +54,7 @@
+ 
+ #include <ctime>
+ #include <fstream>
++#include <iostream>
+ #include <memory>
+ 
+ /**
+@@ -322,6 +323,26 @@ void CReplayPlayer::Replay(const bool serializationtest, const int rejointesttur
+ 	bool ok = g_Game->GetSimulation2()->ComputeStateHash(hash, false);
+ 	ENSURE(ok);
+ 	debug_printf("# Final state: %s\n", Hexify(hash).c_str());
++
++	{
++		CmpPtr<ICmpGuiInterface> cmpGuiInterface(*g_Game->GetSimulation2(), SYSTEM_ENTITY);
++		if (cmpGuiInterface)
++		{
++			ScriptRequest rq(g_Game->GetSimulation2()->GetScriptInterface());
++			JS::RootedValue arg(rq.cx);
++			JS::RootedValue metadata(rq.cx);
++			cmpGuiInterface->ScriptCall(INVALID_PLAYER, L"GetReplayMetadata", arg, &metadata);
++			// debug_printf's formatting buffer is a fixed 16KB (lib/debug.cpp) and
++			// silently drops output that doesn't fit -- GetReplayMetadata's JSON
++			// (per-player stats/sequences for a whole match) routinely exceeds
++			// that, so this writes to stdout directly instead.
++			std::cout << "REPLAY_RESULT " << Script::StringifyJSON(rq, &metadata, false) << "\n";
++			std::cout.flush();
++		}
++		else
++			LOGERROR("Could not get replay result: GuiInterface component missing!");
++	}
++
+ 	timer_DisplayClientTotals();
+ 
+ 	SAFE_DELETE(g_Game);

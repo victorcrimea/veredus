@@ -1,0 +1,203 @@
+From befb3f2bd60c5ef20635d697ef2e327936e4b2f4 Mon Sep 17 00:00:00 2001
+From: Viktor Semenov <suit.uanic@gmail.com>
+Date: Wed, 26 Aug 2026 10:27:19 +0000
+Subject: [PATCH 2/6] Add decode-script-vals-in CLI mode for decoding
+ serialized script values
+
+Adds a standalone tool invoked via --decode-script-vals-in to decode
+and dump serialized script values outside of a full game run.
+---
+ source/main.cpp                |   7 +++
+ source/ps/DecodeScriptVals.cpp | 112 +++++++++++++++++++++++++++++++++
+ source/ps/DecodeScriptVals.h   |  38 +++++++++++
+ 3 files changed, 157 insertions(+)
+ create mode 100644 source/ps/DecodeScriptVals.cpp
+ create mode 100644 source/ps/DecodeScriptVals.h
+
+diff --git a/source/main.cpp b/source/main.cpp
+index 0ad09c1815..961bb3340c 100644
+--- a/source/main.cpp
++++ b/source/main.cpp
+@@ -58,6 +58,7 @@ that of Atlas depending on commandline parameters.
+ #include "ps/CLogger.h"
+ #include "ps/CStr.h"
+ #include "ps/ConfigDB.h"
++#include "ps/DecodeScriptVals.h"
+ #include "ps/Filesystem.h"
+ #include "ps/Game.h"
+ #include "ps/GameSetup/Atlas.h"
+@@ -658,6 +659,12 @@ static void RunGameOrAtlas(const std::span<const char* const> argv)
+ 		return;
+ 	}
+ 
++	if (args.Has("decode-script-vals-in"))
++	{
++		RunDecodeScriptVals(args);
++		return;
++	}
++
+ 	// run in archive-building mode if requested
+ 	if (args.Has("archivebuild"))
+ 	{
+diff --git a/source/ps/DecodeScriptVals.cpp b/source/ps/DecodeScriptVals.cpp
+new file mode 100644
+index 0000000000..e1588890f9
+--- /dev/null
++++ b/source/ps/DecodeScriptVals.cpp
+@@ -0,0 +1,112 @@
++/* Copyright (C) 2026 Wildfire Games.
++ * This file is part of 0 A.D.
++ *
++ * 0 A.D. is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * 0 A.D. is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with 0 A.D.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "precompiled.h"
++
++#include "DecodeScriptVals.h"
++
++#include "lib/os_path.h"
++#include "ps/CLogger.h"
++#include "ps/CStr.h"
++#include "ps/GameSetup/CmdLineArgs.h"
++#include "scriptinterface/JSON.h"
++#include "scriptinterface/ScriptContext.h"
++#include "scriptinterface/ScriptInterface.h"
++#include "scriptinterface/ScriptRequest.h"
++#include "simulation2/serialization/StdDeserializer.h"
++
++#include <exception>
++#include <fstream>
++#include <sodium.h>
++#include <sstream>
++#include <vector>
++
++void RunDecodeScriptVals(const CmdLineArgs& args)
++{
++	const OsPath inputPath(args.Get("decode-script-vals-in"));
++	const OsPath outputPath(args.Get("decode-script-vals-out"));
++	if (outputPath.empty())
++	{
++		LOGERROR("-decode-script-vals-in requires -decode-script-vals-out=<file>");
++		return;
++	}
++
++	std::ifstream in(OsString(inputPath));
++	if (!in.is_open())
++	{
++		LOGERROR("Could not open '%s' for reading.", inputPath.string8().c_str());
++		return;
++	}
++
++	if (sodium_init() < 0)
++	{
++		LOGERROR("Failed to initialize libsodium.");
++		return;
++	}
++
++	std::ofstream out(OsString(outputPath), std::ofstream::out | std::ofstream::trunc);
++	if (!out.is_open())
++	{
++		LOGERROR("Could not open '%s' for writing.", outputPath.string8().c_str());
++		return;
++	}
++
++	// No CGame/CSimulation2/VFS/mods needed: these payloads are plain JS
++	// objects (gameplay commands, game-setup attributes), not simulation
++	// component state, so a bare context+interface is enough to deserialize
++	// and re-stringify them.
++	g_ScriptContext = ScriptContext::CreateContext();
++	{
++		ScriptInterface scriptInterface("Engine", "DecodeScriptVals", g_ScriptContext);
++		ScriptRequest rq(scriptInterface);
++
++		std::string b64;
++		while (std::getline(in, b64))
++		{
++			std::vector<unsigned char> raw(b64.size());
++			size_t rawLen = 0;
++			const bool decodedBase64 = !b64.empty() && sodium_base642bin(
++				raw.data(), raw.size(), b64.c_str(), b64.size(),
++				nullptr, &rawLen, nullptr, sodium_base64_VARIANT_ORIGINAL) == 0;
++
++			if (!decodedBase64)
++			{
++				out << "{\"__decode_error__\":true}\n";
++				continue;
++			}
++
++			try
++			{
++				std::istringstream stream(std::string(reinterpret_cast<char*>(raw.data()), rawLen));
++				CStdDeserializer deserializer(scriptInterface, stream);
++				JS::RootedValue value(rq.cx);
++				deserializer.ScriptVal("command", &value);
++				out << Script::StringifyJSON(rq, &value, false) << "\n";
++			}
++			catch (const std::exception& e)
++			{
++				LOGWARNING("Failed to decode script value: %s", e.what());
++				out << "{\"__decode_error__\":true}\n";
++			}
++		}
++	}
++
++	// Must be explicitly destructed here (matching CReplayPlayer::Replay,
++	// Replay.cpp:331) to avoid the ScriptEngine shutdown assertion that
++	// fires if a ScriptContext outlives it.
++	g_ScriptContext.reset();
++}
+diff --git a/source/ps/DecodeScriptVals.h b/source/ps/DecodeScriptVals.h
+new file mode 100644
+index 0000000000..3486cf95a3
+--- /dev/null
++++ b/source/ps/DecodeScriptVals.h
+@@ -0,0 +1,38 @@
++/* Copyright (C) 2026 Wildfire Games.
++ * This file is part of 0 A.D.
++ *
++ * 0 A.D. is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * 0 A.D. is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with 0 A.D.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef INCLUDED_DECODESCRIPTVALS
++#define INCLUDED_DECODESCRIPTVALS
++
++class CmdLineArgs;
++
++/**
++ * Headless CLI mode: decode a batch of 0 A.D.'s own SpiderMonkey-serialized
++ * "ScriptVal" wire-format blobs (the format used for NMT_SIMULATION_COMMAND
++ * and NMT_GAME_SETUP "command" payloads, see CStdDeserializer::ScriptVal)
++ * into JSON, using the real engine deserializer rather than a reimplementation.
++ *
++ * Reads one base64-encoded blob per line from the file named by
++ * "-decode-script-vals-in" (order preserved) and writes one JSON line per
++ * blob, in the same order, to the file named by "-decode-script-vals-out".
++ * A blob that fails to decode (bad base64, or a malformed/unrecognised
++ * value) produces the line {"__decode_error__":true} rather than aborting
++ * the batch, so callers can still align output lines to input order.
++ */
++void RunDecodeScriptVals(const CmdLineArgs& args);
++
++#endif // INCLUDED_DECODESCRIPTVALS
