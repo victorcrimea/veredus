@@ -200,7 +200,10 @@ impl Gate {
                 if !matches!(phase, Phase::InGame | Phase::PostGame | Phase::Resuming) {
                     return Decision::Pass;
                 }
-                let addr_ok = self.join_by_addr.has_token(&session.addr, now);
+                // The AI host rejoins from loopback after a crash, and a
+                // join refused there would cost the match its AI players.
+                let addr_ok =
+                    session.addr.is_loopback() || self.join_by_addr.has_token(&session.addr, now);
                 let name_ok = lobby_key
                     .as_ref()
                     .is_none_or(|key| self.join_by_lobby_name.has_token(key, now));
@@ -236,7 +239,9 @@ impl Gate {
                     let Some(session) = sessions.get(peer) else {
                         continue;
                     };
-                    self.join_by_addr.spend(session.addr, now);
+                    if !session.addr.is_loopback() {
+                        self.join_by_addr.spend(session.addr, now);
+                    }
                     if let Some(name) = session.lobby_name.as_ref() {
                         self.join_by_lobby_name.spend(name.to_lowercase(), now);
                     }

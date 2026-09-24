@@ -403,7 +403,9 @@ pub fn run_game_server(
                 observe_final(&current, &latest_stats, &latest_loss, metrics);
                 // Outside post-game this is the idle timeout, where normally
                 // no human is admitted to read the line.
-                let reason = if matches!(current, AnyServer::PostGame(_)) {
+                let reason = if current.kept_for_restart() {
+                    "the match is saved for a restart"
+                } else if matches!(current, AnyServer::PostGame(_)) {
                     "the match is over"
                 } else {
                     "the game was idle"

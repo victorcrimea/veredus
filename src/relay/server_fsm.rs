@@ -470,6 +470,14 @@ pub struct Config {
     // bring a new AI host back into the match. It freezes the AI host, and
     // with it the match, while it serializes. 0 pulls only the first one.
     pub ai_state_interval_turns: u32,
+    // How many AI hosts in a row a running match tries to bring back after
+    // its AI host is lost. An AI that crashes on a given state crashes every
+    // time, so the number is capped.
+    pub ai_heal_attempts: u32,
+    // How long one of those AI hosts may take from being started to having
+    // caught up with the match. Catching up replays everything since the
+    // saved AI state, so it has to cover a long interval. None waits forever.
+    pub ai_heal_timeout: Option<TimeDelta>,
 }
 
 impl Default for Config {
@@ -524,6 +532,8 @@ impl Default for Config {
             resume_controller_grace: TimeDelta::minutes(5),
             client_state_interval_turns: 0,
             ai_state_interval_turns: 600,
+            ai_heal_attempts: 3,
+            ai_heal_timeout: Some(TimeDelta::minutes(10)),
         }
     }
 }
@@ -646,6 +656,10 @@ pub(crate) struct Context {
     // It outlives the AI host that produced it, since it is what the next
     // one is brought back from.
     ai_state: Option<Seed>,
+    // Set once the match has been saved and ended for a restart on its own,
+    // rather than by the operator's stop, so no outcome is worked out for a
+    // match that has not ended.
+    kept_for_restart: bool,
     counters: Counters,
     effects: Vec<Effect>,
 }
@@ -667,6 +681,18 @@ struct AiHost {
     // The ready turn when its state was last asked for. None until the
     // first pull, which is due as soon as it plays.
     last_pull: Option<u32>,
+    // Present from the moment a running match loses its AI host until a new
+    // one has caught up. The match phase does not change for it: the players
+    // are only held.
+    heal: Option<Healing>,
+}
+
+struct Healing {
+    // Counts from 1, the AI host now being brought in.
+    attempt: u32,
+    // When that AI host was started. Anchored on the next tick, because the
+    // FSM only learns the time there.
+    since: Option<DateTime<Utc>>,
 }
 
 // The one in-flight one-shot state dump: the turn it rebuilds and every
@@ -922,6 +948,23 @@ impl Context {
     // loopback session can be it, and only before it has been admitted.
     fn ai_host_expected(&self, addr: Ipv4Addr) -> bool {
         addr.is_loopback() && self.ai_host.as_ref().is_some_and(|h| h.peer.is_none())
+    }
+
+    fn ai_healing(&self) -> bool {
+        self.ai_host.as_ref().is_some_and(|h| h.heal.is_some())
+    }
+
+    // The relay's own pause, shared by the AFK hold and the AI heal, so
+    // whichever ends first leaves the match paused for the other.
+    fn server_pause(&mut self, pause: bool) {
+        if !pause && (self.pause_budget.auto_paused() || self.ai_healing()) {
+            return;
+        }
+        let relayed = WireMessage::PlayerPause(PlayerPause {
+            guid: self.server_uuid.clone(),
+            pause,
+        });
+        self.broadcast(&relayed, |s| s.is_in_game());
     }
 
     // Which messages a session may send depends on the session's own phase,
@@ -1464,6 +1507,9 @@ impl AnyServer {
     // Read once the game thread is done with the FSM, however it got there:
     // the thread also ends when its socket closes, which no input announces.
     pub fn outcome_request(&self) -> Option<DumpRequest> {
+        if self.kept_for_restart() {
+            return None;
+        }
         match self {
             AnyServer::InGame(s) => s.outcome_request(),
             // A match decided by a checkpoint already has its final outcome.
@@ -1581,6 +1627,12 @@ impl AnyServer {
         }
     }
 
+    // True once the match ended itself to be resumed after a restart, so the
+    // game thread tells the players that rather than calling it idle.
+    pub fn kept_for_restart(&self) -> bool {
+        self.ctx().kept_for_restart
+    }
+
     // True when a stop keeps the match for a restart instead of ending it:
     // only a running match is worth resuming.
     pub fn saved_on_stop(&self) -> bool {
@@ -1677,9 +1729,7 @@ impl<S: PhaseMarker> Server<S> {
             // result arrives for a game that has moved on.
             Input::StateDumped { .. } => {}
             Input::Checkpointed { .. } => {}
-            // Only a held start acts on this; once the match runs, the AI
-            // host's departure is handled when its connection drops.
-            Input::AiHostExited => tracing::info!("sidecar: AI host process exited"),
+            Input::AiHostExited => self.on_ai_host_exited(),
         }
     }
 
@@ -1816,13 +1866,17 @@ impl<S: PhaseMarker> Server<S> {
         }
 
         if self.ctx.is_ai_host(peer) {
-            // It is not respawned: a new one would have to rebuild the match
-            // state first, so its players simply stop acting.
-            tracing::warn!(?peer, "sidecar: AI host left the match");
-            self.ctx.ai_host = None;
-            self.ctx.effects.push(Effect::StopAiHost);
-            self.ctx
-                .server_chat(None, "The AI host left; AI players will stand idle.");
+            if matches!(S::PHASE, Phase::InGame | Phase::Resuming) {
+                self.ai_host_lost("its connection dropped");
+            } else {
+                // A decided match is not worth holding for it, so its players
+                // simply stop acting.
+                tracing::warn!(?peer, "sidecar: AI host left the match");
+                self.ctx.ai_host = None;
+                self.ctx.effects.push(Effect::StopAiHost);
+                self.ctx
+                    .server_chat(None, "The AI host left; AI players will stand idle.");
+            }
         }
 
         if let Some(uuid) = session.uuid.as_ref() {
@@ -1909,6 +1963,8 @@ impl<S: PhaseMarker> Server<S> {
                 self.retry_join(joiner, source);
             }
         }
+
+        self.check_ai_heal_timeout(now);
 
         // Before the warning gate, on its own anchor: the budget is charged
         // from the elapsed it works out itself, so it neither depends on nor
@@ -2092,13 +2148,14 @@ impl<S: PhaseMarker> Server<S> {
                 self.ctx.checkpoints.prefetch = true;
             }
             BudgetEvent::AutoPauseEnded => {
-                tracing::info!("no absent player left to wait for, resuming");
-                let relayed = WireMessage::PlayerPause(PlayerPause {
-                    guid: self.ctx.server_uuid.clone(),
-                    pause: false,
-                });
-                self.ctx.broadcast(&relayed, |s| s.is_in_game());
                 self.ctx.checkpoints.prefetch = false;
+                // The AI heal lifts the pause itself once it is done.
+                if self.ctx.ai_healing() {
+                    tracing::info!("no absent player left to wait for, AI players still held");
+                    return;
+                }
+                tracing::info!("no absent player left to wait for, resuming");
+                self.ctx.server_pause(false);
                 self.ctx.server_chat(None, "Resuming.");
             }
             BudgetEvent::AbsentExpired { uuid } => {
@@ -2277,7 +2334,14 @@ impl<S: PhaseMarker> Server<S> {
             return Ok(());
         }
 
-        let joining = match self.admit(&name) {
+        // A new AI host joins a running match to take the AI players back,
+        // which no late-observer policy is meant to stop.
+        let admitted = if is_ai_host && matches!(S::PHASE, Phase::InGame | Phase::Resuming) {
+            Ok(true)
+        } else {
+            self.admit(&name)
+        };
+        let joining = match admitted {
             Ok(joining) => joining,
             Err(reason) => {
                 self.disconnect(peer, reason);
@@ -2518,6 +2582,20 @@ impl<S: PhaseMarker> Server<S> {
     // starts at once and no player stalls to serialize for it. A delayed
     // joiner needs one its feed has already passed.
     fn start_snapshot_fetch(&mut self, joiner: PeerID, allow_dump: bool) {
+        // Only the AI host's own state carries its AI players, and the replay
+        // stream brings it from there to the live turn.
+        if self.ctx.is_ai_host(joiner) {
+            match self.ctx.ai_state.clone() {
+                Some(seed) => {
+                    tracing::info!(?joiner, turns = ?seed.turns, "sidecar: AI host served its saved state");
+                    self.deliver_snapshot(joiner, seed.state, seed.turns);
+                }
+                None => self
+                    .ctx
+                    .disconnect(joiner, DisconnectReason::MatchInProgress),
+            }
+            return;
+        }
         let joiner_delayed = self
             .ctx
             .uuid_of(joiner)
@@ -2628,6 +2706,172 @@ impl<S: PhaseMarker> Server<S> {
         self.start_snapshot_fetch(joiner, true);
     }
 
+    // The process can die long before its connection times out, and until
+    // then its session holds the name the next AI host has to use.
+    fn on_ai_host_exited(&mut self) {
+        let healable = matches!(S::PHASE, Phase::InGame | Phase::Resuming);
+        let Some(host) = self.ctx.ai_host.as_ref().filter(|_| healable) else {
+            tracing::info!("sidecar: AI host process exited");
+            return;
+        };
+        match (host.peer, host.heal.is_some()) {
+            (Some(peer), _) => {
+                self.ctx.effects.push(Effect::Disconnect {
+                    peer,
+                    reason: DisconnectReason::ServerShuttingDown,
+                });
+                self.on_disconnected(peer);
+            }
+            (None, true) => self.retry_ai_heal("the AI host process exited"),
+            (None, false) => tracing::info!("sidecar: AI host process exited"),
+        }
+    }
+
+    // The AI players' own state survives only in the AI host, so a new one
+    // is brought in from the last state pulled from it, with the players
+    // held so the match does not run on without them.
+    fn ai_host_lost(&mut self, why: &str) {
+        let Some(host) = self.ctx.ai_host.as_mut() else {
+            return;
+        };
+        host.peer = None;
+        if host.heal.is_some() {
+            self.retry_ai_heal(why);
+            return;
+        }
+        tracing::warn!(why, "sidecar: AI host lost");
+        if self.ctx.ai_state.is_none() {
+            self.ai_heal_gave_up("no AI host state was saved yet");
+            return;
+        }
+        if let Some(host) = self.ctx.ai_host.as_mut() {
+            host.heal = Some(Healing {
+                attempt: 1,
+                since: None,
+            });
+        }
+        // A resumed match already holds everyone until it is restarted.
+        if S::PHASE != Phase::Resuming {
+            self.ctx.server_pause(true);
+            self.ctx.server_chat(
+                None,
+                "The AI players' process stopped. Restoring the AI players; the match is paused.",
+            );
+        }
+        self.spawn_ai_host();
+    }
+
+    fn spawn_ai_host(&mut self) {
+        let name = self.ctx.ai_host_name.clone();
+        self.ctx.effects.push(Effect::StopAiHost);
+        self.ctx.effects.push(Effect::SpawnAiHost { name });
+    }
+
+    // One that got in but never caught up is dropped first, since it holds
+    // the name the next one joins under.
+    fn retry_ai_heal(&mut self, why: &str) {
+        let limit = self.ctx.config.ai_heal_attempts;
+        let Some(host) = self.ctx.ai_host.as_mut() else {
+            return;
+        };
+        let Some(heal) = host.heal.as_mut() else {
+            return;
+        };
+        tracing::warn!(
+            attempt = heal.attempt,
+            why,
+            "sidecar: AI host could not be brought back"
+        );
+        if heal.attempt >= limit {
+            self.ai_heal_gave_up(why);
+            return;
+        }
+        heal.attempt += 1;
+        heal.since = None;
+        if let Some(peer) = host.peer.take() {
+            self.ctx.effects.push(Effect::Disconnect {
+                peer,
+                reason: DisconnectReason::ServerShuttingDown,
+            });
+            self.on_disconnected(peer);
+        }
+        self.spawn_ai_host();
+    }
+
+    // Catching up ends with JOINED, so a new AI host that has not sent it in
+    // time counts as failed. A negative delta re-anchors rather than firing
+    // early (A7).
+    fn check_ai_heal_timeout(&mut self, now: DateTime<Utc>) {
+        let Some(limit) = self.ctx.config.ai_heal_timeout else {
+            return;
+        };
+        let Some(heal) = self.ctx.ai_host.as_mut().and_then(|h| h.heal.as_mut()) else {
+            return;
+        };
+        let since = *heal.since.get_or_insert(now);
+        let elapsed = now.signed_duration_since(since);
+        if elapsed < TimeDelta::zero() {
+            heal.since = Some(now);
+            return;
+        }
+        if elapsed >= limit {
+            self.retry_ai_heal("it did not catch up in time");
+        }
+    }
+
+    // A saved match stops and waits for a restart, which may find the cause
+    // fixed. Without a save, stopping would only lose the match, so it plays
+    // on with the AI players idle. A resumed match gives up on its own.
+    fn ai_heal_gave_up(&mut self, why: &str) {
+        tracing::warn!(why, "sidecar: AI players could not be restored");
+        let held = self.ctx.ai_healing();
+        if let Some(peer) = self.ctx.ai_host.take().and_then(|h| h.peer) {
+            self.ctx.effects.push(Effect::Disconnect {
+                peer,
+                reason: DisconnectReason::ServerShuttingDown,
+            });
+            self.on_disconnected(peer);
+        }
+        self.ctx.effects.push(Effect::StopAiHost);
+        if S::PHASE == Phase::Resuming {
+            return;
+        }
+        if self.ctx.config.saving && self.ctx.ai_state.is_some() {
+            self.ctx.server_chat(
+                None,
+                "The AI players could not be restored. The match is saved and will continue after the server restarts.",
+            );
+            self.ctx.effects.push(Effect::SaveStatus(Status::Stopped));
+            self.ctx.kept_for_restart = true;
+            self.ctx.effects.push(Effect::GameOver);
+            return;
+        }
+        if held {
+            self.ctx.server_pause(false);
+        }
+        self.ctx.server_chat(
+            None,
+            "The AI players could not be restored; they will stand idle.",
+        );
+    }
+
+    fn ai_host_healed(&mut self) {
+        let Some(host) = self.ctx.ai_host.as_mut() else {
+            return;
+        };
+        let Some(heal) = host.heal.take() else {
+            return;
+        };
+        // Its state is far behind the live turn, so a fresh one is pulled
+        // as soon as it plays, which keeps the next heal short.
+        host.last_pull = None;
+        tracing::info!(attempt = heal.attempt, "sidecar: AI players restored");
+        if S::PHASE != Phase::Resuming {
+            self.ctx.server_pause(false);
+        }
+        self.ctx.server_chat(None, "AI players restored.");
+    }
+
     // Every source serializes the same simulation, so once one snapshot is
     // past what a client accepts, trying the next source would only freeze
     // another player for a state that cannot be sent either. Refused here
@@ -2691,8 +2935,13 @@ impl<S: PhaseMarker> Server<S> {
         let Some(settings) = self.st.settings() else {
             return;
         };
+        // The AI host is the one client whose copy keeps the AI slots.
+        let json = match &settings.ai_json {
+            Some(ai_json) if self.ctx.is_ai_host(joiner) => ai_json.clone(),
+            _ => settings.json.clone(),
+        };
         let join = Join {
-            init_attributes: settings.json.clone(),
+            init_attributes: json,
         };
         let joiner_delayed = self
             .ctx
@@ -3128,6 +3377,7 @@ impl Server<Idle> {
                 saved_slots: None,
                 client_pull: None,
                 ai_state: None,
+                kept_for_restart: false,
                 counters: Counters::default(),
                 effects: Vec::new(),
             },
@@ -3272,6 +3522,7 @@ impl Server<Setup> {
             peer: None,
             players: split.players,
             last_pull: None,
+            heal: None,
         });
         let name = self.ctx.ai_host_name.clone();
         self.ctx.effects.push(Effect::SpawnAiHost { name });
@@ -3663,7 +3914,7 @@ impl Server<InGame> {
         let Some(host) = self.ctx.ai_host.as_ref() else {
             return;
         };
-        let Some(source) = host.peer else {
+        let Some(source) = host.peer.filter(|_| host.heal.is_none()) else {
             return;
         };
         let due = match host.last_pull {
@@ -3782,6 +4033,15 @@ impl Server<InGame> {
         ctx.effects.push(Effect::MatchEnded {
             checkpoint: resolved_by,
         });
+        // A decided match is not held for its AI players any more.
+        if ctx.ai_healing() {
+            tracing::info!("sidecar: match decided, no longer restoring the AI players");
+            if let Some(peer) = ctx.ai_host.take().and_then(|h| h.peer) {
+                ctx.disconnect(peer, DisconnectReason::ServerShuttingDown);
+            }
+            ctx.effects.push(Effect::StopAiHost);
+            ctx.server_pause(false);
+        }
         if ctx.config.saving {
             ctx.effects.push(Effect::SaveStatus(Status::Finished));
         }
@@ -4037,6 +4297,9 @@ impl<S: MatchPhase> Server<S> {
         let uuid = self.ctx.speaker(peer, Session::is_in_game)?;
         let relayed = WireMessage::Joined(Joined { guid: uuid });
         self.ctx.broadcast(&relayed, |s| s.is_in_game());
+        if self.ctx.is_ai_host(peer) {
+            self.ai_host_healed();
+        }
 
         // The joiner missed every pause that happened before it arrived.
         let paused: Vec<Guid> = self.ctx.pause_budget.pausing().cloned().collect();
@@ -4049,7 +4312,10 @@ impl<S: MatchPhase> Server<S> {
         // Sent even to the player the match was held for: the next tick
         // lifts it for everyone at once, this client included. A resumed
         // match holds everyone the same way until it is restarted.
-        if self.ctx.pause_budget.auto_paused() || S::PHASE == Phase::Resuming {
+        if self.ctx.pause_budget.auto_paused()
+            || self.ctx.ai_healing()
+            || S::PHASE == Phase::Resuming
+        {
             let guid = self.ctx.server_uuid.clone();
             self.ctx.send(
                 peer,
@@ -4368,6 +4634,9 @@ impl<S: MatchPhase> Server<S> {
             observer,
             false,
         );
+        if self.ctx.is_ai_host(peer) {
+            self.ctx.turns.mark_ai_host(peer);
+        }
         Ok(())
     }
 

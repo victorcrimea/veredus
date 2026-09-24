@@ -346,6 +346,12 @@ pub struct GameSection {
     /// saved, so a crashed AI host can be brought back; each save pauses
     /// the match briefly. 0 uses the checkpoint interval.
     pub ai_state_interval_turns: u32,
+    /// How many times a match tries to bring its AI players back after
+    /// their process is lost, before it is saved for a restart.
+    pub ai_heal_attempts: u32,
+    /// How long each of those tries may take to catch up with the match.
+    /// 0 waits forever.
+    pub ai_heal_timeout_secs: u64,
     /// Names that count as buddies under the buddies observer policy.
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
@@ -410,6 +416,10 @@ impl Default for GameSection {
                 as u64,
             client_state_interval_secs: 0,
             ai_state_interval_turns: 0,
+            ai_heal_attempts: config.ai_heal_attempts,
+            ai_heal_timeout_secs: config
+                .ai_heal_timeout
+                .map_or(0, |d| d.num_seconds().max(0) as u64),
             buddies,
             enabled_mods: config
                 .enabled_mods
@@ -485,6 +495,9 @@ impl GameSection {
                 self.ai_state_interval_turns,
                 checkpoint_interval_turns,
             ),
+            ai_heal_attempts: self.ai_heal_attempts,
+            ai_heal_timeout: (self.ai_heal_timeout_secs != 0)
+                .then(|| secs_to_delta(self.ai_heal_timeout_secs)),
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
             checkpoint_interval_turns,
