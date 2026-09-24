@@ -38,16 +38,27 @@ jobs:
             python-is-python3 libboost-filesystem-dev libboost-system-dev \
             libcurl4-gnutls-dev libenet-dev libfmt-dev libfreetype-dev \
             libicu-dev libpng-dev libsdl2-dev libsodium-dev libxml2-dev \
-            zlib1g-dev
+            zlib1g-dev zstd
+
+      # The toolchain is pinned, so one saved copy serves every later run.
+      - name: Restore Rust and cbindgen
+        id: rust-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/rust
+          key: sidecar-rust-1.76.0-cbindgen-0.29.0-debian12
 
       # Debian's Rust is too old for SpiderMonkey 128; these are the
       # versions upstream pins.
       - name: Install Rust and cbindgen
+        if: steps.rust-cache.outputs.cache-hit != 'true'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain 1.76.0
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
           "$CARGO_HOME/bin/cargo" install --locked cbindgen@0.29.0
+
+      - name: Put Rust on PATH
+        run: echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4
 
@@ -56,6 +67,21 @@ jobs:
           git clone --branch v0.28.0 --depth 1 https://gitea.wildfiregames.com/0ad/0ad.git
           cd 0ad
           for p in ../sidecar/patches/*.patch; do git apply "$p"; done
+
+      # The patches never touch libraries/, so the built libraries depend
+      # only on the 0 A.D. release and the build scripts, which the key
+      # hashes. Each script finds its .already-built marker and skips.
+      # Source tarballs are left out: nothing reads them once built.
+      - name: Restore bundled libraries
+        uses: actions/cache@v4
+        with:
+          path: |
+            0ad/libraries/source/cxxtest-4.4
+            0ad/libraries/source/fcollada
+            0ad/libraries/source/premake-core
+            0ad/libraries/source/spidermonkey
+            !0ad/libraries/source/**/*.tar.*
+          key: sidecar-libs-debian12-gcc12-${{ hashFiles('0ad/libraries/source/*/build.sh', '0ad/libraries/source/*/patches/**') }}
 
       # The library scripts are called one by one rather than through
       # build-source-libs.sh so NVTT is skipped, and SpiderMonkey runs with
