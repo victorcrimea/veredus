@@ -313,7 +313,7 @@ pub static SIDECAR_RUNS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 pub static SIDECAR_RUNS_RUNNING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "sidecar_runs_running",
-        "One-shot pyrogenesis runs holding a slot of [server] max_sidecar_runs, by step",
+        "One-shot pyrogenesis runs holding a slot of [sidecar] max_runs, by step",
         &["step"]
     )
     .unwrap()

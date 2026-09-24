@@ -15,7 +15,6 @@ use veredus::cli;
 use veredus::cli::Command;
 use veredus::config::FileConfig;
 use veredus::config::LogSection;
-use veredus::config::ServerSection;
 use veredus::game_pool::GameConfig;
 use veredus::game_pool::GameId;
 use veredus::game_pool::GamePool;
@@ -81,22 +80,19 @@ async fn main() {
         .with(build_loki_layer(&config.log).map(|layer| layer.with_filter(loki_filter)))
         .init();
 
-    serve_metrics(config.server.metrics_host, config.server.metrics_port);
+    serve_metrics(config.metrics.host, config.metrics.port);
 
     #[cfg(windows)]
     veredus::sidecar::guard_orphans();
-    veredus::sidecar::set_run_limit(config.server.max_sidecar_runs);
-    let mut pool = GamePool::new(config.server.host, config.server.enet_limits());
+    veredus::sidecar::set_run_limit(config.sidecar.max_runs);
+    let mut pool = GamePool::new(config.server.host, config.advanced.enet_limits());
     let pyrogenesis_path = config.server.pyrogenesis_path();
     if pyrogenesis_path.is_some() {
         veredus::sidecar::init_work_root();
     }
-    let outcome_dir = config.server.outcome_dir();
-    let save = config.server.save_setup("");
-    let base = config.game.server_config(
-        pyrogenesis_path.is_some(),
-        config.server.checkpoint_interval_turns,
-    );
+    let outcome_dir = config.saves.outcome_dir();
+    let save = config.save_setup("");
+    let base = config.server_config(pyrogenesis_path.is_some());
 
     let result = match mode.lobby {
         Some(lobby_config) => {
@@ -104,7 +100,7 @@ async fn main() {
                 idle_shutdown: config.lobby.idle_shutdown(),
                 ..base
             };
-            let saved = pick_lobby_resumables(&config.server, save.as_ref(), &base).await;
+            let saved = pick_lobby_resumables(&config, save.as_ref(), &base).await;
             run_pool_lobby_mode(
                 &mut pool,
                 lobby_config,
@@ -118,10 +114,10 @@ async fn main() {
             Ok(())
         }
         None => {
-            let resumable = pick_resumable(&config.server, save.as_ref(), &base).await;
+            let resumable = pick_resumable(&config, save.as_ref(), &base).await;
             run_standalone(
                 &mut pool,
-                &config.server,
+                &config,
                 base,
                 pyrogenesis_path,
                 outcome_dir,
@@ -304,12 +300,16 @@ fn serve_metrics(host: std::net::IpAddr, port: u16) {
 // The saved match a standalone server resumes on its port, if resuming is on
 // and one can be. Reading and locking bundles is blocking file IO.
 async fn pick_resumable(
-    server: &ServerSection,
+    config: &FileConfig,
     save: Option<&SaveSetup>,
     server_config: &Config,
 ) -> Option<Resumable> {
-    let setup = save.filter(|_| server.resume)?;
-    let expect = Expect::new(Mode::Standalone, server_config, server.max_resume_attempts);
+    let setup = save.filter(|_| config.saves.resume)?;
+    let expect = Expect::new(
+        Mode::Standalone,
+        server_config,
+        config.advanced.max_resume_attempts,
+    );
     let root = setup.root.clone();
     tokio::task::spawn_blocking(move || resume::pick(&root, &expect))
         .await
@@ -319,14 +319,18 @@ async fn pick_resumable(
 // Every saved lobby match that can be resumed here. A lobby server has an
 // account pool rather than one port, so it takes them all.
 async fn pick_lobby_resumables(
-    server: &ServerSection,
+    config: &FileConfig,
     save: Option<&SaveSetup>,
     server_config: &Config,
 ) -> Vec<Resumable> {
-    let Some(setup) = save.filter(|_| server.resume) else {
+    let Some(setup) = save.filter(|_| config.saves.resume) else {
         return Vec::new();
     };
-    let expect = Expect::new(Mode::Lobby, server_config, server.max_resume_attempts);
+    let expect = Expect::new(
+        Mode::Lobby,
+        server_config,
+        config.advanced.max_resume_attempts,
+    );
     let root = setup.root.clone();
     tokio::task::spawn_blocking(move || resume::pick_all(&root, &expect))
         .await
@@ -338,15 +342,15 @@ async fn pick_lobby_resumables(
 // set, is the first game.
 async fn run_standalone(
     pool: &mut GamePool,
-    server: &ServerSection,
+    config: &FileConfig,
     server_config: Config,
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
     mut resumable: Option<Resumable>,
 ) -> Result<(), String> {
-    let port = server.port;
-    let exit_after_game = server.exit_after_game;
-    let save = server.save_setup("");
+    let port = config.server.port;
+    let exit_after_game = config.server.exit_after_game;
+    let save = config.save_setup("");
     // One future for the whole run, so a signal that arrives between two
     // games is not missed.
     let shutdown = shutdown_signal();

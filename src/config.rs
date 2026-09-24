@@ -68,21 +68,33 @@ fn default_max_sidecar_runs() -> usize {
 pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
 const GENERATED_HEADER: &str = "# veredus configuration. Command line flags override these values.\n\
-# An empty string or 0 marks an optional setting as unset.\n\n";
+# An empty string or 0 marks an optional setting as unset.\n\
+# Tables run from the settings most servers change to the ones almost none do.\n\n";
 
 // The generated file is this struct serialized, and TOML drops None, so an
 // optional setting is an empty string or 0 here: otherwise the key would be
 // missing from the generated file and nobody would know it exists.
+// Field order is the generated file's table order: the likeliest to be
+// edited first, so an operator reads what matters before what does not.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
     pub server: ServerSection,
-    pub game: GameSection,
     pub lobby: LobbySection,
+    #[serde(rename = "match")]
+    pub game_match: MatchSection,
+    pub observers: ObserversSection,
+    pub pause: PauseSection,
+    pub saves: SavesSection,
+    pub metrics: MetricsSection,
     pub log: LogSection,
+    pub sidecar: SidecarSection,
+    pub limits: LimitsSection,
+    pub timeouts: TimeoutsSection,
+    pub advanced: AdvancedSection,
 }
 
-/// Network, engine runs and saving.
+/// Where the server listens and which engine it runs.
 #[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerSection {
@@ -95,51 +107,10 @@ pub struct ServerSection {
     /// serve get a snapshot from a one-shot replay instead of a drop, and
     /// AI slots are played by a headless pyrogenesis.
     pub pyrogenesis_path: PathBuf,
-    /// Directory each finished match's outcome is written to, as
-    /// <game_id>.json; empty only logs it. Needs pyrogenesis_path, which
-    /// replays the match to work the outcome out.
-    pub outcome_dir: PathBuf,
-    /// Released turns between two sidecar checkpoints, each resumed from
-    /// the last; joiners are served the newest one. 600 is two minutes of
-    /// play at the default turn length. 0 disables them.
-    pub checkpoint_interval_turns: u32,
-    /// Where the Prometheus endpoint listens. Loopback by default: the
-    /// endpoint names players, so exposing it further is the operator's
-    /// decision, not a default.
-    pub metrics_host: IpAddr,
-    /// Port of the Prometheus endpoint; 0 disables it.
-    pub metrics_port: u16,
     /// Standalone mode only: stop the process once its game ends instead
     /// of hosting a fresh one on the same port, for a supervisor that
     /// restarts it.
     pub exit_after_game: bool,
-    /// Largest packet the host sends or reassembles. The floor is 65535:
-    /// the message header counts length in 16 bits, and a lower cap would
-    /// drop the biggest legitimate game settings.
-    pub enet_max_packet_bytes: usize,
-    /// What one peer, authenticated or not, may make the relay hold in
-    /// half reassembled or undelivered packets: a few maximum-size
-    /// messages, which is more than a stock client ever has in flight.
-    pub enet_max_waiting_bytes: usize,
-    /// How many one-shot engine runs (dumps, checkpoints, outcome
-    /// replays) the whole process may have going at once; the rest queue.
-    /// 0 lifts the cap. Defaults to the host core count, since a replay
-    /// is CPU-bound.
-    pub max_sidecar_runs: usize,
-    /// Where every running match keeps its save bundle; empty turns
-    /// saving off. Relative to the working directory, so a checkout saves
-    /// next to itself.
-    pub save_dir: PathBuf,
-    /// Resume the saved matches found in save_dir at startup.
-    pub resume: bool,
-    /// A crash loses at most this much of a match, and the disk sees one
-    /// fsync per game this often.
-    pub save_flush_ms: u64,
-    /// Keep a decided match's bundle instead of deleting it.
-    pub keep_finished_saves: bool,
-    /// A match that crashes the server on every resume must not crash it
-    /// forever.
-    pub max_resume_attempts: u32,
 }
 
 impl Default for ServerSection {
@@ -148,19 +119,7 @@ impl Default for ServerSection {
             host: Ipv4Addr::UNSPECIFIED,
             port: DEFAULT_PORT,
             pyrogenesis_path: PathBuf::from_str("../0ad/binaries/system/pyrogenesis").unwrap(),
-            outcome_dir: PathBuf::from_str("./outcome").unwrap(),
-            checkpoint_interval_turns: DEFAULT_CHECKPOINT_INTERVAL_TURNS,
-            metrics_host: DEFAULT_METRICS_HOST,
-            metrics_port: DEFAULT_METRICS_PORT,
             exit_after_game: false,
-            enet_max_packet_bytes: DEFAULT_ENET_MAX_PACKET_BYTES,
-            enet_max_waiting_bytes: DEFAULT_ENET_MAX_WAITING_BYTES,
-            max_sidecar_runs: default_max_sidecar_runs(),
-            save_dir: PathBuf::from(DEFAULT_SAVE_DIR),
-            resume: true,
-            save_flush_ms: DEFAULT_SAVE_FLUSH_MS,
-            keep_finished_saves: false,
-            max_resume_attempts: DEFAULT_MAX_RESUME_ATTEMPTS,
         }
     }
 }
@@ -168,341 +127,6 @@ impl Default for ServerSection {
 impl ServerSection {
     pub fn pyrogenesis_path(&self) -> Option<PathBuf> {
         non_empty_path(&self.pyrogenesis_path)
-    }
-
-    pub fn outcome_dir(&self) -> Option<PathBuf> {
-        non_empty_path(&self.outcome_dir)
-    }
-
-    pub fn save_dir(&self) -> Option<PathBuf> {
-        non_empty_path(&self.save_dir)
-    }
-
-    // None when saving is off. `lobby_account` names the account hosting
-    // the game, empty in standalone mode.
-    pub fn save_setup(&self, lobby_account: &str) -> Option<SaveSetup> {
-        Some(SaveSetup {
-            root: self.save_dir()?,
-            flush_interval: Duration::from_millis(self.save_flush_ms.max(1)),
-            keep_finished: self.keep_finished_saves,
-            lobby_account: lobby_account.to_string(),
-        })
-    }
-
-    pub fn enet_limits(&self) -> EnetLimits {
-        EnetLimits {
-            max_packet_bytes: self.enet_max_packet_bytes,
-            max_waiting_bytes: self.enet_max_waiting_bytes,
-        }
-    }
-}
-
-// A mirror of LateObserverPolicy, so serde stays out of the relay core.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ObserverPolicy {
-    Everyone,
-    Buddies,
-    Deny,
-}
-
-impl From<LateObserverPolicy> for ObserverPolicy {
-    fn from(policy: LateObserverPolicy) -> Self {
-        match policy {
-            LateObserverPolicy::Everyone => ObserverPolicy::Everyone,
-            LateObserverPolicy::Buddies => ObserverPolicy::Buddies,
-            LateObserverPolicy::Deny => ObserverPolicy::Deny,
-        }
-    }
-}
-
-impl From<ObserverPolicy> for LateObserverPolicy {
-    fn from(policy: ObserverPolicy) -> Self {
-        match policy {
-            ObserverPolicy::Everyone => LateObserverPolicy::Everyone,
-            ObserverPolicy::Buddies => LateObserverPolicy::Buddies,
-            ObserverPolicy::Deny => LateObserverPolicy::Deny,
-        }
-    }
-}
-
-// A mirror of EnabledMod, which is a wire type and carries no serde.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModEntry {
-    pub name: String,
-    pub version: String,
-}
-
-/// Match rules, admission and flood limits.
-#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
-#[serde(default, deny_unknown_fields)]
-pub struct GameSection {
-    /// Milliseconds between released turns. At least 1: a zero-length
-    /// turn would release turns as fast as the tick loop runs.
-    pub turn_length_ms: u16,
-    /// The name the relay speaks under. It occupies an observer row in
-    /// the slot list, where a client looks a chat sender's name up.
-    pub server_name: String,
-    /// Sent to each arriving client; empty greets them with nothing.
-    pub welcome_message: String,
-    /// Empty means the first client to authenticate becomes controller,
-    /// since that is the secret every stock client sends.
-    pub controller_secret: String,
-    /// When set, two clients may play under the same name outside lobby
-    /// mode.
-    pub allow_duplicate_names: bool,
-    /// Who may watch a match already in progress: everyone, buddies or
-    /// deny.
-    pub late_observer_policy: ObserverPolicy,
-    /// How many observers a match holds at once.
-    pub observer_limit: usize,
-    /// How far an observer may lag before it is dropped. 0 means an
-    /// observer never blocks turn release.
-    pub observer_lag_limit: u32,
-    /// How many turns behind the players observers watch. 0 puts them on
-    /// the live stream, where they may not pause.
-    pub observer_delay_turns: u32,
-    /// Cap the FSM enforces at admission, 2 to 200. The arriving session
-    /// counts, so 1 would refuse everyone.
-    pub max_sessions: usize,
-    /// Losing the controller is permanent in the stock server, which
-    /// strands the match with nobody able to start it; when set, someone
-    /// else can take over.
-    pub release_controller_on_leave: bool,
-    /// How long a player may hold the match paused across the whole
-    /// game. Longer than any match is how the policy is turned off.
-    pub pause_budget_secs: u64,
-    /// When set, the match is held for a player who drops or goes silent
-    /// mid-match, charged to that player's pause budget.
-    pub afk_pause: bool,
-    /// How long a decided match keeps running for the players who stay
-    /// to watch or chat before the game shuts down.
-    pub post_game_linger_secs: u64,
-    /// How long a client serializing a snapshot for a joiner may go
-    /// without sending anything before the joiner is re-sourced
-    /// elsewhere. 0 waits forever.
-    pub join_source_stall_secs: u64,
-    /// How long a connected peer may take to be admitted before it is
-    /// dropped. 0 waits forever.
-    pub handshake_timeout_secs: u64,
-    /// How many peers from one address may be connected but not yet
-    /// admitted at once. 0 means no cap.
-    pub max_pending_per_ip: usize,
-    /// How long the loading screen may last before whoever is still on
-    /// it is dropped. Must cover a large map on a slow machine. 0 waits
-    /// forever.
-    pub loading_timeout_secs: u64,
-    /// Per-peer chat limit: what one peer may fan out to every session.
-    /// A stock client stays far below it. 0 turns that bucket off.
-    pub chat_per_sec: u32,
-    /// Chat messages that fit in the bucket at once; at least 1 when the
-    /// rate above is set.
-    pub chat_burst: u32,
-    /// Longer chat is dropped.
-    pub chat_max_chars: usize,
-    /// Per-peer flare limit, as for chat. 0 turns that bucket off.
-    pub flare_per_sec: u32,
-    /// Flares that fit in the bucket at once; at least 1 when the rate
-    /// above is set.
-    pub flare_burst: u32,
-    /// Counted per turn a command is scheduled for, because that is what
-    /// the match log and every replay of it grow by. 0 turns that cap
-    /// off.
-    pub commands_per_turn: u32,
-    /// Byte twin of the cap above. 0 turns that cap off.
-    pub command_bytes_per_turn: usize,
-    /// What a pause costs however soon it is lifted.
-    pub pause_min_charge_secs: u64,
-    /// How many times its limit a peer may send before it is disconnected
-    /// rather than merely dropped. 0 never disconnects.
-    pub flood_kick_multiple: u32,
-    /// How many joins into a running match one address, or one lobby
-    /// name, may make before it has to wait. Every join makes a player or
-    /// a sidecar serialize the match.
-    pub join_burst: u32,
-    /// How long each join past the burst waits. 0 turns the limit off.
-    pub join_interval_secs: u64,
-    /// How many wrong passwords one lobby name may send before it is
-    /// turned away.
-    pub auth_fail_burst: u32,
-    /// How many wrong passwords one address may send. More than the name
-    /// above, because players behind one NAT share it and only one of
-    /// them may be guessing.
-    pub auth_fail_burst_per_addr: u32,
-    /// How long each wrong password past the bursts waits. 0 turns the
-    /// limit off.
-    pub auth_fail_interval_secs: u64,
-    /// How long a resumed match waits with no original player back before
-    /// it is given up. 0 waits forever.
-    pub resume_wait_secs: u64,
-    /// How long only the saved controller may restart a resumed match;
-    /// after that any original player may.
-    pub resume_controller_grace_secs: u64,
-    /// Without a sidecar, how often one playing client is asked for the
-    /// match state so the match can be resumed; 0 turns it off.
-    pub client_state_interval_secs: u64,
-    /// With hosted AI, how many turns apart the AI players' own state is
-    /// saved, so a crashed AI host can be brought back; each save pauses
-    /// the match briefly. 0 uses the checkpoint interval.
-    pub ai_state_interval_turns: u32,
-    /// How many times a match tries to bring its AI players back after
-    /// their process is lost, before it is saved for a restart.
-    pub ai_heal_attempts: u32,
-    /// How long each of those tries may take to catch up with the match.
-    /// 0 waits forever.
-    pub ai_heal_timeout_secs: u64,
-    /// Names that count as buddies under the buddies observer policy.
-    pub buddies: Vec<String>,
-    // Last: TOML refuses a plain value after an array of tables.
-    /// The list admission enforces against every client, so it is
-    /// provably what the game runs.
-    pub enabled_mods: Vec<ModEntry>,
-}
-
-impl Default for GameSection {
-    fn default() -> Self {
-        // Read back from the FSM's own defaults so the two cannot drift apart.
-        let config = Config::default();
-        let mut buddies: Vec<String> = config.buddies.into_iter().collect();
-        buddies.sort();
-        GameSection {
-            turn_length_ms: config.turn_length_ms,
-            server_name: config.server_name,
-            welcome_message: config.welcome_message,
-            controller_secret: config.controller_secret,
-            allow_duplicate_names: config.allow_duplicate_names,
-            late_observer_policy: config.late_observer_policy.into(),
-            observer_limit: config.observer_limit,
-            observer_lag_limit: config.observer_lag_limit.unwrap_or(0),
-            observer_delay_turns: config.observer_delay_turns,
-            max_sessions: config.max_sessions,
-            release_controller_on_leave: config.release_controller_on_leave,
-            pause_budget_secs: config.pause_budget.num_seconds().max(0) as u64,
-            afk_pause: config.afk_pause,
-            post_game_linger_secs: config.post_game_linger.num_seconds().max(0) as u64,
-            join_source_stall_secs: config
-                .join_source_stall
-                .map_or(0, |d| d.num_seconds().max(0) as u64),
-            handshake_timeout_secs: config
-                .handshake_timeout
-                .map_or(0, |d| d.num_seconds().max(0) as u64),
-            max_pending_per_ip: config.max_pending_per_ip,
-            loading_timeout_secs: config
-                .loading_timeout
-                .map_or(0, |d| d.num_seconds().max(0) as u64),
-            chat_per_sec: config.chat_per_sec,
-            chat_burst: config.chat_burst,
-            chat_max_chars: config.chat_max_chars,
-            flare_per_sec: config.flare_per_sec,
-            flare_burst: config.flare_burst,
-            commands_per_turn: config.commands_per_turn,
-            command_bytes_per_turn: config.command_bytes_per_turn,
-            pause_min_charge_secs: config.pause_min_charge.num_seconds().max(0) as u64,
-            flood_kick_multiple: config.flood_kick_multiple,
-            join_burst: config.join_burst,
-            join_interval_secs: config
-                .join_interval
-                .map_or(0, |d| d.num_seconds().max(0) as u64),
-            auth_fail_burst: config.auth_fail_burst,
-            auth_fail_burst_per_addr: config.auth_fail_burst_per_addr,
-            auth_fail_interval_secs: config
-                .auth_fail_interval
-                .map_or(0, |d| d.num_seconds().max(0) as u64),
-            resume_wait_secs: config
-                .resume_wait
-                .map_or(0, |d| d.num_seconds().max(0) as u64),
-            resume_controller_grace_secs: config.resume_controller_grace.num_seconds().max(0)
-                as u64,
-            client_state_interval_secs: 0,
-            ai_state_interval_turns: 0,
-            ai_heal_attempts: config.ai_heal_attempts,
-            ai_heal_timeout_secs: config
-                .ai_heal_timeout
-                .map_or(0, |d| d.num_seconds().max(0) as u64),
-            buddies,
-            enabled_mods: config
-                .enabled_mods
-                .into_iter()
-                .map(|m| ModEntry {
-                    name: m.name,
-                    version: m.version,
-                })
-                .collect(),
-        }
-    }
-}
-
-impl GameSection {
-    // The per-game base both modes start from; lobby mode layers its own
-    // fields on top.
-    pub fn server_config(&self, sidecar: bool, checkpoint_interval_turns: u32) -> Config {
-        Config {
-            enabled_mods: self
-                .enabled_mods
-                .iter()
-                .map(|m| EnabledMod {
-                    name: m.name.clone(),
-                    version: m.version.clone(),
-                })
-                .collect(),
-            turn_length_ms: self.turn_length_ms,
-            controller_secret: self.controller_secret.clone(),
-            allow_duplicate_names: self.allow_duplicate_names,
-            late_observer_policy: self.late_observer_policy.into(),
-            observer_limit: self.observer_limit,
-            observer_lag_limit: (self.observer_lag_limit != 0).then_some(self.observer_lag_limit),
-            observer_delay_turns: self.observer_delay_turns,
-            buddies: self.buddies.iter().cloned().collect::<HashSet<String>>(),
-            max_sessions: self.max_sessions,
-            release_controller_on_leave: self.release_controller_on_leave,
-            server_name: self.server_name.clone(),
-            welcome_message: self.welcome_message.clone(),
-            pause_budget: secs_to_delta(self.pause_budget_secs),
-            afk_pause: self.afk_pause,
-            post_game_linger: secs_to_delta(self.post_game_linger_secs),
-            join_source_stall: (self.join_source_stall_secs != 0)
-                .then(|| secs_to_delta(self.join_source_stall_secs)),
-            handshake_timeout: (self.handshake_timeout_secs != 0)
-                .then(|| secs_to_delta(self.handshake_timeout_secs)),
-            max_pending_per_ip: self.max_pending_per_ip,
-            loading_timeout: (self.loading_timeout_secs != 0)
-                .then(|| secs_to_delta(self.loading_timeout_secs)),
-            chat_per_sec: self.chat_per_sec,
-            chat_burst: self.chat_burst,
-            chat_max_chars: self.chat_max_chars,
-            flare_per_sec: self.flare_per_sec,
-            flare_burst: self.flare_burst,
-            commands_per_turn: self.commands_per_turn,
-            command_bytes_per_turn: self.command_bytes_per_turn,
-            pause_min_charge: secs_to_delta(self.pause_min_charge_secs),
-            flood_kick_multiple: self.flood_kick_multiple,
-            join_burst: self.join_burst,
-            join_interval: (self.join_interval_secs != 0)
-                .then(|| secs_to_delta(self.join_interval_secs)),
-            auth_fail_burst: self.auth_fail_burst,
-            auth_fail_burst_per_addr: self.auth_fail_burst_per_addr,
-            auth_fail_interval: (self.auth_fail_interval_secs != 0)
-                .then(|| secs_to_delta(self.auth_fail_interval_secs)),
-            resume_wait: (self.resume_wait_secs != 0).then(|| secs_to_delta(self.resume_wait_secs)),
-            resume_controller_grace: secs_to_delta(self.resume_controller_grace_secs),
-            client_state_interval_turns: client_state_interval_turns(
-                sidecar,
-                self.client_state_interval_secs,
-                self.turn_length_ms,
-            ),
-            ai_state_interval_turns: ai_state_interval_turns(
-                self.ai_state_interval_turns,
-                checkpoint_interval_turns,
-            ),
-            ai_heal_attempts: self.ai_heal_attempts,
-            ai_heal_timeout: (self.ai_heal_timeout_secs != 0)
-                .then(|| secs_to_delta(self.ai_heal_timeout_secs)),
-            sidecar_dumps: sidecar,
-            hosted_ai: sidecar,
-            checkpoint_interval_turns,
-            ..Config::default()
-        }
     }
 }
 
@@ -519,23 +143,23 @@ pub struct AccountEntry {
 pub struct LobbySection {
     /// Set to run pool-lobby mode off this table.
     pub enabled: bool,
-    /// A lobby run with this empty could never be listed.
-    pub muc_room: String,
-    /// A lobby run with this empty could never log in.
-    pub bot_jid: String,
     /// The address players connect to. A lobby run with this empty could
     /// never be listed.
     pub public_ip: String,
     /// Shown in the lobby game list.
     pub server_name: String,
-    /// Must match the clients.
-    pub engine_version: String,
     /// Optional password set on every lobby game.
     pub game_password: String,
     /// How long a pooled-lobby game may sit with nobody ever having
     /// joined, or with everybody gone, before it shuts itself down and
     /// frees its account. 0 means never.
     pub idle_shutdown_secs: u64,
+    /// A lobby run with this empty could never be listed.
+    pub muc_room: String,
+    /// A lobby run with this empty could never log in.
+    pub bot_jid: String,
+    /// Must match the clients.
+    pub engine_version: String,
     // Last: TOML refuses a plain value after an array of tables.
     /// One-shot XMPP accounts waiting in the room; each hosts one game at
     /// a time. Replace these examples with your own. Keep this file
@@ -547,13 +171,13 @@ impl Default for LobbySection {
     fn default() -> Self {
         LobbySection {
             enabled: false,
-            muc_room: String::new(),
-            bot_jid: String::new(),
             public_ip: String::new(),
             server_name: crate::lobby::default_server_name(),
-            engine_version: crate::lobby::default_engine_version(),
             game_password: String::new(),
             idle_shutdown_secs: DEFAULT_IDLE_SHUTDOWN_SECS,
+            muc_room: String::new(),
+            bot_jid: String::new(),
+            engine_version: crate::lobby::default_engine_version(),
             accounts: Vec::new(),
         }
     }
@@ -581,7 +205,7 @@ impl LobbySection {
     // 0 means never, as for every other duration here; a zero timeout would
     // close each game on its first tick, before anyone could join it.
     pub fn idle_shutdown(&self) -> Option<TimeDelta> {
-        (self.idle_shutdown_secs != 0).then(|| secs_to_delta(self.idle_shutdown_secs))
+        secs_to_opt_delta(self.idle_shutdown_secs)
     }
 
     // The fields default to empty only so the generated file can show them;
@@ -622,6 +246,189 @@ impl LobbySection {
     }
 }
 
+/// What players see and who runs a match.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct MatchSection {
+    /// The name the relay speaks under. It occupies an observer row in
+    /// the slot list, where a client looks a chat sender's name up.
+    pub server_name: String,
+    /// Sent to each arriving client; empty greets them with nothing.
+    pub welcome_message: String,
+    /// Empty means the first client to authenticate becomes controller,
+    /// since that is the secret every stock client sends.
+    pub controller_secret: String,
+    /// When set, two clients may play under the same name outside lobby
+    /// mode.
+    pub allow_duplicate_names: bool,
+    /// How long a decided match keeps running for the players who stay
+    /// to watch or chat before the game shuts down.
+    pub post_game_linger_secs: u64,
+}
+
+impl Default for MatchSection {
+    fn default() -> Self {
+        // Read back from the FSM's own defaults so the two cannot drift apart.
+        let config = Config::default();
+        MatchSection {
+            server_name: config.server_name,
+            welcome_message: config.welcome_message,
+            controller_secret: config.controller_secret,
+            allow_duplicate_names: config.allow_duplicate_names,
+            post_game_linger_secs: delta_to_secs(config.post_game_linger),
+        }
+    }
+}
+
+// A mirror of LateObserverPolicy, so serde stays out of the relay core.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ObserverPolicy {
+    Everyone,
+    Buddies,
+    Deny,
+}
+
+impl From<LateObserverPolicy> for ObserverPolicy {
+    fn from(policy: LateObserverPolicy) -> Self {
+        match policy {
+            LateObserverPolicy::Everyone => ObserverPolicy::Everyone,
+            LateObserverPolicy::Buddies => ObserverPolicy::Buddies,
+            LateObserverPolicy::Deny => ObserverPolicy::Deny,
+        }
+    }
+}
+
+impl From<ObserverPolicy> for LateObserverPolicy {
+    fn from(policy: ObserverPolicy) -> Self {
+        match policy {
+            ObserverPolicy::Everyone => LateObserverPolicy::Everyone,
+            ObserverPolicy::Buddies => LateObserverPolicy::Buddies,
+            ObserverPolicy::Deny => LateObserverPolicy::Deny,
+        }
+    }
+}
+
+/// Who may watch a match, and how far behind the players.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObserversSection {
+    /// Who may watch a match already in progress: everyone, buddies or
+    /// deny.
+    pub policy: ObserverPolicy,
+    /// How many observers a match holds at once.
+    pub limit: usize,
+    /// How many turns behind the players observers watch. 0 puts them on
+    /// the live stream, where they may not pause.
+    pub delay_turns: u32,
+    /// Names that count as buddies under the buddies policy.
+    pub buddies: Vec<String>,
+}
+
+impl Default for ObserversSection {
+    fn default() -> Self {
+        let config = Config::default();
+        let mut buddies: Vec<String> = config.buddies.into_iter().collect();
+        buddies.sort();
+        ObserversSection {
+            policy: config.late_observer_policy.into(),
+            limit: config.observer_limit,
+            delay_turns: config.observer_delay_turns,
+            buddies,
+        }
+    }
+}
+
+/// How long players may hold a match paused.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct PauseSection {
+    /// How long a player may hold the match paused across the whole
+    /// game. Longer than any match is how the policy is turned off.
+    pub budget_secs: u64,
+    /// When set, the match is held for a player who drops or goes silent
+    /// mid-match, charged to that player's pause budget.
+    pub afk: bool,
+    /// What a pause costs however soon it is lifted.
+    pub min_charge_secs: u64,
+}
+
+impl Default for PauseSection {
+    fn default() -> Self {
+        let config = Config::default();
+        PauseSection {
+            budget_secs: delta_to_secs(config.pause_budget),
+            afk: config.afk_pause,
+            min_charge_secs: delta_to_secs(config.pause_min_charge),
+        }
+    }
+}
+
+/// Saving running matches so they survive a restart, and recording how
+/// they ended.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct SavesSection {
+    /// Where every running match keeps its save bundle; empty turns
+    /// saving off. Relative to the working directory, so a checkout saves
+    /// next to itself.
+    pub dir: PathBuf,
+    /// Resume the saved matches found in dir at startup.
+    pub resume: bool,
+    /// Keep a decided match's bundle instead of deleting it.
+    pub keep_finished: bool,
+    /// Directory each finished match's outcome is written to, as
+    /// <game_id>.json; empty only logs it. Needs [server]
+    /// pyrogenesis_path, which replays the match to work the outcome out.
+    pub outcome_dir: PathBuf,
+    /// Without a sidecar, how often one playing client is asked for the
+    /// match state so the match can be resumed; 0 turns it off.
+    pub client_state_interval_secs: u64,
+}
+
+impl Default for SavesSection {
+    fn default() -> Self {
+        SavesSection {
+            dir: PathBuf::from(DEFAULT_SAVE_DIR),
+            resume: true,
+            keep_finished: false,
+            outcome_dir: PathBuf::from_str("./outcome").unwrap(),
+            client_state_interval_secs: 0,
+        }
+    }
+}
+
+impl SavesSection {
+    pub fn outcome_dir(&self) -> Option<PathBuf> {
+        non_empty_path(&self.outcome_dir)
+    }
+
+    pub fn dir(&self) -> Option<PathBuf> {
+        non_empty_path(&self.dir)
+    }
+}
+
+/// The Prometheus endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetricsSection {
+    /// Where the endpoint listens. Loopback by default: the endpoint
+    /// names players, so exposing it further is the operator's decision,
+    /// not a default.
+    pub host: IpAddr,
+    /// Port of the endpoint; 0 disables it.
+    pub port: u16,
+}
+
+impl Default for MetricsSection {
+    fn default() -> Self {
+        MetricsSection {
+            host: DEFAULT_METRICS_HOST,
+            port: DEFAULT_METRICS_PORT,
+        }
+    }
+}
+
 // Every field here loses to its environment variable, which is how a single
 // debugging session turns logging up without editing the file.
 /// Every field loses to its environment variable.
@@ -652,6 +459,229 @@ impl Default for LogSection {
     }
 }
 
+/// Headless engine runs. Unused while [server] pyrogenesis_path is empty.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct SidecarSection {
+    /// How many one-shot engine runs (dumps, checkpoints, outcome
+    /// replays) the whole process may have going at once; the rest queue.
+    /// 0 lifts the cap. Defaults to the host core count, since a replay
+    /// is CPU-bound.
+    pub max_runs: usize,
+    /// Released turns between two checkpoints, each resumed from the
+    /// last; joiners are served the newest one. 600 is two minutes of
+    /// play at the default turn length. 0 disables them.
+    pub checkpoint_interval_turns: u32,
+    /// With hosted AI, how many turns apart the AI players' own state is
+    /// saved, so a crashed AI host can be brought back; each save pauses
+    /// the match briefly. 0 uses the checkpoint interval.
+    pub ai_state_interval_turns: u32,
+    /// How many times a match tries to bring its AI players back after
+    /// their process is lost, before it is saved for a restart.
+    pub ai_heal_attempts: u32,
+    /// How long each of those tries may take to catch up with the match.
+    /// 0 waits forever.
+    pub ai_heal_timeout_secs: u64,
+}
+
+impl Default for SidecarSection {
+    fn default() -> Self {
+        let config = Config::default();
+        SidecarSection {
+            max_runs: default_max_sidecar_runs(),
+            checkpoint_interval_turns: DEFAULT_CHECKPOINT_INTERVAL_TURNS,
+            ai_state_interval_turns: 0,
+            ai_heal_attempts: config.ai_heal_attempts,
+            ai_heal_timeout_secs: opt_delta_to_secs(config.ai_heal_timeout),
+        }
+    }
+}
+
+/// Per-peer flood and abuse limits. A stock client stays far below all
+/// of them.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsSection {
+    /// Per-peer chat limit: what one peer may fan out to every session.
+    /// 0 turns that bucket off.
+    pub chat_per_sec: u32,
+    /// Chat messages that fit in the bucket at once; at least 1 when the
+    /// rate above is set.
+    pub chat_burst: u32,
+    /// Longer chat is dropped.
+    pub chat_max_chars: usize,
+    /// Per-peer flare limit, as for chat. 0 turns that bucket off.
+    pub flare_per_sec: u32,
+    /// Flares that fit in the bucket at once; at least 1 when the rate
+    /// above is set.
+    pub flare_burst: u32,
+    /// Counted per turn a command is scheduled for, because that is what
+    /// the match log and every replay of it grow by. 0 turns that cap
+    /// off.
+    pub commands_per_turn: u32,
+    /// Byte twin of the cap above. 0 turns that cap off.
+    pub command_bytes_per_turn: usize,
+    /// How many times its limit a peer may send before it is disconnected
+    /// rather than merely dropped. 0 never disconnects.
+    pub flood_kick_multiple: u32,
+    /// How many joins into a running match one address, or one lobby
+    /// name, may make before it has to wait. Every join makes a player or
+    /// a sidecar serialize the match.
+    pub join_burst: u32,
+    /// How long each join past the burst waits. 0 turns the limit off.
+    pub join_interval_secs: u64,
+    /// How many wrong passwords one lobby name may send before it is
+    /// turned away.
+    pub auth_fail_burst: u32,
+    /// How many wrong passwords one address may send. More than the name
+    /// above, because players behind one NAT share it and only one of
+    /// them may be guessing.
+    pub auth_fail_burst_per_addr: u32,
+    /// How long each wrong password past the bursts waits. 0 turns the
+    /// limit off.
+    pub auth_fail_interval_secs: u64,
+    /// How many peers from one address may be connected but not yet
+    /// admitted at once. 0 means no cap.
+    pub max_pending_per_ip: usize,
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        let config = Config::default();
+        LimitsSection {
+            chat_per_sec: config.chat_per_sec,
+            chat_burst: config.chat_burst,
+            chat_max_chars: config.chat_max_chars,
+            flare_per_sec: config.flare_per_sec,
+            flare_burst: config.flare_burst,
+            commands_per_turn: config.commands_per_turn,
+            command_bytes_per_turn: config.command_bytes_per_turn,
+            flood_kick_multiple: config.flood_kick_multiple,
+            join_burst: config.join_burst,
+            join_interval_secs: opt_delta_to_secs(config.join_interval),
+            auth_fail_burst: config.auth_fail_burst,
+            auth_fail_burst_per_addr: config.auth_fail_burst_per_addr,
+            auth_fail_interval_secs: opt_delta_to_secs(config.auth_fail_interval),
+            max_pending_per_ip: config.max_pending_per_ip,
+        }
+    }
+}
+
+/// How long the server waits on slow or absent clients.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct TimeoutsSection {
+    /// How long a connected peer may take to be admitted before it is
+    /// dropped. 0 waits forever.
+    pub handshake_secs: u64,
+    /// How long the loading screen may last before whoever is still on
+    /// it is dropped. Must cover a large map on a slow machine. 0 waits
+    /// forever.
+    pub loading_secs: u64,
+    /// How long a client serializing a snapshot for a joiner may go
+    /// without sending anything before the joiner is re-sourced
+    /// elsewhere. 0 waits forever.
+    pub join_source_stall_secs: u64,
+    /// How long a resumed match waits with no original player back before
+    /// it is given up. 0 waits forever.
+    pub resume_wait_secs: u64,
+    /// How long only the saved controller may restart a resumed match;
+    /// after that any original player may.
+    pub resume_controller_grace_secs: u64,
+}
+
+impl Default for TimeoutsSection {
+    fn default() -> Self {
+        let config = Config::default();
+        TimeoutsSection {
+            handshake_secs: opt_delta_to_secs(config.handshake_timeout),
+            loading_secs: opt_delta_to_secs(config.loading_timeout),
+            join_source_stall_secs: opt_delta_to_secs(config.join_source_stall),
+            resume_wait_secs: opt_delta_to_secs(config.resume_wait),
+            resume_controller_grace_secs: delta_to_secs(config.resume_controller_grace),
+        }
+    }
+}
+
+// A mirror of EnabledMod, which is a wire type and carries no serde.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModEntry {
+    pub name: String,
+    pub version: String,
+}
+
+/// Protocol and resource internals. The defaults suit nearly every
+/// server.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdvancedSection {
+    /// Milliseconds between released turns. At least 1: a zero-length
+    /// turn would release turns as fast as the tick loop runs.
+    pub turn_length_ms: u16,
+    /// Cap the FSM enforces at admission, 2 to 200. The arriving session
+    /// counts, so 1 would refuse everyone.
+    pub max_sessions: usize,
+    /// Losing the controller is permanent in the stock server, which
+    /// strands the match with nobody able to start it; when set, someone
+    /// else can take over.
+    pub release_controller_on_leave: bool,
+    /// How far an observer may lag before it is dropped. 0 means an
+    /// observer never blocks turn release.
+    pub observer_lag_limit: u32,
+    /// Largest packet the host sends or reassembles. The floor is 65535:
+    /// the message header counts length in 16 bits, and a lower cap would
+    /// drop the biggest legitimate game settings.
+    pub enet_max_packet_bytes: usize,
+    /// What one peer, authenticated or not, may make the relay hold in
+    /// half reassembled or undelivered packets: a few maximum-size
+    /// messages, which is more than a stock client ever has in flight.
+    pub enet_max_waiting_bytes: usize,
+    /// A crash loses at most this much of a match, and the disk sees one
+    /// fsync per game this often.
+    pub save_flush_ms: u64,
+    /// A match that crashes the server on every resume must not crash it
+    /// forever.
+    pub max_resume_attempts: u32,
+    // Last: TOML refuses a plain value after an array of tables.
+    /// The list admission enforces against every client, so it is
+    /// provably what the game runs.
+    pub enabled_mods: Vec<ModEntry>,
+}
+
+impl Default for AdvancedSection {
+    fn default() -> Self {
+        let config = Config::default();
+        AdvancedSection {
+            turn_length_ms: config.turn_length_ms,
+            max_sessions: config.max_sessions,
+            release_controller_on_leave: config.release_controller_on_leave,
+            observer_lag_limit: config.observer_lag_limit.unwrap_or(0),
+            enet_max_packet_bytes: DEFAULT_ENET_MAX_PACKET_BYTES,
+            enet_max_waiting_bytes: DEFAULT_ENET_MAX_WAITING_BYTES,
+            save_flush_ms: DEFAULT_SAVE_FLUSH_MS,
+            max_resume_attempts: DEFAULT_MAX_RESUME_ATTEMPTS,
+            enabled_mods: config
+                .enabled_mods
+                .into_iter()
+                .map(|m| ModEntry {
+                    name: m.name,
+                    version: m.version,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl AdvancedSection {
+    pub fn enet_limits(&self) -> EnetLimits {
+        EnetLimits {
+            max_packet_bytes: self.enet_max_packet_bytes,
+            max_waiting_bytes: self.enet_max_waiting_bytes,
+        }
+    }
+}
+
 impl FileConfig {
     // `required` is set when the path was named on the command line: a file
     // the operator asked for must not be skipped silently.
@@ -672,57 +702,145 @@ impl FileConfig {
             .map_err(|error| format!("failed to parse config '{}': {error}", path.display()))
     }
 
+    // None when saving is off. `lobby_account` names the account hosting
+    // the game, empty in standalone mode.
+    pub fn save_setup(&self, lobby_account: &str) -> Option<SaveSetup> {
+        Some(SaveSetup {
+            root: self.saves.dir()?,
+            flush_interval: Duration::from_millis(self.advanced.save_flush_ms.max(1)),
+            keep_finished: self.saves.keep_finished,
+            lobby_account: lobby_account.to_string(),
+        })
+    }
+
+    // The per-game base both modes start from; lobby mode layers its own
+    // fields on top.
+    pub fn server_config(&self, sidecar: bool) -> Config {
+        let game_match = &self.game_match;
+        let observers = &self.observers;
+        let pause = &self.pause;
+        let limits = &self.limits;
+        let timeouts = &self.timeouts;
+        let advanced = &self.advanced;
+        let checkpoint_interval_turns = self.sidecar.checkpoint_interval_turns;
+        Config {
+            enabled_mods: advanced
+                .enabled_mods
+                .iter()
+                .map(|m| EnabledMod {
+                    name: m.name.clone(),
+                    version: m.version.clone(),
+                })
+                .collect(),
+            turn_length_ms: advanced.turn_length_ms,
+            controller_secret: game_match.controller_secret.clone(),
+            allow_duplicate_names: game_match.allow_duplicate_names,
+            late_observer_policy: observers.policy.into(),
+            observer_limit: observers.limit,
+            observer_lag_limit: (advanced.observer_lag_limit != 0)
+                .then_some(advanced.observer_lag_limit),
+            observer_delay_turns: observers.delay_turns,
+            buddies: observers
+                .buddies
+                .iter()
+                .cloned()
+                .collect::<HashSet<String>>(),
+            max_sessions: advanced.max_sessions,
+            release_controller_on_leave: advanced.release_controller_on_leave,
+            server_name: game_match.server_name.clone(),
+            welcome_message: game_match.welcome_message.clone(),
+            pause_budget: secs_to_delta(pause.budget_secs),
+            afk_pause: pause.afk,
+            post_game_linger: secs_to_delta(game_match.post_game_linger_secs),
+            join_source_stall: secs_to_opt_delta(timeouts.join_source_stall_secs),
+            handshake_timeout: secs_to_opt_delta(timeouts.handshake_secs),
+            max_pending_per_ip: limits.max_pending_per_ip,
+            loading_timeout: secs_to_opt_delta(timeouts.loading_secs),
+            chat_per_sec: limits.chat_per_sec,
+            chat_burst: limits.chat_burst,
+            chat_max_chars: limits.chat_max_chars,
+            flare_per_sec: limits.flare_per_sec,
+            flare_burst: limits.flare_burst,
+            commands_per_turn: limits.commands_per_turn,
+            command_bytes_per_turn: limits.command_bytes_per_turn,
+            pause_min_charge: secs_to_delta(pause.min_charge_secs),
+            flood_kick_multiple: limits.flood_kick_multiple,
+            join_burst: limits.join_burst,
+            join_interval: secs_to_opt_delta(limits.join_interval_secs),
+            auth_fail_burst: limits.auth_fail_burst,
+            auth_fail_burst_per_addr: limits.auth_fail_burst_per_addr,
+            auth_fail_interval: secs_to_opt_delta(limits.auth_fail_interval_secs),
+            resume_wait: secs_to_opt_delta(timeouts.resume_wait_secs),
+            resume_controller_grace: secs_to_delta(timeouts.resume_controller_grace_secs),
+            client_state_interval_turns: client_state_interval_turns(
+                sidecar,
+                self.saves.client_state_interval_secs,
+                advanced.turn_length_ms,
+            ),
+            ai_state_interval_turns: ai_state_interval_turns(
+                self.sidecar.ai_state_interval_turns,
+                checkpoint_interval_turns,
+            ),
+            ai_heal_attempts: self.sidecar.ai_heal_attempts,
+            ai_heal_timeout: secs_to_opt_delta(self.sidecar.ai_heal_timeout_secs),
+            sidecar_dumps: sidecar,
+            hosted_ai: sidecar,
+            checkpoint_interval_turns,
+            ..Config::default()
+        }
+    }
+
     // Run on the merged result, so a command line flag cannot slip a value
     // past it either.
     pub fn validate(&self) -> Result<(), String> {
         // A zero-length turn would release turns as fast as the tick loop
         // runs, and the clients would simulate none of them in real time.
-        if self.game.turn_length_ms == 0 {
-            return Err("[game] turn_length_ms must be at least 1".to_string());
+        if self.advanced.turn_length_ms == 0 {
+            return Err("[advanced] turn_length_ms must be at least 1".to_string());
         }
         // The arriving session counts against the cap, so 1 refuses everyone,
         // and above the ENet peer limit no peer is left over to tell a client
         // the server is full.
-        if !(2..=PEER_LIMIT).contains(&self.game.max_sessions) {
+        if !(2..=PEER_LIMIT).contains(&self.advanced.max_sessions) {
             return Err(format!(
-                "[game] max_sessions must be between 2 and {PEER_LIMIT}, got {}",
-                self.game.max_sessions
+                "[advanced] max_sessions must be between 2 and {PEER_LIMIT}, got {}",
+                self.advanced.max_sessions
             ));
         }
         // A bucket that holds nothing drops every message, which is not what
         // a rate that is switched on means.
-        if self.game.chat_per_sec != 0 && self.game.chat_burst == 0 {
+        if self.limits.chat_per_sec != 0 && self.limits.chat_burst == 0 {
             return Err(
-                "[game] chat_burst must be at least 1 when chat_per_sec is set".to_string(),
+                "[limits] chat_burst must be at least 1 when chat_per_sec is set".to_string(),
             );
         }
-        if self.game.join_interval_secs != 0 && self.game.join_burst == 0 {
+        if self.limits.join_interval_secs != 0 && self.limits.join_burst == 0 {
             return Err(
-                "[game] join_burst must be at least 1 when join_interval_secs is set".to_string(),
+                "[limits] join_burst must be at least 1 when join_interval_secs is set".to_string(),
             );
         }
-        if self.game.auth_fail_interval_secs != 0
-            && (self.game.auth_fail_burst == 0 || self.game.auth_fail_burst_per_addr == 0)
+        if self.limits.auth_fail_interval_secs != 0
+            && (self.limits.auth_fail_burst == 0 || self.limits.auth_fail_burst_per_addr == 0)
         {
             return Err(
-                "[game] auth_fail_burst and auth_fail_burst_per_addr must be at least 1 \
+                "[limits] auth_fail_burst and auth_fail_burst_per_addr must be at least 1 \
                  when auth_fail_interval_secs is set"
                     .to_string(),
             );
         }
-        if self.game.flare_per_sec != 0 && self.game.flare_burst == 0 {
+        if self.limits.flare_per_sec != 0 && self.limits.flare_burst == 0 {
             return Err(
-                "[game] flare_burst must be at least 1 when flare_per_sec is set".to_string(),
+                "[limits] flare_burst must be at least 1 when flare_per_sec is set".to_string(),
             );
         }
-        if self.server.enet_max_packet_bytes < DEFAULT_ENET_MAX_PACKET_BYTES {
+        if self.advanced.enet_max_packet_bytes < DEFAULT_ENET_MAX_PACKET_BYTES {
             return Err(format!(
-                "[server] enet_max_packet_bytes must be at least {DEFAULT_ENET_MAX_PACKET_BYTES}, got {}",
-                self.server.enet_max_packet_bytes
+                "[advanced] enet_max_packet_bytes must be at least {DEFAULT_ENET_MAX_PACKET_BYTES}, got {}",
+                self.advanced.enet_max_packet_bytes
             ));
         }
-        if self.server.enet_max_waiting_bytes == 0 {
-            return Err("[server] enet_max_waiting_bytes must be at least 1".to_string());
+        if self.advanced.enet_max_waiting_bytes == 0 {
+            return Err("[advanced] enet_max_waiting_bytes must be at least 1".to_string());
         }
         Ok(())
     }
@@ -756,9 +874,17 @@ impl FileConfig {
 // comments, so prose written for rustdoc is never retyped for TOML.
 fn decorate_default(doc: &mut DocumentMut) {
     decorate_section::<ServerSection>(doc, "server");
-    decorate_section::<GameSection>(doc, "game");
     decorate_section::<LobbySection>(doc, "lobby");
+    decorate_section::<MatchSection>(doc, "match");
+    decorate_section::<ObserversSection>(doc, "observers");
+    decorate_section::<PauseSection>(doc, "pause");
+    decorate_section::<SavesSection>(doc, "saves");
+    decorate_section::<MetricsSection>(doc, "metrics");
     decorate_section::<LogSection>(doc, "log");
+    decorate_section::<SidecarSection>(doc, "sidecar");
+    decorate_section::<LimitsSection>(doc, "limits");
+    decorate_section::<TimeoutsSection>(doc, "timeouts");
+    decorate_section::<AdvancedSection>(doc, "advanced");
 }
 
 fn decorate_section<T: Documented + DocumentedFields>(doc: &mut DocumentMut, table: &str) {
@@ -864,6 +990,19 @@ fn secs_to_delta(secs: u64) -> TimeDelta {
         .ok()
         .and_then(TimeDelta::try_seconds)
         .unwrap_or(TimeDelta::MAX)
+}
+
+// 0 in the file is how an optional duration is written as unset.
+fn secs_to_opt_delta(secs: u64) -> Option<TimeDelta> {
+    (secs != 0).then(|| secs_to_delta(secs))
+}
+
+fn delta_to_secs(delta: TimeDelta) -> u64 {
+    delta.num_seconds().max(0) as u64
+}
+
+fn opt_delta_to_secs(delta: Option<TimeDelta>) -> u64 {
+    delta.map_or(0, delta_to_secs)
 }
 
 #[cfg(test)]

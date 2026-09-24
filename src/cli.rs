@@ -103,22 +103,22 @@ pub fn parse_args() -> Result<Command, String> {
         config.server.pyrogenesis_path = path;
     }
     if let Some(path) = args.outcome_dir {
-        config.server.outcome_dir = path;
+        config.saves.outcome_dir = path;
     }
     if let Some(turns) = args.checkpoint_interval_turns {
-        config.server.checkpoint_interval_turns = turns;
+        config.sidecar.checkpoint_interval_turns = turns;
     }
     if let Some(host) = args.metrics_host {
-        config.server.metrics_host = host;
+        config.metrics.host = host;
     }
     if let Some(port) = args.metrics_port {
-        config.server.metrics_port = port;
+        config.metrics.port = port;
     }
     if let Some(path) = args.save_dir {
-        config.server.save_dir = path;
+        config.saves.dir = path;
     }
     if args.no_resume {
-        config.server.resume = false;
+        config.saves.resume = false;
     }
 
     config.validate()?;

@@ -126,7 +126,7 @@ time it starts:
    five minutes, any returning player can.
 
 This works best with the sidecar, and matches with AI opponents need it.
-Without the sidecar, set `[game] client_state_interval_secs` (for example
+Without the sidecar, set `[saves] client_state_interval_secs` (for example
 300). Every so often the server then asks one player's game for a copy of
 the match, which pauses the game for a moment. To start fresh instead, run
 with `--no-resume`.
@@ -185,12 +185,19 @@ file. `./veredus --help` lists every flag.
 
 Things people commonly change:
 
-- `[server] port` is the game port for a server outside the lobby.
-- `[game] server_name` and `welcome_message` set what players see.
-- `[game] turn_length_ms` controls game speed and responsiveness.
-- `[game] observer_delay_turns` sets how far behind observers watch
+- `[server] host` and `port` set where the server listens; `port` is the
+  game port for a server outside the lobby.
+- `[lobby]` turns lobby hosting on and holds the public address and the
+  accounts.
+- `[match] server_name` and `welcome_message` set what players see.
+- `[observers] delay_turns` sets how far behind observers watch
   (0 means live).
-- `[game] pause_budget_secs` limits how long each player may pause.
+- `[pause] budget_secs` limits how long each player may pause.
+
+The file runs from the settings most servers change to the ones almost none
+do; `[advanced]` at the end is best left alone. A config file written for an
+older version is refused with an "unknown field" error: write a fresh one with
+`--gen-config` and copy your values over.
 
 ## Running as a service
 
