@@ -224,10 +224,28 @@ impl TurnManager {
         // away in an endless loop. That is not only an empty match: once the
         // players and the controller have left, the observers that remain
         // block nothing. Hold instead.
+        //
+        // The headless AI host runs turns as fast as the engine can, so once
+        // no human blocks release it alone would race the match ahead of
+        // anyone still watching, or, with nobody watching, play on unseen
+        // for as long as the game lingers. Then every remaining client paces
+        // release, and with only the AI host left the match holds.
+        let humans_block = self
+            .clients
+            .values()
+            .any(|c| !c.ai_host && self.blocks(c, observer_lag_limit));
+        let ai_alone = !humans_block
+            && self
+                .clients
+                .values()
+                .any(|c| c.ai_host && self.blocks(c, observer_lag_limit));
+        if ai_alone && self.clients.values().all(|c| c.ai_host) {
+            return false;
+        }
         let mut blocking = self
             .clients
             .values()
-            .filter(|c| self.blocks(c, observer_lag_limit))
+            .filter(|c| ai_alone || self.blocks(c, observer_lag_limit))
             .peekable();
         if blocking.peek().is_none() {
             return false;
