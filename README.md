@@ -63,13 +63,16 @@ With the [sidecar](#extra-features-with-the-sidecar), a patched headless
    Windows: unzip it, open a terminal in that folder and run `veredus.exe`.
    When Windows Firewall asks, allow access.
 
-3. Optional, Linux only: from a `-sidecar` download, start it with the
-   sidecar instead. This needs glibc 2.36 or newer (Debian 12, Ubuntu 24.04
-   and later).
+3. Optional: start it with the [sidecar](#extra-features-with-the-sidecar)
+   instead. From a Linux `-sidecar` download (glibc 2.36 or newer, such as
+   Debian 12, Ubuntu 24.04 and later):
 
    ```sh
    ./veredus --pyrogenesis-path sidecar/binaries/system/pyrogenesis
    ```
+
+   On any other system, [build the sidecar](#building-the-sidecar) yourself
+   and pass its path the same way.
 
 4. Allow **UDP port 20595** through your firewall. At home, also forward
    that port on your router to the server machine.
@@ -110,15 +113,10 @@ To host games from the in-game lobby instead, see
 - On this page: [the sidecar](#extra-features-with-the-sidecar),
   [restarts](#restarts), [lobby hosting](#hosting-in-the-multiplayer-lobby),
   [configuration](#configuration), [running as a service](#running-as-a-service),
-  [building from source](#building-from-source) and
-  [building the sidecar](#building-the-sidecar).
+  [building from source](#building-from-source),
+  [building the sidecar](#building-the-sidecar) and [license](#license).
 - `./veredus --help` lists every flag; `./veredus --gen-config` writes a
   config file with every setting explained.
-- License: Veredus is Apache-2.0, see [LICENSE](LICENSE). The sidecar
-  patches in `sidecar/patches` change 0 A.D., so they are GPL-2.0 or later
-  like 0 A.D.'s code, see [sidecar/LICENSE](sidecar/LICENSE); 0 A.D.'s art is
-  CC BY-SA 3.0. The bundled ENet code is MIT, see
-  [src/enet/LICENSE.rusty_enet](src/enet/LICENSE.rusty_enet).
 
 ## Extra features with the sidecar
 
@@ -142,10 +140,11 @@ folder, start the server with:
 ./veredus --pyrogenesis-path sidecar/binaries/system/pyrogenesis
 ```
 
-The ready-made sidecar needs a Linux with glibc 2.36 or newer, such as
-Debian 12 or Ubuntu 24.04 and later, even in the musl downloads. There is
-no Windows sidecar yet. On other systems you can
-[build it from source](#building-the-sidecar) and point the server at it:
+The sidecar runs wherever 0 A.D. itself runs; only Linux gets a
+ready-made one. It needs glibc 2.36 or newer, such as Debian 12 or Ubuntu
+24.04 and later, even in the musl downloads. On Windows, macOS or an older
+Linux, [build it from source](#building-the-sidecar) and point the server
+at it:
 
 ```sh
 ./veredus --pyrogenesis-path /path/to/0ad/binaries/system/pyrogenesis
@@ -312,3 +311,15 @@ make -C build/workspaces/gcc config=release -j"$(nproc)"
 The result is `binaries/system/pyrogenesis`. Keep it inside the cloned
 folder, because it loads the game data from there, and pass its path to
 `--pyrogenesis-path`.
+
+On Windows and macOS, clone and apply the patches the same way, then follow
+the official build instructions for your system. The result is
+`binaries\system\pyrogenesis.exe` on Windows.
+
+## License
+
+Veredus is Apache-2.0, see [LICENSE](LICENSE). The sidecar patches in
+`sidecar/patches` change 0 A.D., so they are GPL-2.0 or later like 0 A.D.'s
+code, see [sidecar/LICENSE](sidecar/LICENSE); 0 A.D.'s art is CC BY-SA 3.0.
+The bundled ENet code is MIT, see
+[src/enet/LICENSE.rusty_enet](src/enet/LICENSE.rusty_enet).
