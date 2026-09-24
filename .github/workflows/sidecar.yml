@@ -1,0 +1,82 @@
+name: Sidecar
+
+# Manual only: the build takes the better part of an hour, and it proves
+# that sidecar/patches still apply to 0 A.D. v0.28.0 and compile. Nothing
+# is uploaded, because an artifact on a public repo is a binary release.
+on:
+  workflow_dispatch:
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-latest
+    # Debian 12 is what upstream builds its own 0.28 Linux binaries on, so
+    # the sidecar gets the same compiler and libraries as the players'
+    # Linux clients.
+    container: debian:bookworm-slim
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The engine has no LFS file it needs to compile, only game assets.
+      GIT_LFS_SKIP_SMUDGE: "1"
+      # premake5.lua keys its gcc 12 warning workaround on this exact name.
+      CC: gcc-12
+      CXX: g++-12
+      MAKE: make
+      RUSTUP_HOME: /usr/local/rust
+      CARGO_HOME: /usr/local/rust
+    steps:
+      # Upstream's Debian 12 package list, minus audio, lobby, UPnP, Atlas
+      # (wxWidgets) and clang, which the options below switch off.
+      - name: Install build dependencies
+        run: |
+          apt-get -qqy update
+          apt-get install -qqy --no-install-recommends \
+            ca-certificates curl git subversion make patch m4 xz-utils \
+            pkg-config gcc-12 g++-12 llvm python3 python3-dev python3-pip \
+            python-is-python3 libboost-filesystem-dev libboost-system-dev \
+            libcurl4-gnutls-dev libenet-dev libfmt-dev libfreetype-dev \
+            libicu-dev libpng-dev libsdl2-dev libsodium-dev libxml2-dev \
+            zlib1g-dev
+
+      # Debian's Rust is too old for SpiderMonkey 128; these are the
+      # versions upstream pins.
+      - name: Install Rust and cbindgen
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.76.0
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/cargo" install --locked cbindgen@0.29.0
+
+      - uses: actions/checkout@v4
+
+      - name: Fetch 0 A.D. v0.28.0 and apply the sidecar patches
+        run: |
+          git clone --branch v0.28.0 --depth 1 https://gitea.wildfiregames.com/0ad/0ad.git
+          cd 0ad
+          for p in ../sidecar/patches/*.patch; do git apply "$p"; done
+
+      # The library scripts are called one by one rather than through
+      # build-source-libs.sh so NVTT is skipped, and SpiderMonkey runs with
+      # OS=FreeBSD, the only way its script skips the debug copy it would
+      # otherwise build next to the release one. Nothing else in that
+      # script depends on the value on Linux.
+      - name: Build bundled libraries
+        working-directory: 0ad/libraries
+        run: |
+          export JOBS="-j$(nproc)"
+          ./source/cxxtest-4.4/build.sh
+          ./source/fcollada/build.sh
+          ./source/premake-core/build.sh
+          OS=FreeBSD ./source/spidermonkey/build.sh
+          cp source/spidermonkey/lib/* ../binaries/system/
+
+      - name: Build pyrogenesis
+        working-directory: 0ad
+        run: |
+          build/workspaces/update-workspaces.sh \
+            --without-atlas --without-tests --without-audio \
+            --without-lobby --without-miniupnpc --without-nvtt
+          make -C build/workspaces/gcc config=release -j"$(nproc)"
+          ls -l binaries/system/pyrogenesis
