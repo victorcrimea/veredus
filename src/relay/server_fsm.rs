@@ -84,6 +84,7 @@ use crate::savegame::SavedIdentity;
 use crate::savegame::SavedPlayer;
 use crate::savegame::SlotsSnapshot;
 use crate::savegame::Status;
+use crate::savegame::resume::AiResume;
 use crate::savegame::resume::ResumeData;
 use crate::savegame::resume::Seed;
 use crate::sidecar::BaseState;
@@ -3436,6 +3437,9 @@ impl Server<Idle> {
         }
         ctx.client_pull = pull;
         tracing::info!(turn, "resuming a saved match");
+        if let Some(ai) = data.ai {
+            server.resume_ai_host(ai);
+        }
         server.start_restore(data.base);
         server
     }
@@ -4692,8 +4696,32 @@ impl Server<Resuming> {
             }
             other => self.on_common_input(other),
         }
+        // Healing gives up by dropping the AI host, and a match without its
+        // AI players is not worth restarting.
+        if self.ctx.ai_host.is_none() && !self.st.settings.ai_players.is_empty() {
+            self.abandon("its AI players could not be restored");
+        }
         self.announce_arrivals();
         self.into()
+    }
+
+    // The AI host comes back the way a lost one is healed, from its own
+    // saved state up to the stopped turn, while everyone is held anyway.
+    fn resume_ai_host(&mut self, ai: AiResume) {
+        tracing::info!(ai_players = ?ai.players, turns = ?ai.state.turns, "sidecar: bringing the AI host back");
+        self.st.settings.ai_json = Some(ai.settings);
+        self.st.settings.ai_players = ai.players.clone();
+        self.ctx.ai_state = Some(ai.state);
+        self.ctx.ai_host = Some(AiHost {
+            peer: None,
+            players: ai.players.into_iter().collect(),
+            last_pull: None,
+            heal: Some(Healing {
+                attempt: 1,
+                since: None,
+            }),
+        });
+        self.spawn_ai_host();
     }
 
     // The state at the stopped turn, which every returning client loads, is
@@ -4773,6 +4801,13 @@ impl Server<Resuming> {
             self.ctx.server_chat(
                 Some(peer),
                 "The match is still being rebuilt; it can be resumed once that is done.",
+            );
+            return self.into();
+        }
+        if self.ctx.ai_healing() {
+            self.ctx.server_chat(
+                Some(peer),
+                "The AI players are still being restored; the match can be resumed once they are back.",
             );
             return self.into();
         }
@@ -4930,11 +4965,18 @@ impl Server<Resuming> {
             ),
             (None, false) => format!("The controller types {RESUME_COMMAND} to continue."),
         };
+        let ai = if self.ctx.ai_healing() {
+            " The AI players are still being restored."
+        } else {
+            ""
+        };
         if waiting.is_empty() {
-            format!("Match restored at turn {turn} after a server restart. Everyone is back. {who}")
+            format!(
+                "Match restored at turn {turn} after a server restart. Everyone is back.{ai} {who}"
+            )
         } else {
             format!(
-                "Match restored at turn {turn} after a server restart. Waiting for: {}. {who}",
+                "Match restored at turn {turn} after a server restart. Waiting for: {}.{ai} {who}",
                 waiting.join(", ")
             )
         }

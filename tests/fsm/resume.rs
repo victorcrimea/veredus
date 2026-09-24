@@ -89,6 +89,7 @@ fn data(base: Option<BaseState>) -> ResumeData {
         },
         base,
         seed: None,
+        ai: None,
     }
 }
 

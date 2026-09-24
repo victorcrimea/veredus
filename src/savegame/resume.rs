@@ -56,6 +56,17 @@ pub struct ResumeData {
     pub base: Option<BaseState>,
     // The newest client state, for a server without a sidecar.
     pub seed: Option<Seed>,
+    // What brings the AI host back, for a match with hosted AI players.
+    pub ai: Option<AiResume>,
+}
+
+// The AI host's side of a saved match: its own copy of the settings, the
+// player ids it plays and the newest state pulled from it.
+#[derive(Debug, Clone)]
+pub struct AiResume {
+    pub settings: Vec<u8>,
+    pub players: Vec<i32>,
+    pub state: Seed,
 }
 
 impl ResumeData {
@@ -187,6 +198,15 @@ pub fn load(dir: &Path, expect: &Expect) -> Result<Resumable, Skip> {
     if !expect.sidecar && seed.is_none() {
         return Err(Skip::NoSidecar);
     }
+    let ai = if manifest.ai_players.is_empty() {
+        None
+    } else {
+        // The AI host is a sidecar process, whatever state is saved.
+        if !expect.sidecar {
+            return Err(Skip::NoSidecar);
+        }
+        Some(read_ai(dir, &manifest.ai_players)?)
+    };
 
     let settings =
         std::fs::read(dir.join(bundle::SETTINGS)).map_err(|e| Skip::Unreadable(e.to_string()))?;
@@ -219,6 +239,7 @@ pub fn load(dir: &Path, expect: &Expect) -> Result<Resumable, Skip> {
         slots,
         base,
         seed,
+        ai,
     };
     Ok(Resumable {
         game_id: manifest.game_id.clone(),
@@ -252,11 +273,6 @@ fn check_compatible(manifest: &Manifest, expect: &Expect) -> Result<(), Skip> {
     }
     if manifest.mods != expect.mods {
         return Err(Skip::Incompatible("a different mod list".to_string()));
-    }
-    // Nothing brings the AI host back into a resumed match yet, and its
-    // players would stand idle for the rest of it.
-    if !manifest.ai_players.is_empty() {
-        return Err(Skip::Incompatible("hosted AI players".to_string()));
     }
     Ok(())
 }
@@ -328,6 +344,31 @@ fn read_client_state(dir: &Path) -> Option<Seed> {
     Some(Seed {
         turns: meta.first..=meta.last,
         state: Arc::new(state),
+    })
+}
+
+// Without its own state the AI host cannot be brought back, and its
+// players would stand idle for the rest of the match, so the bundle is left
+// alone rather than resumed without them.
+fn read_ai(dir: &Path, players: &[i32]) -> Result<AiResume, Skip> {
+    let settings = std::fs::read(dir.join(bundle::SETTINGS_AI))
+        .map_err(|_| Skip::Incompatible("no AI host settings".to_string()))?;
+    let missing = || Skip::Incompatible("no AI host state".to_string());
+    let state = std::fs::read(dir.join(bundle::AI_STATE)).map_err(|_| missing())?;
+    let meta: ClientStateMeta =
+        bundle::read_json(&dir.join(bundle::AI_STATE_META)).map_err(|_| missing())?;
+    if !meta.matches(&state) || meta.first > meta.last {
+        return Err(Skip::Incompatible(
+            "the AI host state does not match its turns".to_string(),
+        ));
+    }
+    Ok(AiResume {
+        settings,
+        players: players.to_vec(),
+        state: Seed {
+            turns: meta.first..=meta.last,
+            state: Arc::new(state),
+        },
     })
 }
 

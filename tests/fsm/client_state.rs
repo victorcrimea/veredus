@@ -181,6 +181,7 @@ fn resumed_from_seed() -> Harness {
             turns: 5..=7,
             state: Arc::new(vec![1, 2, 3]),
         }),
+        ai: None,
     };
     let server = Server::<Idle>::new(pulling()).resume(data);
     let (h, effects) = Harness::with_server(AnyServer::from(server));
