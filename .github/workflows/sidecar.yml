@@ -234,7 +234,11 @@ jobs:
       - name: Run the sidecar on a bare Debian 12
         run: |
           tar -xzf sidecar-linux-${{ matrix.arch }}.tar.gz
-          docker run --rm -v "$PWD/sidecar:/sidecar" debian:bookworm-slim \
+          # pyrogenesis refuses to start as root, which is the container default.
+          # The runner's own uid has no passwd entry in the image, so HOME
+          # would be "/", which it cannot write.
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$PWD/sidecar:/sidecar" debian:bookworm-slim \
             /sidecar/binaries/system/pyrogenesis -replay=/nonexistent/commands.txt \
             2>&1 | tee smoke.log
           grep -q "does not exist" smoke.log
