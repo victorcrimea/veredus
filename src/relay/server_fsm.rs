@@ -694,6 +694,17 @@ struct Healing {
     // When that AI host was started. Anchored on the next tick, because the
     // FSM only learns the time there.
     since: Option<DateTime<Utc>>,
+    // Set while a checkpoint decides whether the lost AI host only left
+    // because the match is over, and nothing has been spawned yet: an AI
+    // host started after the end would replay to it and leave again.
+    verdict: Option<AiVerdict>,
+}
+
+enum AiVerdict {
+    // Waiting for the next checkpoint run to start.
+    Due,
+    // The id of the run that answers it.
+    Running(u32),
 }
 
 // The one in-flight one-shot state dump: the turn it rebuilds and every
@@ -2791,6 +2802,23 @@ impl<S: PhaseMarker> Server<S> {
             return;
         }
         tracing::warn!(why, "sidecar: AI host lost");
+        // The AI host also leaves when the match is over, so a checkpoint at
+        // the held turn is asked first, as a resign or a departure would be.
+        if S::PHASE == Phase::InGame && self.ctx.config.sidecar_dumps {
+            if let Some(host) = self.ctx.ai_host.as_mut() {
+                host.heal = Some(Healing {
+                    attempt: 1,
+                    since: None,
+                    verdict: Some(AiVerdict::Due),
+                });
+            }
+            self.ctx.server_pause(true);
+            self.ctx.server_chat(
+                None,
+                "The AI players' process stopped. Checking whether the match is over; the match is paused.",
+            );
+            return;
+        }
         if self.ctx.ai_state.is_none() {
             self.ai_heal_gave_up("no AI host state was saved yet");
             return;
@@ -2799,6 +2827,7 @@ impl<S: PhaseMarker> Server<S> {
             host.heal = Some(Healing {
                 attempt: 1,
                 since: None,
+                verdict: None,
             });
         }
         // A resumed match already holds everyone until it is restarted.
@@ -2828,6 +2857,12 @@ impl<S: PhaseMarker> Server<S> {
         let Some(heal) = host.heal.as_mut() else {
             return;
         };
+        // The process that was lost can report its exit only now, and no
+        // new one has been started yet to fail.
+        if heal.verdict.is_some() {
+            tracing::debug!(why, "sidecar: AI host gone again while its loss is checked");
+            return;
+        }
         tracing::warn!(
             attempt = heal.attempt,
             why,
@@ -2859,6 +2894,10 @@ impl<S: PhaseMarker> Server<S> {
         let Some(heal) = self.ctx.ai_host.as_mut().and_then(|h| h.heal.as_mut()) else {
             return;
         };
+        // Counted from the spawn, which waits for the checkpoint run.
+        if heal.verdict.is_some() {
+            return;
+        }
         let since = *heal.since.get_or_insert(now);
         let elapsed = now.signed_duration_since(since);
         if elapsed < TimeDelta::zero() {
@@ -3992,9 +4031,39 @@ impl Server<InGame> {
             return self.end_match(None).into();
         }
         self.maybe_checkpoint();
+        self.settle_ai_verdict();
         self.maybe_pull_client_state();
         self.maybe_pull_ai_state();
         self.into()
+    }
+
+    fn ai_verdict(&self) -> Option<&AiVerdict> {
+        self.ctx.ai_host.as_ref()?.heal.as_ref()?.verdict.as_ref()
+    }
+
+    // A decided run has already ended the match before this runs, so a
+    // verdict with nothing left in flight means the match goes on: the run
+    // did not decide it, failed, or none could start, the stored checkpoint
+    // then being at the held turn already.
+    fn settle_ai_verdict(&mut self) {
+        let pending = self.ctx.checkpoints.pending.as_ref().map(|p| p.id);
+        match (self.ai_verdict(), pending) {
+            (None, _) => return,
+            (Some(AiVerdict::Running(id)), Some(p)) if *id == p => return,
+            (Some(AiVerdict::Due), Some(_)) => return,
+            _ => {}
+        }
+        if let Some(heal) = self.ctx.ai_host.as_mut().and_then(|h| h.heal.as_mut()) {
+            heal.verdict = None;
+        }
+        if self.ctx.ai_state.is_none() {
+            self.ai_heal_gave_up("no AI host state was saved yet");
+            return;
+        }
+        tracing::info!("sidecar: match not over, restoring the AI players");
+        self.ctx
+            .server_chat(None, "The match goes on. Restoring the AI players.");
+        self.spawn_ai_host();
     }
 
     // Paced like a client state pull, since it freezes the match the same
@@ -4168,7 +4237,8 @@ impl Server<InGame> {
         let turn = self.ctx.turns.ready_turn();
         let base = chain.states.last().cloned();
         let last = base.as_ref().map_or(0, |b| b.turn);
-        let due = if chain.prefetch {
+        let verdict_due = matches!(self.ai_verdict(), Some(AiVerdict::Due));
+        let due = if chain.prefetch || verdict_due {
             turn > last
         } else {
             turn >= last.saturating_add(interval)
@@ -4194,6 +4264,9 @@ impl Server<InGame> {
             turn,
             from_scratch,
         });
+        if verdict_due && let Some(heal) = self.ctx.ai_host.as_mut().and_then(|h| h.heal.as_mut()) {
+            heal.verdict = Some(AiVerdict::Running(id));
+        }
         tracing::debug!(from = last, turn, "sidecar: requesting checkpoint");
         self.ctx
             .effects
@@ -4825,6 +4898,7 @@ impl Server<Resuming> {
             heal: Some(Healing {
                 attempt: 1,
                 since: None,
+                verdict: None,
             }),
         });
         self.spawn_ai_host();
