@@ -762,10 +762,11 @@ fn handle_muc_message(
     if msg.payloads.iter().any(|p| p.is("delay", "urn:xmpp:delay")) {
         return;
     }
+    // The stock client tags its body with xml:lang, so it is not stored
+    // under the empty language.
     let body = msg
-        .bodies
-        .get("")
-        .map(|b| b.trim())
+        .get_best_body(Vec::new())
+        .map(|(_, b)| b.trim())
         .unwrap_or_default()
         .to_string();
     if body != "hostme" {
