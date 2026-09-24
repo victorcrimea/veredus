@@ -15,6 +15,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::lobby::link::LobbyMap;
 use crate::relay::messages::PlayerCommand;
 
 // Where a match stands as far as a later process is concerned. `Running`
@@ -66,6 +67,7 @@ pub enum SaveItem {
         settings: Vec<u8>,
         ai_settings: Option<Vec<u8>>,
         ai_players: Vec<i32>,
+        lobby_map: Option<LobbyMap>,
     },
     Resumed {
         now: DateTime<Utc>,

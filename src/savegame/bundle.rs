@@ -14,6 +14,7 @@ use sysinfo::ProcessRefreshKind;
 use sysinfo::ProcessesToUpdate;
 use sysinfo::System;
 
+use crate::lobby::link::LobbyMap;
 use crate::relay::messages::EnabledMod;
 use crate::savegame::SavedIdentity;
 use crate::savegame::Status;
@@ -74,6 +75,9 @@ pub struct Manifest {
     pub turn_length_ms: u16,
     // The player ids the AI host plays; empty without hosted AI.
     pub ai_players: Vec<i32>,
+    // Defaulted so a bundle written before it was kept still loads.
+    #[serde(default)]
+    pub lobby_map: Option<LobbyMap>,
 }
 
 // The stored state and the turn it is at. The checksum ties the two files

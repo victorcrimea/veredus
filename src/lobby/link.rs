@@ -4,6 +4,9 @@
 // The FSM and the game thread must reach the lobby without depending on
 // tokio-xmpp, so this half of the channel pair carries only plain data.
 
+use serde::Deserialize;
+use serde::Serialize;
+
 use crate::relay::messages::EnabledMod;
 use crate::relay::script_value::ScriptValue;
 
@@ -18,7 +21,7 @@ pub struct LobbyAuthToken {
 // The map fields of Sec. 17.3's register attributes, derived from the
 // controller's GAME_SETTINGS (Sec. 5) once one has arrived. None until then:
 // a hostme game is listed before any settings exist.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LobbyMap {
     pub map_name: String,
     pub nice_map_name: String,

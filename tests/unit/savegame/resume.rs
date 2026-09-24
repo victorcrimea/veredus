@@ -82,6 +82,7 @@ fn stopped_match(setup: &SaveSetup, ai_players: Vec<i32>) -> PathBuf {
                 settings: b"{\"settings\":{}}".to_vec(),
                 ai_settings: None,
                 ai_players,
+                lobby_map: None,
             },
             SaveItem::Slots(slots),
             SaveItem::Turn {

@@ -100,10 +100,12 @@ fn clone_effect(effect: &Effect) -> Effect {
             settings,
             ai_settings,
             ai_players,
+            lobby_map,
         } => Effect::SaveStarted {
             settings: settings.clone(),
             ai_settings: ai_settings.clone(),
             ai_players: ai_players.clone(),
+            lobby_map: lobby_map.clone(),
         },
         Effect::SaveTurn {
             turn,

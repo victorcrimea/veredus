@@ -10,6 +10,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use chrono::DateTime;
 use chrono::Utc;
 
+use crate::lobby::link::LobbyMap;
 use crate::savegame::SaveItem;
 use crate::savegame::SaveSetup;
 use crate::savegame::SlotsSnapshot;
@@ -130,7 +131,14 @@ impl Writer {
                 settings,
                 ai_settings,
                 ai_players,
-            } => self.start(now, &settings, ai_settings.as_deref(), ai_players),
+                lobby_map,
+            } => self.start(
+                now,
+                &settings,
+                ai_settings.as_deref(),
+                ai_players,
+                lobby_map,
+            ),
             SaveItem::Resumed { now, turn } => {
                 self.last_turn = turn;
                 self.append(&Record::Resumed {
@@ -165,6 +173,7 @@ impl Writer {
         settings: &[u8],
         ai_settings: Option<&[u8]>,
         ai_players: Vec<i32>,
+        lobby_map: Option<LobbyMap>,
     ) {
         if self.manifest.is_some() {
             return;
@@ -210,6 +219,7 @@ impl Writer {
             resume_attempts: 0,
             turn_length_ms: self.meta.turn_length_ms,
             ai_players,
+            lobby_map,
         });
         self.write_manifest();
         tracing::info!(dir = %self.dir.display(), "save: match bundle started");

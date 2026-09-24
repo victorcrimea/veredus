@@ -659,6 +659,7 @@ fn drain(
                 settings,
                 ai_settings,
                 ai_players,
+                lobby_map,
             } => {
                 forward_save(
                     save,
@@ -667,6 +668,7 @@ fn drain(
                         settings,
                         ai_settings,
                         ai_players,
+                        lobby_map,
                     },
                 );
                 continue;

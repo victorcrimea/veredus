@@ -82,6 +82,7 @@ fn match_start_saves_settings_and_slots() {
             settings: SETTINGS.to_vec(),
             ai_settings: None,
             ai_players: Vec::new(),
+            lobby_map: None,
         }]
     );
     let slots = h

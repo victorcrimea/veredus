@@ -257,6 +257,9 @@ pub enum Effect {
         settings: Vec<u8>,
         ai_settings: Option<Vec<u8>>,
         ai_players: Vec<i32>,
+        // A resumed lobby match is listed again before any GAME_SETTINGS
+        // could tell the lobby its map.
+        lobby_map: Option<LobbyMap>,
     },
     // A turn was released, and with it every command it will ever carry.
     SaveTurn {
@@ -3704,6 +3707,7 @@ impl Server<Loading> {
                 settings: settings.json.clone(),
                 ai_settings: settings.ai_json.clone(),
                 ai_players: settings.ai_players.clone(),
+                lobby_map: self.ctx.lobby_map.clone(),
             });
             self.ctx.saved_slots = Some(SlotsSnapshot::default());
             self.ctx.save_slots();

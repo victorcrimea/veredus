@@ -36,6 +36,7 @@ fn manifest_roundtrips() {
         resume_attempts: 2,
         turn_length_ms: 200,
         ai_players: vec![2],
+        lobby_map: None,
     };
     let path = dir.join(MANIFEST);
     write_json(&path, &manifest).unwrap();
