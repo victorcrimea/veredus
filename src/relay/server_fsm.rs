@@ -708,7 +708,9 @@ struct PendingDump {
 // The rolling checkpoint chain: the states already built, ascending by turn,
 // and the one run that extends it, if any. Only the newest state at or before
 // the delayed feed and the ones after it are kept, since nothing ever asks
-// for an older one.
+// for an older one. Without a sidecar the states pulled from clients for the
+// save land here too, so a joiner is served one instead of stalling a player
+// to serialize again.
 #[derive(Default)]
 struct CheckpointChain {
     states: Vec<BaseState>,
@@ -749,6 +751,22 @@ const CHECKPOINT_FAILURE_LIMIT: u8 = 2;
 impl CheckpointChain {
     fn at_or_before(&self, turn: u32) -> Option<&BaseState> {
         self.states.iter().rev().find(|b| b.turn <= turn)
+    }
+
+    // A pulled client state can be older than the last one when its source
+    // lags, and at_or_before relies on the order, so such a state is dropped.
+    fn store(&mut self, base: BaseState, feed_head: u32) {
+        if self
+            .states
+            .last()
+            .is_some_and(|last| last.turn >= base.turn)
+        {
+            return;
+        }
+        self.states.push(base);
+        if let Some(keep_from) = self.states.iter().rposition(|b| b.turn <= feed_head) {
+            self.states.drain(..keep_from);
+        }
     }
 
     // The earliest hint wins, so a later one cannot push back a check that
@@ -2627,11 +2645,7 @@ impl<S: PhaseMarker> Server<S> {
             u32::MAX
         };
         if let Some(base) = self.ctx.checkpoints.at_or_before(newest_usable).cloned() {
-            tracing::info!(
-                ?joiner,
-                turn = base.turn,
-                "join served from a sidecar checkpoint"
-            );
+            tracing::info!(?joiner, turn = base.turn, "join served from a stored state");
             self.ctx.counters.join_from_checkpoint += 1;
             self.deliver_snapshot(joiner, base.state, base.turn..=base.turn);
             return;
@@ -4170,15 +4184,15 @@ impl Server<InGame> {
             return false;
         };
         chain.failures = 0;
-        chain.states.push(BaseState {
-            turn: pending.turn,
-            state: Arc::new(bytes),
-        });
         let head = self.ctx.feed.head();
         let chain = &mut self.ctx.checkpoints;
-        if let Some(keep_from) = chain.states.iter().rposition(|b| b.turn <= head) {
-            chain.states.drain(..keep_from);
-        }
+        chain.store(
+            BaseState {
+                turn: pending.turn,
+                state: Arc::new(bytes),
+            },
+            head,
+        );
         tracing::info!(
             turn = pending.turn,
             kept = chain.states.len(),
@@ -4232,6 +4246,14 @@ impl<S: MatchPhase> Server<S> {
                         turn,
                         state: state.clone(),
                     });
+                    let head = self.ctx.feed.head();
+                    self.ctx.checkpoints.store(
+                        BaseState {
+                            turn,
+                            state: state.clone(),
+                        },
+                        head,
+                    );
                 }
                 None => tracing::warn!(
                     ?peer,

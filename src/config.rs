@@ -382,7 +382,9 @@ pub struct SavesSection {
     /// pyrogenesis_path, which replays the match to work the outcome out.
     pub outcome_dir: PathBuf,
     /// Without a sidecar, how often one playing client is asked for the
-    /// match state so the match can be resumed; 0 turns it off.
+    /// match state, which pauses the game for a moment. The copy lets the
+    /// match be resumed and is served to rejoining players and observers,
+    /// so they do not stall a player each time; 0 turns it off.
     pub client_state_interval_secs: u64,
 }
 
@@ -393,7 +395,7 @@ impl Default for SavesSection {
             resume: true,
             keep_finished: false,
             outcome_dir: PathBuf::from_str("./outcome").unwrap(),
-            client_state_interval_secs: 0,
+            client_state_interval_secs: 120,
         }
     }
 }

@@ -126,10 +126,11 @@ time it starts:
    five minutes, any returning player can.
 
 This works best with the sidecar, and matches with AI opponents need it.
-Without the sidecar, set `[saves] client_state_interval_secs` (for example
-300). Every so often the server then asks one player's game for a copy of
-the match, which pauses the game for a moment. To start fresh instead, run
-with `--no-resume`.
+Without the sidecar, every 2 minutes the server asks one player's game for a
+copy of the match, which pauses the game for a moment. The same copy is
+given to players and observers who rejoin, so they do not stop the game
+each time. Change how often with `[saves] client_state_interval_secs`, or
+set it to 0 to turn it off. To start fresh instead, run with `--no-resume`.
 
 ## Hosting in the multiplayer lobby
 
