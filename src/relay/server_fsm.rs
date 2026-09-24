@@ -2296,11 +2296,30 @@ impl<S: PhaseMarker> Server<S> {
         }
 
         if self.ctx.config.lobby_mode && !is_ai_host {
-            let expected = lobby_name.unwrap_or_default().to_lowercase();
+            let expected = lobby_name.as_deref().unwrap_or_default().to_lowercase();
             if auth::suffix_stripped(&sanitized).to_lowercase() != expected {
                 self.disconnect(peer, DisconnectReason::LobbyAuthFailed);
                 return Ok(());
             }
+        }
+
+        // The lobby listing is public before the hostme sender has joined, so
+        // anyone with the password could otherwise sit in Setup waiting for a
+        // settings relay that never comes. Hold them off until the host is in,
+        // since only the host can make the game playable.
+        let is_host = lobby_name
+            .as_deref()
+            .is_some_and(|n| n.to_lowercase() == self.ctx.config.lobby_host_name.to_lowercase());
+        if S::PHASE == Phase::Setup
+            && self.ctx.config.lobby_mode
+            && !self.ctx.config.lobby_host_name.is_empty()
+            && self.ctx.controller.is_none()
+            && !is_ai_host
+            && !is_host
+        {
+            tracing::debug!(?peer, "refusing join: host has not joined yet");
+            self.disconnect(peer, DisconnectReason::ServerLoading);
+            return Ok(());
         }
 
         // Salted with the raw name, unlike every other name-based check, and
