@@ -149,6 +149,25 @@ impl Harness {
         }
     }
 
+    // For a server built some other way than listening, such as a resumed
+    // match. Whatever it pushed while being built is logged as the first
+    // effects.
+    pub fn with_server(server: AnyServer) -> (Self, Vec<Effect>) {
+        let mut h = Harness {
+            server: Some(server),
+            now: DateTime::UNIX_EPOCH,
+            log: Vec::new(),
+            syns: HashMap::new(),
+        };
+        let effects = h
+            .server
+            .as_mut()
+            .expect("harness server missing")
+            .take_effects();
+        h.log.extend(effects.iter().map(clone_effect));
+        (h, effects)
+    }
+
     pub fn server(&self) -> &AnyServer {
         self.server.as_ref().expect("harness server missing")
     }

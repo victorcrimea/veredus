@@ -14,6 +14,7 @@ use veredus::cli;
 use veredus::cli::Command;
 use veredus::config::FileConfig;
 use veredus::config::LogSection;
+use veredus::config::ServerSection;
 use veredus::game_pool::GameConfig;
 use veredus::game_pool::GameId;
 use veredus::game_pool::GamePool;
@@ -24,6 +25,10 @@ use veredus::lobby::link::LobbyLink;
 use veredus::relay::password;
 use veredus::relay::server_fsm::Config;
 use veredus::savegame::SaveSetup;
+use veredus::savegame::bundle::Mode;
+use veredus::savegame::resume;
+use veredus::savegame::resume::Expect;
+use veredus::savegame::resume::Resumable;
 
 // Default directive when neither the environment nor the config file sets one.
 // Rocket logs every request and its launch banner at info through `log`,
@@ -110,14 +115,14 @@ async fn main() {
             Ok(())
         }
         None => {
+            let resumable = pick_resumable(&config.server, save.as_ref(), &base).await;
             run_standalone(
                 &mut pool,
-                config.server.port,
+                &config.server,
                 base,
                 pyrogenesis_path,
                 outcome_dir,
-                save,
-                config.server.exit_after_game,
+                resumable,
             )
             .await
         }
@@ -293,23 +298,44 @@ fn serve_metrics(host: std::net::IpAddr, port: u16) {
     tracing::info!(%host, port, "metrics endpoint listening on /metrics");
 }
 
+// The saved match a standalone server resumes on its port, if resuming is on
+// and one can be. Reading and locking bundles is blocking file IO.
+async fn pick_resumable(
+    server: &ServerSection,
+    save: Option<&SaveSetup>,
+    server_config: &Config,
+) -> Option<Resumable> {
+    let setup = save.filter(|_| server.resume)?;
+    let expect = Expect::new(Mode::Standalone, server_config, server.max_resume_attempts);
+    let root = setup.root.clone();
+    tokio::task::spawn_blocking(move || resume::pick(&root, &expect))
+        .await
+        .unwrap_or_default()
+}
+
 // Hosts one game after another on the same port, or only one when
-// `exit_after_game` hands restarting over to a supervisor.
+// `exit_after_game` hands restarting over to a supervisor. `resumable`, when
+// set, is the first game.
 async fn run_standalone(
     pool: &mut GamePool,
-    port: u16,
+    server: &ServerSection,
     server_config: Config,
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
-    save: Option<SaveSetup>,
-    exit_after_game: bool,
+    mut resumable: Option<Resumable>,
 ) -> Result<(), String> {
+    let port = server.port;
+    let exit_after_game = server.exit_after_game;
+    let save = server.save_setup("");
     // One future for the whole run, so a signal that arrives between two
     // games is not missed.
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
     loop {
+        if let Some(saved) = &resumable {
+            tracing::info!(game_id = %saved.game_id, turn = saved.data.last_turn(), "resuming a saved match");
+        }
         let (game_id, port) = pool.create_game(GameConfig {
             port: Some(port),
             server: server_config.clone(),
@@ -317,6 +343,7 @@ async fn run_standalone(
             pyrogenesis_path: pyrogenesis_path.clone(),
             outcome_dir: outcome_dir.clone(),
             save: save.clone(),
+            resume: resumable.take(),
         })?;
         tracing::info!(game_id = %game_id, port, "game running");
 
@@ -463,6 +490,7 @@ async fn run_pool_lobby_mode(
                         lobby_account: account_nodes.get(account).cloned().unwrap_or_default(),
                         ..setup
                     }),
+                    resume: None,
                 }) {
                     Ok((game_id, port)) => {
                         tracing::info!(

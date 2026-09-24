@@ -21,12 +21,16 @@ use crate::relay::enet_task::EnetLimits;
 use crate::relay::enet_task::run_enet_host;
 use crate::relay::game_server::SidecarSetup;
 use crate::relay::game_server::run_game_server;
+use crate::relay::server_fsm::AnyServer;
 use crate::relay::server_fsm::Config;
+use crate::relay::server_fsm::Idle;
 use crate::relay::server_fsm::SIMULATION_VERSION;
+use crate::relay::server_fsm::Server;
 use crate::savegame::SaveItem;
 use crate::savegame::SaveSetup;
 use crate::savegame::bundle::ModRecord;
 use crate::savegame::bundle::Mode;
+use crate::savegame::resume::Resumable;
 use crate::savegame::writer;
 use crate::savegame::writer::BundleMeta;
 
@@ -36,6 +40,14 @@ const PORT_RANGE: (u16, u16) = (20595, 20695);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GameId(Uuid);
+
+impl GameId {
+    // The inverse of Display, for a game id read back from a save bundle.
+    pub fn parse(text: &str) -> Option<GameId> {
+        let uuid = text.strip_prefix("gid_")?;
+        Uuid::parse_str(uuid).ok().map(GameId)
+    }
+}
 
 impl std::fmt::Display for GameId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -57,6 +69,9 @@ pub struct GameConfig {
     pub outcome_dir: Option<PathBuf>,
     // Where the match is saved as it runs. None turns saving off.
     pub save: Option<SaveSetup>,
+    // A saved match to resume instead of hosting a fresh one. It keeps its
+    // game id and carries on in its own bundle; it needs `save` for that.
+    pub resume: Option<Resumable>,
 }
 
 struct GameHandle {
@@ -127,8 +142,22 @@ impl GamePool {
             pyrogenesis_path,
             outcome_dir,
             save,
+            resume,
         } = config;
         server_config.saving = save.is_some();
+        let resume_game_id = match &resume {
+            Some(resumable) => Some(
+                GameId::parse(&resumable.game_id)
+                    .ok_or_else(|| format!("saved game id '{}' is invalid", resumable.game_id))?,
+            ),
+            None => None,
+        };
+        if resume_game_id
+            .as_ref()
+            .is_some_and(|id| self.games.contains_key(id))
+        {
+            return Err("the saved match is already running".to_string());
+        }
         // Bound here rather than in the ENet thread: a bind failure has to reach
         // the caller as an error, not a panic in a thread nobody joins until
         // shutdown.
@@ -150,7 +179,13 @@ impl GamePool {
         let ai_host_connect = (self.bind_ip.is_unspecified() || self.bind_ip.is_loopback())
             .then(|| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
 
-        let game_id = GameId(Uuid::now_v7());
+        // A resumed match keeps its id, so its outcome file, metrics and
+        // logs carry on under the same name.
+        let game_id = resume_game_id.unwrap_or_else(|| GameId(Uuid::now_v7()));
+        let (resume_data, existing) = match resume {
+            Some(resumable) => (Some(resumable.data), Some(resumable.existing)),
+            None => (None, None),
+        };
         let outcome_path = outcome_dir.map(|dir| dir.join(format!("{game_id}.json")));
 
         let (event_tx, event_rx) = mpsc::channel::<InboundNetworkMessage>();
@@ -181,21 +216,14 @@ impl GamePool {
                     lobby_account: setup.lobby_account.clone(),
                     lobby_host_name: server_config.lobby_host_name.clone(),
                     engine_version: SIMULATION_VERSION.to_string(),
-                    mods: server_config
-                        .enabled_mods
-                        .iter()
-                        .map(|m| ModRecord {
-                            name: m.name.clone(),
-                            version: m.version.clone(),
-                        })
-                        .collect(),
+                    mods: ModRecord::list(&server_config.enabled_mods),
                     turn_length_ms: server_config.turn_length_ms,
                 };
                 let save_game_id = game_id.to_string();
                 let thread = std::thread::spawn(move || {
                     let span = tracing::info_span!("game", game_id = %save_game_id, port);
                     let _guard = span.entered();
-                    writer::run(setup, meta, save_game_id.clone(), None, rx);
+                    writer::run(setup, meta, save_game_id.clone(), existing, rx);
                 });
                 (Some(tx), Some(thread))
             }
@@ -212,11 +240,18 @@ impl GamePool {
             // counted and its series are still removed when the thread ends.
             let mut metrics = GameMetrics::new(&server_game_id, port);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let idle = Server::<Idle>::new(server_config);
+                // A fresh game is parked in the listening state, which is
+                // the phase a relay spends its whole idle life in.
+                let initial = match resume_data {
+                    Some(data) => AnyServer::from(idle.resume(data)),
+                    None => AnyServer::from(idle.listen()),
+                };
                 run_game_server(
                     event_rx,
                     send_tx,
                     shutdown_requested_for_thread,
-                    server_config,
+                    initial,
                     lobby,
                     SidecarSetup {
                         pyrogenesis_path,

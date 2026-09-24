@@ -91,6 +91,9 @@ the game engine running next to it, which we call the sidecar:
 - **Rejoining** even when no other player's game can send the joiner a copy
   of the match.
 - **Match results** worked out on the server and written to a file.
+- **Matches that survive a restart.** When you stop the server during a
+  match, or it crashes, the match continues when you start it again. See
+  [Restarts](#restarts).
 
 The sidecar is 0 A.D. 0.28.0 with a small set of patches, kept in this
 repository. There is no ready-made sidecar download yet, so you
@@ -102,6 +105,21 @@ point the server at it:
 ```
 
 To keep each match's result as a JSON file, add `--outcome-dir results`.
+
+## Restarts
+
+The server saves every running match as it goes, into a `saves` folder next
+to where you start it (`--save-dir` picks another folder). If you stop the
+server during a match, or it crashes, it picks the match up again the next
+time it starts, on the same port:
+
+1. Players reconnect the way they joined, by address and port.
+2. Each player gets their own slot back. Anyone else can only watch.
+3. The match stays paused until the host types `!resume` in chat. After
+   five minutes, any returning player can.
+
+This needs the sidecar, and for now it works only outside the lobby and
+without AI opponents. To start fresh instead, run with `--no-resume`.
 
 ## Hosting in the multiplayer lobby
 

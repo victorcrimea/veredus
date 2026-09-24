@@ -53,6 +53,14 @@ impl ObserverFeed {
         }
     }
 
+    // For a match rebuilt from its save, whose feed was already this far.
+    pub fn resumed(delay: u32, head: u32) -> Self {
+        ObserverFeed {
+            head: head.max(INITIAL_READY_TURN),
+            ..ObserverFeed::new(delay)
+        }
+    }
+
     pub fn head(&self) -> u32 {
         self.head
     }

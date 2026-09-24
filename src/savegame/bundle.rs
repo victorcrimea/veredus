@@ -14,6 +14,7 @@ use sysinfo::ProcessRefreshKind;
 use sysinfo::ProcessesToUpdate;
 use sysinfo::System;
 
+use crate::relay::messages::EnabledMod;
 use crate::savegame::SavedIdentity;
 use crate::savegame::Status;
 
@@ -41,6 +42,17 @@ pub enum Mode {
 pub struct ModRecord {
     pub name: String,
     pub version: String,
+}
+
+impl ModRecord {
+    pub fn list(mods: &[EnabledMod]) -> Vec<ModRecord> {
+        mods.iter()
+            .map(|m| ModRecord {
+                name: m.name.clone(),
+                version: m.version.clone(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

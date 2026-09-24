@@ -197,7 +197,7 @@ impl Gate {
                     };
                 }
 
-                if !matches!(phase, Phase::InGame | Phase::PostGame) {
+                if !matches!(phase, Phase::InGame | Phase::PostGame | Phase::Resuming) {
                     return Decision::Pass;
                 }
                 let addr_ok = self.join_by_addr.has_token(&session.addr, now);

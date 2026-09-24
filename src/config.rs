@@ -48,6 +48,8 @@ const DEFAULT_SAVE_DIR: &str = "saves";
 // A crash loses at most this much of a match, and the disk sees one fsync
 // per game this often.
 const DEFAULT_SAVE_FLUSH_MS: u64 = 1000;
+// A match that crashes the server on every resume must not crash it forever.
+const DEFAULT_MAX_RESUME_ATTEMPTS: u32 = 3;
 
 // One engine per core: a replay is CPU-bound, so running more at once than
 // there are cores only makes each one finish later. Read from the machine, which means a
@@ -100,9 +102,12 @@ pub struct ServerSection {
     // Where every running match keeps its save bundle; empty turns saving
     // off.
     pub save_dir: PathBuf,
+    // Resume the saved matches found in save_dir at startup.
+    pub resume: bool,
     pub save_flush_ms: u64,
     // Keep a decided match's bundle instead of deleting it.
     pub keep_finished_saves: bool,
+    pub max_resume_attempts: u32,
 }
 
 impl Default for ServerSection {
@@ -120,8 +125,10 @@ impl Default for ServerSection {
             enet_max_waiting_bytes: DEFAULT_ENET_MAX_WAITING_BYTES,
             max_sidecar_runs: default_max_sidecar_runs(),
             save_dir: PathBuf::from(DEFAULT_SAVE_DIR),
+            resume: true,
             save_flush_ms: DEFAULT_SAVE_FLUSH_MS,
             keep_finished_saves: false,
+            max_resume_attempts: DEFAULT_MAX_RESUME_ATTEMPTS,
         }
     }
 }
@@ -230,6 +237,8 @@ pub struct GameSection {
     pub auth_fail_burst: u32,
     pub auth_fail_burst_per_addr: u32,
     pub auth_fail_interval_secs: u64,
+    pub resume_wait_secs: u64,
+    pub resume_controller_grace_secs: u64,
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
     pub enabled_mods: Vec<ModEntry>,
@@ -284,6 +293,11 @@ impl Default for GameSection {
             auth_fail_interval_secs: config
                 .auth_fail_interval
                 .map_or(0, |d| d.num_seconds().max(0) as u64),
+            resume_wait_secs: config
+                .resume_wait
+                .map_or(0, |d| d.num_seconds().max(0) as u64),
+            resume_controller_grace_secs: config.resume_controller_grace.num_seconds().max(0)
+                as u64,
             buddies,
             enabled_mods: config
                 .enabled_mods
@@ -348,6 +362,8 @@ impl GameSection {
             auth_fail_burst_per_addr: self.auth_fail_burst_per_addr,
             auth_fail_interval: (self.auth_fail_interval_secs != 0)
                 .then(|| secs_to_delta(self.auth_fail_interval_secs)),
+            resume_wait: (self.resume_wait_secs != 0).then(|| secs_to_delta(self.resume_wait_secs)),
+            resume_controller_grace: secs_to_delta(self.resume_controller_grace_secs),
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
             checkpoint_interval_turns,

@@ -103,6 +103,20 @@ impl Default for TurnManager {
 }
 
 impl TurnManager {
+    // A match rebuilt from its save: released through `ready_turn`, with the
+    // hashes the players had agreed on. Nobody is registered yet; every
+    // client comes back as a joiner.
+    pub fn resumed(ready_turn: u32, references: impl IntoIterator<Item = (u32, Vec<u8>)>) -> Self {
+        let references: HashMap<u32, Vec<u8>> = references.into_iter().collect();
+        let last_compared = references.keys().max().copied().unwrap_or(0);
+        TurnManager {
+            ready_turn,
+            references,
+            last_compared,
+            ..TurnManager::default()
+        }
+    }
+
     pub fn ready_turn(&self) -> u32 {
         self.ready_turn
     }

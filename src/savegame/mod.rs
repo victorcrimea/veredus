@@ -3,6 +3,7 @@
 
 pub mod bundle;
 pub mod journal;
+pub mod resume;
 pub mod writer;
 
 use std::path::PathBuf;

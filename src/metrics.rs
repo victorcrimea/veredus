@@ -111,7 +111,7 @@ pub static GAME_TURNS: LazyLock<Histogram> = LazyLock::new(|| {
 pub static GAME_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "game_state",
-        "Current phase (0=Setup, 1=Loading, 2=InGame, 3=PostGame)",
+        "Current phase (0=Setup, 1=Loading, 2=InGame, 3=PostGame, 4=Resuming)",
         GAME_LABELS
     )
     .unwrap()
@@ -619,7 +619,10 @@ impl GameMetrics {
         self.turn.set(i64::from(snapshot.ready_turn));
         self.feed_lag.set(i64::from(snapshot.feed_lag.unwrap_or(0)));
         self.last_turn = snapshot.ready_turn;
-        if matches!(snapshot.phase, Phase::InGame | Phase::PostGame) {
+        if matches!(
+            snapshot.phase,
+            Phase::InGame | Phase::PostGame | Phase::Resuming
+        ) {
             self.match_started.get_or_insert(now);
         }
 
@@ -731,6 +734,7 @@ fn phase_value(phase: Phase) -> i64 {
         Phase::Loading => 1,
         Phase::InGame => 2,
         Phase::PostGame => 3,
+        Phase::Resuming => 4,
     }
 }
 

@@ -28,6 +28,23 @@ pub struct Slots {
 }
 
 impl Slots {
+    // The table of a saved match: every entry has left, so each can only be
+    // taken back by a returning client, by UUID or by name.
+    pub fn restore(entries: impl IntoIterator<Item = (Guid, String, i8)>) -> Self {
+        Slots {
+            entries: entries
+                .into_iter()
+                .map(|(uuid, name, slot)| PlayerSlot {
+                    uuid,
+                    name,
+                    slot,
+                    status: STATUS_NOT_READY,
+                    connected: false,
+                })
+                .collect(),
+        }
+    }
+
     // `recover` is set once the match has started: only then may an arriving
     // client take over a slot left behind by a departed one. The UUID of the
     // entry that was displaced is returned, so a caller that keys per-match

@@ -84,6 +84,7 @@ use crate::savegame::SavedIdentity;
 use crate::savegame::SavedPlayer;
 use crate::savegame::SlotsSnapshot;
 use crate::savegame::Status;
+use crate::savegame::resume::ResumeData;
 use crate::sidecar::BaseState;
 use crate::sidecar::DumpRequest;
 
@@ -117,6 +118,13 @@ const UUID_ATTEMPTS: usize = 8;
 // a cold pyrogenesis to boot and connect, short enough that a controller whose
 // start is refused is not left waiting for nothing.
 const AI_HOST_ADMIT_TIMEOUT: TimeDelta = TimeDelta::seconds(30);
+
+// How often a held resumed match repeats who it is waiting for.
+const RESUME_HINT_INTERVAL: TimeDelta = TimeDelta::seconds(30);
+
+// Typed in chat, this restarts a resumed match. A stock client sends a line
+// starting with "!" as ordinary chat, unlike one starting with "/".
+const RESUME_COMMAND: &str = "!resume";
 
 // The per-slot fields that make a stock client register and run an AI.
 const AI_FIELDS: [&str; 3] = ["AI", "AIDiff", "AIBehavior"];
@@ -430,6 +438,12 @@ pub struct Config {
     // can resume it. The IO side owns the files; this flag is what the FSM
     // gates its save effects on.
     pub saving: bool,
+    // How long a resumed match waits with no original player back before it
+    // is given up. None waits forever.
+    pub resume_wait: Option<TimeDelta>,
+    // How long only the saved controller may restart a resumed match; after
+    // that any original player may.
+    pub resume_controller_grace: TimeDelta,
 }
 
 impl Default for Config {
@@ -480,6 +494,8 @@ impl Default for Config {
             auth_fail_burst_per_addr: 10,
             auth_fail_interval: Some(TimeDelta::minutes(5)),
             saving: false,
+            resume_wait: Some(TimeDelta::minutes(15)),
+            resume_controller_grace: TimeDelta::minutes(5),
         }
     }
 }
@@ -511,6 +527,8 @@ pub enum Phase {
     Loading,
     InGame,
     PostGame,
+    // A match rebuilt from its save, held until it is restarted.
+    Resuming,
 }
 
 // Running totals of events only the FSM can see. Kept as plain numbers so
@@ -640,6 +658,9 @@ struct CheckpointChain {
     // passed this turn, rather than at the next interval, so the end is
     // noticed while the players are still there to be told.
     probe: Option<u32>,
+    // Joiners of a resumed match waiting for the state the pending run is
+    // rebuilding, which is the one every returning client is served.
+    waiting: Vec<PeerID>,
 }
 
 struct PendingCheckpoint {
@@ -1200,6 +1221,27 @@ pub struct PostGame {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
+// Still in-game on the wire: a saved match rebuilt after a restart. Every
+// client comes back as a joiner and is held paused at the turn the match
+// stopped at; no turn is released until it is restarted with RESUME_COMMAND.
+pub struct Resuming {
+    pub settings: FrozenSettings,
+    // The turn the match stopped at, where every returning client is held.
+    turn: u32,
+    // Who may restart it, as the save recorded them.
+    controller: Option<SavedIdentity>,
+    // All anchored on the first tick, because the FSM only learns the time
+    // there.
+    entered_at: Option<DateTime<Utc>>,
+    // Since when no original player has been back.
+    empty_since: Option<DateTime<Utc>>,
+    last_hint: Option<DateTime<Utc>>,
+    // The original players already told they are back, by name.
+    announced: HashSet<String>,
+    // Set once GameOver is pushed, so a second reason cannot push it again.
+    abandoned: bool,
+}
+
 // Setup handlers stay available while a savegame is being fetched.
 pub trait SetupPhase {}
 impl SetupPhase for Setup {}
@@ -1213,6 +1255,10 @@ pub trait PhaseMarker {
     // The frozen settings, once a match has been configured. Setup-like
     // phases have none, so snapshot dumps stay unreachable there.
     fn settings(&self) -> Option<&FrozenSettings> {
+        None
+    }
+    // Who the controller role goes back to, in a match rebuilt from its save.
+    fn saved_controller(&self) -> Option<&SavedIdentity> {
         None
     }
 }
@@ -1243,6 +1289,15 @@ impl PhaseMarker for PostGame {
         Some(&self.settings)
     }
 }
+impl PhaseMarker for Resuming {
+    const PHASE: Phase = Phase::Resuming;
+    fn settings(&self) -> Option<&FrozenSettings> {
+        Some(&self.settings)
+    }
+    fn saved_controller(&self) -> Option<&SavedIdentity> {
+        self.controller.as_ref()
+    }
+}
 
 // The phases in which turns are being released, which share every handler
 // of the running match.
@@ -1259,6 +1314,11 @@ impl MatchPhase for PostGame {
         &self.settings
     }
 }
+impl MatchPhase for Resuming {
+    fn frozen(&self) -> &FrozenSettings {
+        &self.settings
+    }
+}
 
 pub enum AnyServer {
     Idle(Server<Idle>),
@@ -1268,6 +1328,7 @@ pub enum AnyServer {
     Loading(Server<Loading>),
     InGame(Server<InGame>),
     PostGame(Server<PostGame>),
+    Resuming(Server<Resuming>),
 }
 
 impl From<Server<Idle>> for AnyServer {
@@ -1312,6 +1373,12 @@ impl From<Server<PostGame>> for AnyServer {
     }
 }
 
+impl From<Server<Resuming>> for AnyServer {
+    fn from(s: Server<Resuming>) -> Self {
+        AnyServer::Resuming(s)
+    }
+}
+
 impl AnyServer {
     // Read once the game thread is done with the FSM, however it got there:
     // the thread also ends when its socket closes, which no input announces.
@@ -1339,6 +1406,7 @@ impl AnyServer {
             AnyServer::Loading(_) => Loading::PHASE,
             AnyServer::InGame(_) => InGame::PHASE,
             AnyServer::PostGame(_) => PostGame::PHASE,
+            AnyServer::Resuming(_) => Resuming::PHASE,
         };
         let ctx = self.ctx();
         let ready_turn = ctx.turns.ready_turn();
@@ -1368,6 +1436,7 @@ impl AnyServer {
             AnyServer::Loading(s) => &s.ctx,
             AnyServer::InGame(s) => &s.ctx,
             AnyServer::PostGame(s) => &s.ctx,
+            AnyServer::Resuming(s) => &s.ctx,
         }
     }
 
@@ -1384,6 +1453,7 @@ impl AnyServer {
             AnyServer::Loading(s) => Some(parts(s)),
             AnyServer::InGame(s) => Some(parts(s)),
             AnyServer::PostGame(s) => Some(parts(s)),
+            AnyServer::Resuming(s) => Some(parts(s)),
         }
     }
 
@@ -1405,6 +1475,7 @@ impl AnyServer {
             AnyServer::Loading(s) => s.on_input(input),
             AnyServer::InGame(s) => s.on_input(input),
             AnyServer::PostGame(s) => s.on_input(input),
+            AnyServer::Resuming(s) => s.on_input(input),
         };
         // Effects are only drained by take_effects, outside this call, so
         // everything from the mark on was pushed for this input, whichever
@@ -1425,13 +1496,14 @@ impl AnyServer {
             AnyServer::Loading(s) => s.take_effects(),
             AnyServer::InGame(s) => s.take_effects(),
             AnyServer::PostGame(s) => s.take_effects(),
+            AnyServer::Resuming(s) => s.take_effects(),
         }
     }
 
     // True when a stop keeps the match for a restart instead of ending it:
     // only a running match is worth resuming.
     pub fn saved_on_stop(&self) -> bool {
-        self.ctx().config.saving && matches!(self, AnyServer::InGame(_))
+        self.ctx().config.saving && matches!(self, AnyServer::InGame(_) | AnyServer::Resuming(_))
     }
 
     // The operator's stop, as opposed to the game ending on its own. A
@@ -1443,6 +1515,7 @@ impl AnyServer {
         }
         match self {
             AnyServer::InGame(s) => s.stop_saved(REASON),
+            AnyServer::Resuming(s) => s.stop_saved(REASON),
             other => other.shutdown(REASON),
         }
     }
@@ -1456,6 +1529,7 @@ impl AnyServer {
             AnyServer::Loading(s) => s.shutdown(reason),
             AnyServer::InGame(s) => s.shutdown(reason),
             AnyServer::PostGame(s) => s.shutdown(reason),
+            AnyServer::Resuming(s) => s.shutdown(reason),
         }
     }
 }
@@ -1583,6 +1657,13 @@ impl<S: PhaseMarker> Server<S> {
         }
     }
 
+    // A held resumed match releases nothing, whatever its clients seal.
+    fn release_turns(&mut self, turn_length_ms: u16) {
+        if S::PHASE != Phase::Resuming {
+            self.ctx.release_turns(turn_length_ms);
+        }
+    }
+
     fn on_connected(&mut self, peer: PeerID, addr: Ipv4Addr) {
         // The ban is checked before anything else, so a banned address never
         // gets a session or a handshake.
@@ -1636,6 +1717,7 @@ impl<S: PhaseMarker> Server<S> {
         let orphaned = self.ctx.transfers.forget(peer);
         self.ctx.turns.forget(peer);
         self.ctx.feed.forget(peer);
+        self.ctx.checkpoints.waiting.retain(|p| *p != peer);
         for joiner in orphaned {
             self.retry_join(joiner, peer);
         }
@@ -1680,7 +1762,7 @@ impl<S: PhaseMarker> Server<S> {
         // A departed client no longer blocks release, and hash comparison no
         // longer waits for it.
         let turn_length = self.ctx.config.turn_length_ms;
-        self.ctx.release_turns(turn_length);
+        self.release_turns(turn_length);
         for mismatch in self.ctx.turns.recheck_pending() {
             self.ctx.report_mismatch(mismatch);
         }
@@ -1725,7 +1807,9 @@ impl<S: PhaseMarker> Server<S> {
             }
         }
 
-        if self.idle_shutdown_due(now) {
+        // A resumed match has a wait of its own, long enough for people to
+        // notice the restart.
+        if S::PHASE != Phase::Resuming && self.idle_shutdown_due(now) {
             // Everyone gave up on it, so it ends here like a decided match
             // and is not kept for a restart.
             if S::PHASE == Phase::InGame && self.ctx.config.saving {
@@ -2191,15 +2275,25 @@ impl<S: PhaseMarker> Server<S> {
         // In lobby mode the listing is public before the hostme sender has
         // joined, so first-joiner would hand their game to whoever is fastest.
         // The lobby name is verified by the lobby, unlike a typed one.
-        let is_host = !self.ctx.config.lobby_mode
-            || self
-                .ctx
-                .sessions
-                .get(&peer)
-                .and_then(|s| s.lobby_name.as_deref())
-                .is_some_and(|n| {
-                    n.to_lowercase() == self.ctx.config.lobby_host_name.to_lowercase()
-                });
+        let lobby_name = self
+            .ctx
+            .sessions
+            .get(&peer)
+            .and_then(|s| s.lobby_name.as_deref());
+        // A resumed match hands the role back to whoever held it, not to
+        // whoever is first back.
+        let is_host = match self.st.saved_controller() {
+            Some(saved) if self.ctx.config.lobby_mode => {
+                lobby_name.is_some_and(|n| n.to_lowercase() == saved.lobby_name.to_lowercase())
+            }
+            Some(saved) => name == saved.name,
+            None => {
+                !self.ctx.config.lobby_mode
+                    || lobby_name.is_some_and(|n| {
+                        n.to_lowercase() == self.ctx.config.lobby_host_name.to_lowercase()
+                    })
+            }
+        };
         // The controller flag only ever reaches a client here; there is no
         // message that promotes an already-connected one.
         let is_controller = self.ctx.controller.is_none()
@@ -2239,10 +2333,11 @@ impl<S: PhaseMarker> Server<S> {
         // A slot is only reclaimed once the match itself is running. The
         // returning client authenticates under a fresh UUID, so its pause
         // quota has to follow the slot or a reconnect would refill it.
-        let displaced = self
-            .ctx
-            .slots
-            .add(uuid.clone(), name, S::PHASE == Phase::InGame);
+        let displaced = self.ctx.slots.add(
+            uuid.clone(),
+            name,
+            matches!(S::PHASE, Phase::InGame | Phase::Resuming),
+        );
         if let Some(old) = displaced {
             self.ctx.pause_budget.inherit(&old, &uuid);
         }
@@ -2344,6 +2439,13 @@ impl<S: PhaseMarker> Server<S> {
             .ctx
             .uuid_of(joiner)
             .is_some_and(|u| self.ctx.is_delayed_observer(&u));
+        // Every client returning to a resumed match is served the state it
+        // stopped at, so one arriving while that is rebuilt waits for it.
+        if S::PHASE == Phase::Resuming && !joiner_delayed && self.ctx.checkpoints.pending.is_some()
+        {
+            self.ctx.checkpoints.waiting.push(joiner);
+            return;
+        }
         let newest_usable = if joiner_delayed {
             self.ctx.feed.head()
         } else {
@@ -2800,16 +2902,7 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
 
 impl<S: SetupPhase + PhaseMarker> Server<S> {
     fn freeze(&self, json: &[u8]) -> FrozenSettings {
-        let (player_ids, endless) = match_players(json);
-        FrozenSettings {
-            cheats_enabled: cheats_enabled(json),
-            json: json.to_vec(),
-            turn_length_ms: self.ctx.config.turn_length_ms,
-            player_ids,
-            endless,
-            ai_json: None,
-            ai_players: Vec::new(),
-        }
+        frozen_settings(json, self.ctx.config.turn_length_ms)
     }
 
     // Sends the start and registers every setup session for turn release.
@@ -2926,6 +3019,48 @@ impl Server<Idle> {
 
     pub fn listen(self) -> Server<Setup> {
         self.with_state(Setup)
+    }
+
+    // A saved match, rebuilt as it stopped: every turn and agreed hash, the
+    // slot table with everyone gone, and a run that rebuilds the state at
+    // the turn it stopped at, unless the save already holds that state.
+    pub fn resume(self, data: ResumeData) -> Server<Resuming> {
+        let turn = data.last_turn();
+        let settings = frozen_settings(&data.settings, data.turn_length_ms);
+        let slots = data.slots;
+        let mut server = self.with_state(Resuming {
+            settings,
+            turn,
+            controller: slots.controller.clone(),
+            entered_at: None,
+            empty_since: None,
+            last_hint: None,
+            announced: HashSet::new(),
+            abandoned: false,
+        });
+        let ctx = &mut server.ctx;
+        for saved in data.turns {
+            ctx.log.record_turn_length(saved.turn, saved.length);
+            for command in saved.commands {
+                ctx.log.record_command(command);
+            }
+        }
+        ctx.turns = TurnManager::resumed(turn, data.hashes);
+        ctx.slots = Slots::restore(slots.players.iter().map(|p| {
+            let slot = i8::try_from(p.player_id).unwrap_or(UNASSIGNED);
+            (Guid(p.uuid.clone()), p.name.clone(), slot)
+        }));
+        ctx.banned_names = slots.banned_names.iter().cloned().collect();
+        ctx.resigned = slots.resigned.iter().copied().collect();
+        ctx.forfeited = slots.forfeited.iter().cloned().map(Guid).collect();
+        let delay = ctx.config.observer_delay_turns;
+        ctx.feed = ObserverFeed::resumed(delay, turn.saturating_sub(delay));
+        if ctx.config.saving {
+            ctx.saved_slots = Some(slots);
+        }
+        tracing::info!(turn, "resuming a saved match");
+        server.start_restore(data.base);
+        server
     }
 
     fn on_input(self, input: Input) -> AnyServer {
@@ -3638,8 +3773,9 @@ impl<S: MatchPhase> Server<S> {
             );
         }
         // Sent even to the player the match was held for: the next tick
-        // lifts it for everyone at once, this client included.
-        if self.ctx.pause_budget.auto_paused() {
+        // lifts it for everyone at once, this client included. A resumed
+        // match holds everyone the same way until it is restarted.
+        if self.ctx.pause_budget.auto_paused() || S::PHASE == Phase::Resuming {
             let guid = self.ctx.server_uuid.clone();
             self.ctx.send(
                 peer,
@@ -3855,7 +3991,7 @@ impl<S: MatchPhase> Server<S> {
         }
         self.ctx.turns.on_turn_sealed(peer, msg.turn)?;
         let turn_length = self.st.frozen().turn_length_ms;
-        self.ctx.release_turns(turn_length);
+        self.release_turns(turn_length);
         Ok(())
     }
 
@@ -3993,6 +4129,275 @@ impl<S: MatchPhase> Server<S> {
     }
 }
 
+impl Server<Resuming> {
+    fn on_input(mut self, input: Input) -> AnyServer {
+        match input {
+            Input::Received {
+                peer,
+                msg: WireMessage::Chat(chat),
+            } if is_resume_command(&chat.message) => return self.on_resume_command(peer),
+            Input::Received { peer, msg } => self.on_message(peer, msg),
+            Input::Checkpointed { id, state, .. } => self.on_restored(id, state),
+            Input::StateDumped { id, state } => self.on_state_dumped(id, state),
+            Input::Tick { now, stats } => {
+                self.on_tick(now, stats);
+                if self.gave_up(now) {
+                    self.abandon("nobody came back in time");
+                } else {
+                    self.hint_if_due(now);
+                }
+            }
+            other => self.on_common_input(other),
+        }
+        self.announce_arrivals();
+        self.into()
+    }
+
+    // The state at the stopped turn, which every returning client loads, is
+    // rebuilt by the same one-shot run a checkpoint uses, checked against
+    // the hashes the players agreed on before the stop.
+    fn start_restore(&mut self, base: Option<BaseState>) {
+        let turn = self.st.turn;
+        if let Some(base) = base.as_ref().filter(|b| b.turn == turn) {
+            self.ctx.checkpoints.states.push(base.clone());
+            return;
+        }
+        if !self.ctx.config.sidecar_dumps {
+            return;
+        }
+        let base = base.filter(|b| b.turn < turn);
+        let from = base.as_ref().map_or(0, |b| b.turn);
+        let from_scratch = base.is_none();
+        let Some(mut request) = self.match_record_from(base, turn) else {
+            return;
+        };
+        request.hashes = self.reference_hashes(from, turn);
+        let chain = &mut self.ctx.checkpoints;
+        let id = chain.next_id;
+        chain.next_id = chain.next_id.wrapping_add(1);
+        chain.pending = Some(PendingCheckpoint {
+            id,
+            turn,
+            from_scratch,
+        });
+        tracing::info!(from, turn, "sidecar: rebuilding the saved match state");
+        self.ctx
+            .effects
+            .push(Effect::Checkpoint { id, turn, request });
+    }
+
+    fn on_restored(&mut self, id: u32, state: Option<Vec<u8>>) {
+        let chain = &mut self.ctx.checkpoints;
+        if chain.pending.as_ref().is_none_or(|p| p.id != id) {
+            return;
+        }
+        let pending = chain.pending.take().expect("pending was just checked");
+        let Some(bytes) = state else {
+            let waiting = std::mem::take(&mut chain.waiting);
+            for joiner in waiting {
+                self.ctx
+                    .disconnect(joiner, DisconnectReason::MatchInProgress);
+            }
+            self.abandon("its state could not be rebuilt");
+            return;
+        };
+        let snapshot = Arc::new(bytes);
+        chain.states.push(BaseState {
+            turn: pending.turn,
+            state: snapshot.clone(),
+        });
+        let waiting = std::mem::take(&mut chain.waiting);
+        tracing::info!(
+            turn = pending.turn,
+            joiners = waiting.len(),
+            "sidecar: saved match state rebuilt"
+        );
+        for joiner in waiting {
+            self.ctx.counters.join_from_checkpoint += 1;
+            self.deliver_snapshot(joiner, snapshot.clone(), pending.turn..=pending.turn);
+        }
+        self.post_hint();
+    }
+
+    // Only a player who is back in the game may restart it, and only the
+    // controller until the grace period is over, so one early arrival cannot
+    // start the match without the host.
+    fn on_resume_command(mut self, peer: PeerID) -> AnyServer {
+        let Ok(uuid) = self.ctx.speaker(peer, Session::is_in_game) else {
+            return self.into();
+        };
+        if self.ctx.checkpoints.pending.is_some() {
+            self.ctx.server_chat(
+                Some(peer),
+                "The match is still being rebuilt; it can be resumed once that is done.",
+            );
+            return self.into();
+        }
+        let is_controller = self.ctx.controller.as_ref() == Some(&uuid);
+        let is_player = self
+            .ctx
+            .slots
+            .slot_of(&uuid)
+            .is_some_and(|slot| slot != UNASSIGNED);
+        if !is_controller && !(is_player && self.grace_over()) {
+            let text = match &self.st.controller {
+                Some(c) => format!(
+                    "Only {} (the controller) can resume the match for now.",
+                    c.name
+                ),
+                None => "Only the controller can resume the match for now.".to_string(),
+            };
+            self.ctx.server_chat(Some(peer), &text);
+            return self.into();
+        }
+        let by = self.ctx.name_of(&uuid).unwrap_or_else(|| uuid.to_string());
+        self.resume_match(&by).into()
+    }
+
+    fn resume_match(self, by: &str) -> Server<InGame> {
+        let Server { mut ctx, st } = self;
+        tracing::info!(turn = st.turn, by, "resumed match restarted");
+        let relayed = WireMessage::PlayerPause(PlayerPause {
+            guid: ctx.server_uuid.clone(),
+            pause: false,
+        });
+        ctx.broadcast(&relayed, |s| s.is_in_game());
+        ctx.server_chat(None, &format!("{by} resumed the match."));
+        let turn_length = st.settings.turn_length_ms;
+        let mut server = Server {
+            ctx,
+            st: InGame {
+                settings: st.settings,
+            },
+        };
+        server.release_turns(turn_length);
+        server
+    }
+
+    fn grace_over(&self) -> bool {
+        match (self.st.entered_at, self.ctx.now) {
+            (Some(entered), Some(now)) => {
+                now.signed_duration_since(entered) >= self.ctx.config.resume_controller_grace
+            }
+            _ => false,
+        }
+    }
+
+    // Kept on disk and never resumed again, so a match nobody returns to
+    // does not come back on every restart.
+    fn abandon(&mut self, why: &str) {
+        if self.st.abandoned {
+            return;
+        }
+        self.st.abandoned = true;
+        tracing::warn!(why, "giving up on the resumed match");
+        self.ctx
+            .server_chat(None, &format!("The saved match cannot continue: {why}."));
+        if self.ctx.config.saving {
+            self.ctx.effects.push(Effect::SaveStatus(Status::Abandoned));
+        }
+        self.ctx.effects.push(Effect::GameOver);
+    }
+
+    // The wait restarts whenever an original player is back, so a match is
+    // only given up once they have all been gone for the whole of it. A
+    // negative delta re-anchors rather than firing early (A7).
+    fn gave_up(&mut self, now: DateTime<Utc>) -> bool {
+        self.st.entered_at.get_or_insert(now);
+        let Some(wait) = self.ctx.config.resume_wait else {
+            return false;
+        };
+        let anyone_back = self
+            .ctx
+            .slots
+            .entries()
+            .any(|e| e.connected && e.slot != UNASSIGNED);
+        if anyone_back {
+            self.st.empty_since = None;
+            return false;
+        }
+        let anchor = *self.st.empty_since.get_or_insert(now);
+        let elapsed = now.signed_duration_since(anchor);
+        if elapsed < TimeDelta::zero() {
+            self.st.empty_since = Some(now);
+            return false;
+        }
+        elapsed >= wait
+    }
+
+    fn hint_if_due(&mut self, now: DateTime<Utc>) {
+        let due = self.st.last_hint.is_none_or(|last| {
+            let elapsed = now.signed_duration_since(last);
+            elapsed < TimeDelta::zero() || elapsed >= RESUME_HINT_INTERVAL
+        });
+        if due {
+            self.post_hint();
+        }
+    }
+
+    // Told once as each original player gets back, besides the periodic
+    // reminder.
+    fn announce_arrivals(&mut self) {
+        let back: HashSet<String> = self
+            .ctx
+            .slots
+            .entries()
+            .filter(|e| e.connected && e.slot != UNASSIGNED)
+            .map(|e| e.name.clone())
+            .collect();
+        let arrived = back.iter().any(|name| !self.st.announced.contains(name));
+        self.st.announced = back;
+        if arrived {
+            self.post_hint();
+        }
+    }
+
+    fn post_hint(&mut self) {
+        let anyone_admitted = self.ctx.sessions.values().any(|s| s.admitted.is_some());
+        if !anyone_admitted {
+            return;
+        }
+        self.st.last_hint = self.ctx.now;
+        let text = self.hint();
+        self.ctx.server_chat(None, &text);
+    }
+
+    fn hint(&self) -> String {
+        let turn = self.st.turn;
+        if self.ctx.checkpoints.pending.is_some() {
+            return format!(
+                "Match restored at turn {turn} after a server restart. Its state is being rebuilt, which can take a while."
+            );
+        }
+        let mut waiting: Vec<&str> = self
+            .ctx
+            .slots
+            .entries()
+            .filter(|e| !e.connected && e.slot != UNASSIGNED)
+            .filter(|e| !self.ctx.forfeited.contains(&e.uuid))
+            .filter(|e| !self.ctx.resigned.contains(&i32::from(e.slot)))
+            .map(|e| e.name.as_str())
+            .collect();
+        waiting.sort_unstable();
+        let who = match (&self.st.controller, self.grace_over()) {
+            (_, true) => format!("Any player types {RESUME_COMMAND} to continue."),
+            (Some(c), false) => format!(
+                "{} (the controller) types {RESUME_COMMAND} to continue.",
+                c.name
+            ),
+            (None, false) => format!("The controller types {RESUME_COMMAND} to continue."),
+        };
+        if waiting.is_empty() {
+            format!("Match restored at turn {turn} after a server restart. Everyone is back. {who}")
+        } else {
+            format!(
+                "Match restored at turn {turn} after a server restart. Waiting for: {}. {who}",
+                waiting.join(", ")
+            )
+        }
+    }
+}
+
 impl Server<PostGame> {
     fn on_input(mut self, input: Input) -> AnyServer {
         match input {
@@ -4029,6 +4434,23 @@ impl Server<PostGame> {
         }
         elapsed >= self.ctx.config.post_game_linger
     }
+}
+
+fn frozen_settings(json: &[u8], turn_length_ms: u16) -> FrozenSettings {
+    let (player_ids, endless) = match_players(json);
+    FrozenSettings {
+        cheats_enabled: cheats_enabled(json),
+        json: json.to_vec(),
+        turn_length_ms,
+        player_ids,
+        endless,
+        ai_json: None,
+        ai_players: Vec::new(),
+    }
+}
+
+fn is_resume_command(message: &str) -> bool {
+    message.trim().eq_ignore_ascii_case(RESUME_COMMAND)
 }
 
 // A duration as the chat line announcing it reads it.

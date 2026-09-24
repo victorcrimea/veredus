@@ -26,11 +26,8 @@ use crate::network_message::OutboundNetworkMessage;
 use crate::relay::messages::WireMessage;
 use crate::relay::monitor::PeerStats;
 use crate::relay::server_fsm::AnyServer;
-use crate::relay::server_fsm::Config;
 use crate::relay::server_fsm::Effect;
-use crate::relay::server_fsm::Idle;
 use crate::relay::server_fsm::Input;
-use crate::relay::server_fsm::Server;
 use crate::savegame::SaveItem;
 use crate::sidecar::AiHostProcess;
 use crate::sidecar::DumpRequest;
@@ -189,6 +186,8 @@ pub struct SidecarSetup {
     pub save: Option<Sender<SaveItem>>,
 }
 
+// `initial` is the FSM the game starts from: listening for a fresh match, or
+// a saved one rebuilt for resuming.
 // The ENet thread feeds decoded events in over `event_rx` and takes effects out
 // over `send_tx`. Every clock read lives here, on the IO side, so the FSM
 // itself stays a pure function of the inputs it is handed. `lobby` is None in
@@ -201,7 +200,7 @@ pub fn run_game_server(
     event_rx: Receiver<InboundNetworkMessage>,
     send_tx: Sender<OutboundNetworkMessage>,
     shutdown_requested: Arc<AtomicBool>,
-    config: Config,
+    initial: AnyServer,
     lobby: Option<LobbyLink>,
     sidecar: SidecarSetup,
     metrics: &mut GameMetrics,
@@ -212,9 +211,15 @@ pub fn run_game_server(
         outcome_path,
         save,
     } = sidecar;
-    // Parked in the listening state, which is the phase a relay spends its
-    // whole idle life in.
-    let mut server = Some(AnyServer::from(Server::<Idle>::new(config).listen()));
+    // A resumed match carries on in the same journal, marked where it
+    // picked up again.
+    if let (Some(save), AnyServer::Resuming(_)) = (&save, &initial) {
+        let _ = save.send(SaveItem::Resumed {
+            now: Utc::now(),
+            turn: initial.snapshot().ready_turn,
+        });
+    }
+    let mut server = Some(initial);
     let mut latest_stats: Vec<PeerStats> = Vec::new();
     let mut latest_loss: Vec<(PeerID, u32)> = Vec::new();
     let mut last_tick: DateTime<Utc> = Utc::now();

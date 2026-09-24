@@ -63,6 +63,9 @@ struct Args {
     /// an empty value turns saving off [default: saves]
     #[arg(long)]
     save_dir: Option<PathBuf>,
+    /// Do not resume the saved matches found in the save directory at startup
+    #[arg(long)]
+    no_resume: bool,
 }
 
 pub enum Command {
@@ -113,6 +116,9 @@ pub fn parse_args() -> Result<Command, String> {
     }
     if let Some(path) = args.save_dir {
         config.server.save_dir = path;
+    }
+    if args.no_resume {
+        config.server.resume = false;
     }
 
     config.validate()?;
