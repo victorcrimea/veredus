@@ -99,6 +99,10 @@ pub enum SaveItem {
         now: DateTime<Utc>,
         status: Status,
     },
+    // Time to fsync the journal. Paced by the game thread, since the writer
+    // may not read a clock (A7), and a match sends items far more often than
+    // the writer could ever sit idle long enough to notice the time itself.
+    Sync,
 }
 
 // How a game is saved, handed to the pool per game. `lobby_account` is the

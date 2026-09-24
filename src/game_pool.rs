@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
+use chrono::TimeDelta;
 use uuid::Uuid;
 
 use crate::lobby::link::LobbyLink;
@@ -204,6 +205,10 @@ impl GamePool {
 
         // Its own thread, so a slow disk or an fsync never stalls the tick
         // loop. It ends once the server thread drops its sender.
+        let save_sync = save
+            .as_ref()
+            .and_then(|setup| TimeDelta::from_std(setup.flush_interval).ok())
+            .unwrap_or(TimeDelta::MAX);
         let (save_tx, save_thread) = match save {
             Some(setup) => {
                 let (tx, rx) = mpsc::channel::<SaveItem>();
@@ -258,6 +263,7 @@ impl GamePool {
                         ai_host_connect,
                         outcome_path,
                         save: save_tx,
+                        save_sync,
                     },
                     &mut metrics,
                 )

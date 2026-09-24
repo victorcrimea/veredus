@@ -159,6 +159,7 @@ impl Writer {
             }
             SaveItem::AiState { first, last, state } => self.write_ai_state(first, last, &state),
             SaveItem::Status { now, status } => self.set_status(now, status),
+            SaveItem::Sync => self.flush(),
         }
     }
 

@@ -179,11 +179,13 @@ fn ai_host_event(outcome: &str) {
 // to. `outcome_path` is where the match outcome is written; None only logs it.
 // `save` is the game's save writer, None when saving is off; it rides here
 // because checkpoint states are saved from the same place they arrive.
+// `save_sync` is how often the writer is told to fsync its journal.
 pub struct SidecarSetup {
     pub pyrogenesis_path: Option<PathBuf>,
     pub ai_host_connect: Option<SocketAddrV4>,
     pub outcome_path: Option<PathBuf>,
     pub save: Option<Sender<SaveItem>>,
+    pub save_sync: TimeDelta,
 }
 
 // `initial` is the FSM the game starts from: listening for a fresh match, or
@@ -210,6 +212,7 @@ pub fn run_game_server(
         ai_host_connect,
         outcome_path,
         save,
+        save_sync,
     } = sidecar;
     // A resumed match carries on in the same journal, marked where it
     // picked up again.
@@ -223,6 +226,7 @@ pub fn run_game_server(
     let mut latest_stats: Vec<PeerStats> = Vec::new();
     let mut latest_loss: Vec<(PeerID, u32)> = Vec::new();
     let mut last_tick: DateTime<Utc> = Utc::now();
+    let mut last_sync: DateTime<Utc> = Utc::now();
     let (dump_tx, dump_rx) = std::sync::mpsc::channel::<(u32, Option<Vec<u8>>)>();
     let (checkpoint_tx, checkpoint_rx) =
         std::sync::mpsc::channel::<(u32, Option<CheckpointDone>)>();
@@ -244,6 +248,14 @@ pub fn run_game_server(
     };
     'game: loop {
         let tick_start = Utc::now();
+        // A step backwards syncs at once and re-anchors (A7).
+        if let Some(save) = &save {
+            let since = tick_start.signed_duration_since(last_sync);
+            if since < TimeDelta::zero() || since >= save_sync {
+                let _ = save.send(SaveItem::Sync);
+                last_sync = tick_start;
+            }
+        }
         // Drained before the ENet events, so a lobby-auth prompt is queued
         // ahead of the AUTHENTICATE it is meant to precede.
         if let Some(lobby) = &lobby {
