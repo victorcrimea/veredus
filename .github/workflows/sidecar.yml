@@ -97,7 +97,12 @@ jobs:
           export JOBS="-j$(nproc)"
           ./source/cxxtest-4.4/build.sh
           ./source/fcollada/build.sh
-          ./source/premake-core/build.sh
+          # Premake names its own version after the git tag it is built at.
+          # Its unpacked source is not a repository, so git would climb to
+          # the 0 A.D. clone, which sits exactly on v0.28.0, and premake
+          # would then call itself 0.28.0 and refuse the build scripts.
+          GIT_CEILING_DIRECTORIES="$PWD/source/premake-core" \
+            ./source/premake-core/build.sh
           OS=FreeBSD ./source/spidermonkey/build.sh
           cp source/spidermonkey/lib/* ../binaries/system/
 
