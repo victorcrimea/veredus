@@ -31,6 +31,8 @@ pub const STATE: &str = "state.bin";
 pub const STATE_META: &str = "state.json";
 pub const CLIENT_STATE: &str = "client_state.bin";
 pub const CLIENT_STATE_META: &str = "client_state.json";
+pub const AI_STATE: &str = "ai_state.bin";
+pub const AI_STATE_META: &str = "ai_state.json";
 pub const LOCK: &str = "lock";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

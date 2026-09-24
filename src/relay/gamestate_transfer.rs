@@ -41,6 +41,10 @@ pub enum Purpose {
     // which is how a match without a sidecar can be resumed. `floor` is as
     // for a join.
     SaveSnapshot { floor: u32 },
+    // The AI host's own state, the only one that holds its AI players' live
+    // registration and memory, pulled so a new AI host can be brought back
+    // into the match. `floor` is as for a join.
+    AiSnapshot { floor: u32 },
     Savegame,
 }
 
@@ -104,14 +108,14 @@ impl Transfers {
     // A source may take as long as it likes overall, but not sit idle:
     // nothing on the wire would ever tell the joiner it was abandoned.
     // Returns (source, joiner) for every join snapshot dropped here; a
-    // stalled save pull is just dropped. A clock step backwards restarts the
+    // stalled save or AI pull is just dropped. A clock step backwards restarts the
     // wait rather than firing early.
     pub fn stalled(&mut self, now: DateTime<Utc>, limit: TimeDelta) -> Vec<(PeerID, PeerID)> {
         let mut dropped = Vec::new();
         self.incoming.retain(|(source, _), rx| {
             let joiner = match rx.purpose {
                 Purpose::JoinSnapshot { joiner, .. } => Some(joiner),
-                Purpose::SaveSnapshot { .. } => None,
+                Purpose::SaveSnapshot { .. } | Purpose::AiSnapshot { .. } => None,
                 Purpose::Savegame => return true,
             };
             let since = *rx.last_progress.get_or_insert(now);

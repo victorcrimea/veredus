@@ -684,6 +684,10 @@ fn drain(
                 forward_save(save, SaveItem::ClientState { first, last, state });
                 continue;
             }
+            Effect::SaveAiState { first, last, state } => {
+                forward_save(save, SaveItem::AiState { first, last, state });
+                continue;
+            }
             Effect::SaveStatus(status) => {
                 forward_save(
                     save,

@@ -122,6 +122,11 @@ fn clone_effect(effect: &Effect) -> Effect {
             last: *last,
             state: state.clone(),
         },
+        Effect::SaveAiState { first, last, state } => Effect::SaveAiState {
+            first: *first,
+            last: *last,
+            state: state.clone(),
+        },
     }
 }
 

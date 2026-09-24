@@ -280,6 +280,13 @@ pub enum Effect {
         last: u32,
         state: Arc<Vec<u8>>,
     },
+    // The AI host's own state, somewhere in `first..=last`, which is what a
+    // new AI host is brought back into the match from.
+    SaveAiState {
+        first: u32,
+        last: u32,
+        state: Arc<Vec<u8>>,
+    },
 }
 
 // Values travel as the ENet disconnect `data` word; only the number reaches the client.
@@ -458,6 +465,11 @@ pub struct Config {
     // turns it off; matches with AI players never do it, since their
     // clients' state is not all a resumed match needs.
     pub client_state_interval_turns: u32,
+    // A match with hosted AI pulls the AI host's state right after it starts
+    // and then every this many released turns, since only that state can
+    // bring a new AI host back into the match. It freezes the AI host, and
+    // with it the match, while it serializes. 0 pulls only the first one.
+    pub ai_state_interval_turns: u32,
 }
 
 impl Default for Config {
@@ -511,6 +523,7 @@ impl Default for Config {
             resume_wait: Some(TimeDelta::minutes(15)),
             resume_controller_grace: TimeDelta::minutes(5),
             client_state_interval_turns: 0,
+            ai_state_interval_turns: 600,
         }
     }
 }
@@ -629,6 +642,10 @@ pub(crate) struct Context {
     saved_slots: Option<SlotsSnapshot>,
     // Present while this match pulls client states for its save.
     client_pull: Option<ClientPull>,
+    // The newest state pulled from the AI host, and the turns it can be at.
+    // It outlives the AI host that produced it, since it is what the next
+    // one is brought back from.
+    ai_state: Option<Seed>,
     counters: Counters,
     effects: Vec<Effect>,
 }
@@ -647,6 +664,9 @@ struct AiHost {
     peer: Option<PeerID>,
     // The AI player ids it may send commands for.
     players: HashSet<i32>,
+    // The ready turn when its state was last asked for. None until the
+    // first pull, which is due as soon as it plays.
+    last_pull: Option<u32>,
 }
 
 // The one in-flight one-shot state dump: the turn it rebuilds and every
@@ -720,6 +740,10 @@ pub(crate) enum TransferDone {
         snapshot: Arc<Vec<u8>>,
     },
     SaveSnapshot {
+        floor: u32,
+        state: Arc<Vec<u8>>,
+    },
+    AiSnapshot {
         floor: u32,
         state: Arc<Vec<u8>>,
     },
@@ -2832,13 +2856,13 @@ impl<S: PhaseMarker> Server<S> {
         // A save pull that cannot complete is dropped, so it does not block
         // the next one until the stall limit.
         if !gamestate_transfer::fits(msg.length as usize)
-            && let Some(Purpose::SaveSnapshot { .. }) =
+            && let Some(Purpose::SaveSnapshot { .. } | Purpose::AiSnapshot { .. }) =
                 self.ctx.transfers.purpose(peer, msg.request_id)
         {
             tracing::info!(
                 ?peer,
                 length = msg.length,
-                "save: client state cannot be pulled, skipped"
+                "save: state cannot be pulled, skipped"
             );
             self.ctx.transfers.abandon(peer, msg.request_id);
             return Ok(());
@@ -2891,6 +2915,10 @@ impl<S: PhaseMarker> Server<S> {
                     state: Arc::new(bytes),
                 }))
             }
+            Some((Purpose::AiSnapshot { floor }, bytes)) => Ok(Some(TransferDone::AiSnapshot {
+                floor,
+                state: Arc::new(bytes),
+            })),
             Some((Purpose::Savegame, bytes)) => Ok(Some(TransferDone::Savegame(bytes))),
             None => Ok(None),
         }
@@ -3099,6 +3127,7 @@ impl Server<Idle> {
                 lobby_map: None,
                 saved_slots: None,
                 client_pull: None,
+                ai_state: None,
                 counters: Counters::default(),
                 effects: Vec::new(),
             },
@@ -3242,6 +3271,7 @@ impl Server<Setup> {
         self.ctx.ai_host = Some(AiHost {
             peer: None,
             players: split.players,
+            last_pull: None,
         });
         let name = self.ctx.ai_host_name.clone();
         self.ctx.effects.push(Effect::SpawnAiHost { name });
@@ -3620,7 +3650,55 @@ impl Server<InGame> {
         }
         self.maybe_checkpoint();
         self.maybe_pull_client_state();
+        self.maybe_pull_ai_state();
         self.into()
+    }
+
+    // Paced like a client state pull, since it freezes the match the same
+    // way, but from the AI host alone: nobody else has its AI players'
+    // memory. An AI host out of sync would hand on a state that is wrong.
+    fn maybe_pull_ai_state(&mut self) {
+        let turn = self.ctx.turns.ready_turn();
+        let interval = self.ctx.config.ai_state_interval_turns;
+        let Some(host) = self.ctx.ai_host.as_ref() else {
+            return;
+        };
+        let Some(source) = host.peer else {
+            return;
+        };
+        let due = match host.last_pull {
+            None => true,
+            Some(last) => interval != 0 && turn >= last.saturating_add(interval),
+        };
+        if !due
+            || self.ctx.transfers.is_fetching()
+            || self.ctx.pause_budget.auto_paused()
+            || self.ctx.pause_budget.pausing().next().is_some()
+            || !self
+                .ctx
+                .sessions
+                .get(&source)
+                .is_some_and(|s| s.is_in_game())
+            || self.ctx.turns.is_out_of_sync(source)
+        {
+            return;
+        }
+        if let Some(host) = self.ctx.ai_host.as_mut() {
+            host.last_pull = Some(turn);
+        }
+        let floor = self.ctx.turns.simulated_turn(source).unwrap_or(0);
+        let request_id = self.ctx.transfers.allocate();
+        self.ctx
+            .transfers
+            .expect(source, request_id, Purpose::AiSnapshot { floor });
+        tracing::debug!(?source, turn, "sidecar: pulling the AI host state");
+        self.ctx.send(
+            source,
+            WireMessage::GamestateRequest(GamestateRequest {
+                request_type: KIND_RUNNING_GAME,
+                request_id,
+            }),
+        );
     }
 
     // Serializing freezes the source, and with it the whole match, so a pull
@@ -3863,6 +3941,27 @@ impl<S: MatchPhase> Server<S> {
                 last,
                 state: state.clone(),
             });
+        }
+        // Kept even with saving off, since healing the AI host needs it too.
+        if let Some(TransferDone::AiSnapshot { floor, state }) = &done {
+            let last = self.ctx.turns.ready_turn();
+            tracing::info!(
+                first = floor,
+                last,
+                bytes = state.len(),
+                "sidecar: AI host state pulled"
+            );
+            self.ctx.ai_state = Some(Seed {
+                turns: *floor..=last,
+                state: state.clone(),
+            });
+            if self.ctx.config.saving {
+                self.ctx.effects.push(Effect::SaveAiState {
+                    first: *floor,
+                    last,
+                    state: state.clone(),
+                });
+            }
         }
         if let Some(TransferDone::JoinSnapshot {
             joiner,

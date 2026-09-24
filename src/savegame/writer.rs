@@ -157,6 +157,7 @@ impl Writer {
             SaveItem::ClientState { first, last, state } => {
                 self.write_client_state(first, last, &state)
             }
+            SaveItem::AiState { first, last, state } => self.write_ai_state(first, last, &state),
             SaveItem::Status { now, status } => self.set_status(now, status),
         }
     }
@@ -288,6 +289,21 @@ impl Writer {
         let meta = ClientStateMeta::of(first, last, state);
         if let Err(error) = bundle::write_json(&self.dir.join(bundle::CLIENT_STATE_META), &meta) {
             self.fail("cannot write the client state turns", error);
+        }
+    }
+
+    // Pulled from the AI host the same way a client state is pulled from a
+    // player, so it carries the same kind of turn range.
+    fn write_ai_state(&mut self, first: u32, last: u32, state: &[u8]) {
+        if self.manifest.is_none() {
+            return;
+        }
+        if let Err(error) = bundle::write_atomic(&self.dir.join(bundle::AI_STATE), state) {
+            return self.fail("cannot write the AI host state", error);
+        }
+        let meta = ClientStateMeta::of(first, last, state);
+        if let Err(error) = bundle::write_json(&self.dir.join(bundle::AI_STATE_META), &meta) {
+            self.fail("cannot write the AI host state turns", error);
         }
     }
 

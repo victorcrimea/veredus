@@ -342,6 +342,10 @@ pub struct GameSection {
     /// Without a sidecar, how often one playing client is asked for the
     /// match state so the match can be resumed; 0 turns it off.
     pub client_state_interval_secs: u64,
+    /// With hosted AI, how many turns apart the AI players' own state is
+    /// saved, so a crashed AI host can be brought back; each save pauses
+    /// the match briefly. 0 uses the checkpoint interval.
+    pub ai_state_interval_turns: u32,
     /// Names that count as buddies under the buddies observer policy.
     pub buddies: Vec<String>,
     // Last: TOML refuses a plain value after an array of tables.
@@ -405,6 +409,7 @@ impl Default for GameSection {
             resume_controller_grace_secs: config.resume_controller_grace.num_seconds().max(0)
                 as u64,
             client_state_interval_secs: 0,
+            ai_state_interval_turns: 0,
             buddies,
             enabled_mods: config
                 .enabled_mods
@@ -475,6 +480,10 @@ impl GameSection {
                 sidecar,
                 self.client_state_interval_secs,
                 self.turn_length_ms,
+            ),
+            ai_state_interval_turns: ai_state_interval_turns(
+                self.ai_state_interval_turns,
+                checkpoint_interval_turns,
             ),
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
@@ -792,6 +801,16 @@ fn client_state_interval_turns(sidecar: bool, secs: u64, turn_length_ms: u16) ->
     }
     let turns = secs.saturating_mul(1000) / u64::from(turn_length_ms);
     u32::try_from(turns).unwrap_or(u32::MAX).max(1)
+}
+
+// Follows the checkpoint interval unless set, and never turns the pulls off
+// with it: a match without checkpoints still needs its AI state.
+fn ai_state_interval_turns(turns: u32, checkpoint_interval_turns: u32) -> u32 {
+    match (turns, checkpoint_interval_turns) {
+        (0, 0) => Config::default().ai_state_interval_turns,
+        (0, checkpoint) => checkpoint,
+        (turns, _) => turns,
+    }
 }
 
 fn non_empty_path(value: &Path) -> Option<PathBuf> {
