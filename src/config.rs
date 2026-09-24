@@ -538,7 +538,8 @@ pub struct LobbySection {
     pub idle_shutdown_secs: u64,
     // Last: TOML refuses a plain value after an array of tables.
     /// One-shot XMPP accounts waiting in the room; each hosts one game at
-    /// a time. Keep this file private: it holds account passwords.
+    /// a time. Replace these examples with your own. Keep this file
+    /// private: it holds account passwords.
     pub accounts: Vec<AccountEntry>,
 }
 
@@ -559,6 +560,24 @@ impl Default for LobbySection {
 }
 
 impl LobbySection {
+    // The generated file is the only place an operator sees how accounts are
+    // written, but Default must stay empty: serde fills every key a file
+    // leaves out from it, and placeholder accounts would then log in.
+    fn example() -> Self {
+        LobbySection {
+            muc_room: "arena28@conference.lobby.wildfiregames.com".to_string(),
+            bot_jid: "wfgbot28@lobby.wildfiregames.com/CC".to_string(),
+            accounts: ["myserver1", "myserver2"]
+                .into_iter()
+                .map(|name| AccountEntry {
+                    jid: format!("{name}@lobby.wildfiregames.com"),
+                    password: String::new(),
+                })
+                .collect(),
+            ..LobbySection::default()
+        }
+    }
+
     // 0 means never, as for every other duration here; a zero timeout would
     // close each game on its first tick, before anyone could join it.
     pub fn idle_shutdown(&self) -> Option<TimeDelta> {
@@ -570,6 +589,10 @@ impl LobbySection {
     pub fn to_lobby_config(&self) -> Result<LobbyConfig, String> {
         if self.accounts.is_empty() {
             return Err("[lobby] is enabled but lists no accounts".to_string());
+        }
+        // Catches the generated file's example accounts left in place.
+        if let Some(account) = self.accounts.iter().find(|a| a.password.is_empty()) {
+            return Err(format!("[lobby] account '{}' has no password", account.jid));
         }
         for (key, value) in [
             ("muc_room", &self.muc_room),
@@ -705,7 +728,11 @@ impl FileConfig {
     }
 
     pub fn write_default(path: &Path) -> Result<(), String> {
-        let body = toml::to_string_pretty(&FileConfig::default())
+        let generated = FileConfig {
+            lobby: LobbySection::example(),
+            ..FileConfig::default()
+        };
+        let body = toml::to_string_pretty(&generated)
             .map_err(|error| format!("failed to serialize the default config: {error}"))?;
         // Serializing drops every comment, so each section's doc comments are
         // attached afterwards; values and prose then share one source each.
