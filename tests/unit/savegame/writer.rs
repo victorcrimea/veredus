@@ -80,7 +80,7 @@ fn a_stopped_match_keeps_its_bundle() {
                 turn: 1,
                 hash: vec![3; 16],
             },
-            SaveItem::Checkpoint {
+            SaveItem::State {
                 turn: 4,
                 state: Arc::new(vec![5, 5]),
             },

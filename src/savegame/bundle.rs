@@ -29,8 +29,6 @@ pub const SLOTS: &str = "slots.json";
 pub const JOURNAL: &str = "journal.bin";
 pub const STATE: &str = "state.bin";
 pub const STATE_META: &str = "state.json";
-pub const CLIENT_STATE: &str = "client_state.bin";
-pub const CLIENT_STATE_META: &str = "client_state.json";
 pub const AI_STATE: &str = "ai_state.bin";
 pub const AI_STATE_META: &str = "ai_state.json";
 pub const LOCK: &str = "lock";
@@ -91,30 +89,6 @@ impl StateMeta {
     pub fn of(turn: u32, state: &[u8]) -> Self {
         StateMeta {
             turn,
-            checksum: hex::encode(Blake2b128::digest(state)),
-        }
-    }
-
-    pub fn matches(&self, state: &[u8]) -> bool {
-        hex::encode(Blake2b128::digest(state)) == self.checksum
-    }
-}
-
-// A state pulled from a client, which is somewhere in `first..=last`: the
-// server never decodes it, so it only knows the turns the client could have
-// been at.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientStateMeta {
-    pub first: u32,
-    pub last: u32,
-    pub checksum: String,
-}
-
-impl ClientStateMeta {
-    pub fn of(first: u32, last: u32, state: &[u8]) -> Self {
-        ClientStateMeta {
-            first,
-            last,
             checksum: hex::encode(Blake2b128::digest(state)),
         }
     }

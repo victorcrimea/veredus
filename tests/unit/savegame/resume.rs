@@ -93,7 +93,7 @@ fn stopped_match(setup: &SaveSetup, ai_players: Vec<i32>) -> PathBuf {
                 turn: 1,
                 hash: vec![1; 16],
             },
-            SaveItem::Checkpoint {
+            SaveItem::State {
                 turn: 4,
                 state: Arc::new(vec![4, 4]),
             },
@@ -254,42 +254,18 @@ fn scan_finds_running_and_stopped_only() {
 }
 
 #[test]
-fn without_a_sidecar_a_checkpoint_or_client_state_is_enough() {
+fn without_a_sidecar_a_saved_state_is_enough() {
     let setup = setup();
     let dir = stopped_match(&setup, Vec::new());
     let mut no_sidecar = expect();
     no_sidecar.sidecar = false;
-    let resumable = load(&dir, &no_sidecar).expect("resumable from the checkpoint");
-    assert!(resumable.data.seed.is_none());
+    let resumable = load(&dir, &no_sidecar).expect("resumable from the saved state");
     assert_eq!(resumable.data.base.as_ref().map(|b| b.turn), Some(4));
     drop(resumable);
-    std::fs::remove_file(dir.join(bundle::STATE)).unwrap();
+
+    std::fs::write(dir.join(bundle::STATE), [1]).unwrap();
     assert!(matches!(load(&dir, &no_sidecar), Err(Skip::NoSidecar)));
-
-    write(
-        &setup,
-        None,
-        vec![
-            SaveItem::Started {
-                now: DateTime::UNIX_EPOCH,
-                settings: b"{}".to_vec(),
-                ai_settings: None,
-                ai_players: Vec::new(),
-            },
-            SaveItem::ClientState {
-                first: 3,
-                last: 5,
-                state: Arc::new(vec![8, 8]),
-            },
-        ],
-    );
-    let resumable = load(&dir, &no_sidecar).expect("resumable from the client state");
-    let seed = resumable.data.seed.clone().expect("seed");
-    assert_eq!(seed.turns, 3..=5);
-    assert_eq!(*seed.state, vec![8, 8]);
-    drop(resumable);
-
-    std::fs::write(dir.join(bundle::CLIENT_STATE), [1]).unwrap();
+    std::fs::remove_file(dir.join(bundle::STATE)).unwrap();
     assert!(matches!(load(&dir, &no_sidecar), Err(Skip::NoSidecar)));
     std::fs::remove_dir_all(&setup.root).unwrap();
 }

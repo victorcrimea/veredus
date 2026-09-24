@@ -88,7 +88,6 @@ fn data(base: Option<BaseState>) -> ResumeData {
             ..SlotsSnapshot::default()
         },
         base,
-        seed: None,
         ai: None,
     }
 }

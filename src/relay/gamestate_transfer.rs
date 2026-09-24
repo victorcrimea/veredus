@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::Arc;
 
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
+use flate2::read::ZlibDecoder;
 
 use crate::enet::PeerID;
 use crate::relay::fault::PeerFault;
@@ -23,6 +25,16 @@ pub const MAX_TRANSFER: u32 = 8 * 1024 * 1024;
 // served, whoever produced it.
 pub fn fits(len: usize) -> bool {
     len != 0 && len <= MAX_TRANSFER as usize
+}
+
+// A running game's state is `u32 LE length || zlib(u32 LE turn || state)`,
+// and the turn is all the server reads of it. Only the first four bytes are
+// inflated, so a large state costs no more than a small one.
+pub fn snapshot_turn(snapshot: &[u8]) -> Option<u32> {
+    let compressed = snapshot.get(4..)?;
+    let mut turn = [0u8; 4];
+    ZlibDecoder::new(compressed).read_exact(&mut turn).ok()?;
+    Some(u32::from_le_bytes(turn))
 }
 
 pub const KIND_SAVEGAME: i8 = 0;

@@ -44,6 +44,7 @@ prometheus = { version = "0.13", features = ["process"] }
 unicode-general-category = "1.1.0"
 toml_edit = "0.23"
 documented = "0.10.0"
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

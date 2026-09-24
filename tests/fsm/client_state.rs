@@ -25,7 +25,7 @@ use veredus::savegame::SavedPlayer;
 use veredus::savegame::SlotsSnapshot;
 use veredus::savegame::resume::ResumeData;
 use veredus::savegame::resume::SavedTurn;
-use veredus::savegame::resume::Seed;
+use veredus::sidecar::BaseState;
 
 use crate::harness::Harness;
 use crate::harness::chats_to;
@@ -75,11 +75,11 @@ fn requests(h: &Harness) -> usize {
         .count()
 }
 
-fn saved_states(effects: &[Effect]) -> Vec<(u32, u32)> {
+fn saved_states(effects: &[Effect]) -> Vec<u32> {
     effects
         .iter()
         .filter_map(|e| match e {
-            Effect::SaveClientState { first, last, .. } => Some((*first, *last)),
+            Effect::SaveState { turn, .. } => Some(*turn),
             _ => None,
         })
         .collect()
@@ -92,11 +92,8 @@ fn a_client_state_is_pulled_every_interval() {
     assert_eq!(requests(&h), 0, "not due yet");
     release_through(&mut h, INITIAL_READY_TURN + INTERVAL);
     assert_eq!(requests(&h), 1);
-    let effects = h.serve_snapshot();
-    assert_eq!(
-        saved_states(&effects),
-        vec![(0, INITIAL_READY_TURN + INTERVAL)]
-    );
+    let effects = h.serve_snapshot_at(INITIAL_READY_TURN + INTERVAL);
+    assert_eq!(saved_states(&effects), vec![INITIAL_READY_TURN + INTERVAL]);
 }
 
 #[test]
@@ -141,7 +138,7 @@ fn a_restart_is_promised_only_once_a_state_is_saved() {
             .iter()
             .all(|c| c.starts_with("Server shutdown:"))
     );
-    h.serve_snapshot();
+    h.serve_snapshot_at(INITIAL_READY_TURN + INTERVAL);
     let after = h.stop();
     assert!(
         chats_to(&after, ALICE)
@@ -176,9 +173,8 @@ fn resumed_from_seed() -> Harness {
             }),
             ..SlotsSnapshot::default()
         },
-        base: None,
-        seed: Some(Seed {
-            turns: 5..=7,
+        base: Some(BaseState {
+            turn: 6,
             state: Arc::new(vec![1, 2, 3]),
         }),
         ai: None,

@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Viktor Semenov
 // SPDX-License-Identifier: Apache-2.0
 
-use std::ops::RangeInclusive;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +12,6 @@ use crate::relay::turn::INITIAL_READY_TURN;
 use crate::savegame::SlotsSnapshot;
 use crate::savegame::Status;
 use crate::savegame::bundle;
-use crate::savegame::bundle::ClientStateMeta;
 use crate::savegame::bundle::FORMAT_VERSION;
 use crate::savegame::bundle::Lock;
 use crate::savegame::bundle::Manifest;
@@ -33,14 +31,6 @@ pub struct SavedTurn {
     pub commands: Vec<PlayerCommand>,
 }
 
-// A client state a match without a sidecar is resumed from, and the turns
-// it can be at.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Seed {
-    pub turns: RangeInclusive<u32>,
-    pub state: Arc<Vec<u8>>,
-}
-
 // Everything the FSM needs to rebuild a saved match. Plain data: reading it
 // is IO, and that happens here, before the game thread exists (A2).
 #[derive(Debug, Clone)]
@@ -52,11 +42,10 @@ pub struct ResumeData {
     pub turns: Vec<SavedTurn>,
     pub hashes: Vec<(u32, Vec<u8>)>,
     pub slots: SlotsSnapshot,
-    // The newest checkpoint, when one was stored and still matches its turn.
+    // The newest state, from a sidecar checkpoint or a client, when one was
+    // stored and still matches its turn. A sidecar replays from it; without
+    // one it is what returning clients load.
     pub base: Option<BaseState>,
-    // The newest client state, for a server without a sidecar, which can
-    // also serve `base` instead.
-    pub seed: Option<Seed>,
     // What brings the AI host back, for a match with hosted AI players.
     pub ai: Option<AiResume>,
 }
@@ -67,7 +56,7 @@ pub struct ResumeData {
 pub struct AiResume {
     pub settings: Vec<u8>,
     pub players: Vec<i32>,
-    pub state: Seed,
+    pub state: BaseState,
 }
 
 impl ResumeData {
@@ -195,9 +184,8 @@ pub fn load(dir: &Path, expect: &Expect) -> Result<Resumable, Skip> {
         .map_err(|e| Skip::Unreadable(e.to_string()))?
         .ok_or(Skip::Locked)?;
     check_compatible(&manifest, expect)?;
-    let seed = read_client_state(dir);
     let base = read_state(dir);
-    if !expect.sidecar && seed.is_none() && base.is_none() {
+    if !expect.sidecar && base.is_none() {
         return Err(Skip::NoSidecar);
     }
     let ai = if manifest.ai_players.is_empty() {
@@ -239,7 +227,6 @@ pub fn load(dir: &Path, expect: &Expect) -> Result<Resumable, Skip> {
         hashes,
         slots,
         base,
-        seed,
         ai,
     };
     Ok(Resumable {
@@ -321,29 +308,17 @@ fn read_journal(path: &Path) -> Result<Journal, Skip> {
 }
 
 // A state whose turn record does not match it is dropped rather than
-// trusted: the replay then starts from turn 0, which is slower but right.
+// trusted: a sidecar then replays from turn 0, which is slower but right,
+// and without one the match is not resumed.
 fn read_state(dir: &Path) -> Option<BaseState> {
     let state = std::fs::read(dir.join(bundle::STATE)).ok()?;
     let meta: StateMeta = bundle::read_json(&dir.join(bundle::STATE_META)).ok()?;
     if !meta.matches(&state) {
-        tracing::warn!(dir = %dir.display(), "save: checkpoint state does not match its turn, replaying from the start");
+        tracing::warn!(dir = %dir.display(), "save: saved state does not match its turn, not used");
         return None;
     }
     Some(BaseState {
         turn: meta.turn,
-        state: Arc::new(state),
-    })
-}
-
-fn read_client_state(dir: &Path) -> Option<Seed> {
-    let state = std::fs::read(dir.join(bundle::CLIENT_STATE)).ok()?;
-    let meta: ClientStateMeta = bundle::read_json(&dir.join(bundle::CLIENT_STATE_META)).ok()?;
-    if !meta.matches(&state) || meta.first > meta.last {
-        tracing::warn!(dir = %dir.display(), "save: client state does not match its turns, not used");
-        return None;
-    }
-    Some(Seed {
-        turns: meta.first..=meta.last,
         state: Arc::new(state),
     })
 }
@@ -356,18 +331,18 @@ fn read_ai(dir: &Path, players: &[i32]) -> Result<AiResume, Skip> {
         .map_err(|_| Skip::Incompatible("no AI host settings".to_string()))?;
     let missing = || Skip::Incompatible("no AI host state".to_string());
     let state = std::fs::read(dir.join(bundle::AI_STATE)).map_err(|_| missing())?;
-    let meta: ClientStateMeta =
+    let meta: StateMeta =
         bundle::read_json(&dir.join(bundle::AI_STATE_META)).map_err(|_| missing())?;
-    if !meta.matches(&state) || meta.first > meta.last {
+    if !meta.matches(&state) {
         return Err(Skip::Incompatible(
-            "the AI host state does not match its turns".to_string(),
+            "the AI host state does not match its turn".to_string(),
         ));
     }
     Ok(AiResume {
         settings,
         players: players.to_vec(),
-        state: Seed {
-            turns: meta.first..=meta.last,
+        state: BaseState {
+            turn: meta.turn,
             state: Arc::new(state),
         },
     })

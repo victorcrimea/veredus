@@ -22,6 +22,7 @@ use crate::relay::gamestate_transfer::KIND_SAVEGAME;
 use crate::relay::gamestate_transfer::MAX_TRANSFER;
 use crate::relay::gamestate_transfer::Purpose;
 use crate::relay::gamestate_transfer::Transfers;
+use crate::relay::gamestate_transfer::snapshot_turn;
 use crate::relay::ingress::Decision;
 use crate::relay::ingress::Gate;
 use crate::relay::messages::Ack;
@@ -86,7 +87,6 @@ use crate::savegame::SlotsSnapshot;
 use crate::savegame::Status;
 use crate::savegame::resume::AiResume;
 use crate::savegame::resume::ResumeData;
-use crate::savegame::resume::Seed;
 use crate::sidecar::BaseState;
 use crate::sidecar::DumpRequest;
 
@@ -274,18 +274,16 @@ pub enum Effect {
     // who may take one back.
     SaveSlots(SlotsSnapshot),
     SaveStatus(Status),
-    // A state serialized by a playing client, somewhere in `first..=last`,
-    // which is what a match without a sidecar is resumed from.
-    SaveClientState {
-        first: u32,
-        last: u32,
+    // A state serialized by a playing client at `turn`, which is what a
+    // match without a sidecar is resumed from.
+    SaveState {
+        turn: u32,
         state: Arc<Vec<u8>>,
     },
-    // The AI host's own state, somewhere in `first..=last`, which is what a
-    // new AI host is brought back into the match from.
+    // The AI host's own state at `turn`, which is what a new AI host is
+    // brought back into the match from.
     SaveAiState {
-        first: u32,
-        last: u32,
+        turn: u32,
         state: Arc<Vec<u8>>,
     },
 }
@@ -653,10 +651,9 @@ pub(crate) struct Context {
     saved_slots: Option<SlotsSnapshot>,
     // Present while this match pulls client states for its save.
     client_pull: Option<ClientPull>,
-    // The newest state pulled from the AI host, and the turns it can be at.
-    // It outlives the AI host that produced it, since it is what the next
-    // one is brought back from.
-    ai_state: Option<Seed>,
+    // The newest state pulled from the AI host. It outlives the AI host that
+    // produced it, since it is what the next one is brought back from.
+    ai_state: Option<BaseState>,
     // Set once the match has been saved and ended for a restart on its own,
     // rather than by the operator's stop, so no outcome is worked out for a
     // match that has not ended.
@@ -669,7 +666,7 @@ struct ClientPull {
     interval: u32,
     // The ready turn when the last pull was asked for.
     last: u32,
-    // Whether the bundle holds a client state yet, which is what makes the
+    // Whether the bundle holds a saved state yet, which is what makes the
     // match resumable without a sidecar.
     saved: bool,
 }
@@ -1355,9 +1352,9 @@ pub struct Resuming {
     announced: HashSet<String>,
     // Set once GameOver is pushed, so a second reason cannot push it again.
     abandoned: bool,
-    // Without a sidecar, the client state every returning client loads
-    // instead, and the turns it can be at.
-    seed: Option<Seed>,
+    // Without a sidecar, the saved state every returning client loads
+    // instead of one rebuilt at the stopped turn.
+    seed: Option<BaseState>,
 }
 
 // Setup handlers stay available while a savegame is being fetched.
@@ -1379,8 +1376,8 @@ pub trait PhaseMarker {
     fn saved_controller(&self) -> Option<&SavedIdentity> {
         None
     }
-    // The saved client state a match rebuilt without a sidecar serves.
-    fn resume_seed(&self) -> Option<&Seed> {
+    // The saved state a match rebuilt without a sidecar serves.
+    fn resume_seed(&self) -> Option<&BaseState> {
         None
     }
 }
@@ -1419,7 +1416,7 @@ impl PhaseMarker for Resuming {
     fn saved_controller(&self) -> Option<&SavedIdentity> {
         self.controller.as_ref()
     }
-    fn resume_seed(&self) -> Option<&Seed> {
+    fn resume_seed(&self) -> Option<&BaseState> {
         self.seed.as_ref()
     }
 }
@@ -1687,7 +1684,7 @@ impl<S> Server<S> {
 
     // The match is marked stopped before anyone is dropped, so the players
     // are only promised a restart that a later start can actually resume.
-    // Without a sidecar or a client state nothing can rebuild the state, so
+    // Without a sidecar or a saved state nothing can rebuild the state, so
     // the line stays the plain one.
     fn stop_saved(mut self, reason: &str) -> Vec<Effect> {
         let resumable =
@@ -2587,9 +2584,13 @@ impl<S: PhaseMarker> Server<S> {
         // stream brings it from there to the live turn.
         if self.ctx.is_ai_host(joiner) {
             match self.ctx.ai_state.clone() {
-                Some(seed) => {
-                    tracing::info!(?joiner, turns = ?seed.turns, "sidecar: AI host served its saved state");
-                    self.deliver_snapshot(joiner, seed.state, seed.turns);
+                Some(saved) => {
+                    tracing::info!(
+                        ?joiner,
+                        turn = saved.turn,
+                        "sidecar: AI host served its saved state"
+                    );
+                    self.deliver_snapshot(joiner, saved.state, saved.turn..=saved.turn);
                 }
                 None => self
                     .ctx
@@ -2608,13 +2609,13 @@ impl<S: PhaseMarker> Server<S> {
             self.ctx.checkpoints.waiting.push(joiner);
             return;
         }
-        // The replay stream then brings the joiner from wherever in its
-        // range the state is up to the stopped turn.
+        // The replay stream then brings the joiner from the state's turn up
+        // to the stopped turn.
         if let Some(seed) = self.st.resume_seed() {
             let state = seed.state.clone();
-            let turns = seed.turns.clone();
-            self.ctx.counters.join_from_client += 1;
-            self.deliver_snapshot(joiner, state, turns);
+            let turn = seed.turn;
+            self.ctx.counters.join_from_checkpoint += 1;
+            self.deliver_snapshot(joiner, state, turn..=turn);
             return;
         }
         let newest_usable = if joiner_delayed {
@@ -3430,21 +3431,7 @@ impl Server<Idle> {
         }
         let mut pull = ctx.client_pull_for(&server.st.settings, turn);
         if !ctx.config.sidecar_dumps {
-            // A match saved with a sidecar has only its checkpoint, which
-            // needs no sidecar to serve. An exact turn beats a client state
-            // that may be no newer.
-            let checkpoint = data.base.as_ref().map(|b| Seed {
-                turns: b.turn..=b.turn,
-                state: b.state.clone(),
-            });
-            server.st.seed = match (data.seed, checkpoint) {
-                (Some(client), Some(checkpoint))
-                    if checkpoint.turns.start() < client.turns.start() =>
-                {
-                    Some(client)
-                }
-                (client, checkpoint) => checkpoint.or(client),
-            };
+            server.st.seed = data.base.clone();
             if let Some(pull) = pull.as_mut() {
                 pull.saved = server.st.seed.is_some();
             }
@@ -4202,43 +4189,53 @@ impl<S: MatchPhase> Server<S> {
     fn on_snapshot_chunk(&mut self, peer: PeerID, msg: GamestateChunk) -> Result<(), PeerFault> {
         let done = self.on_gamestate_chunk(peer, msg)?;
         // The source cannot have run past the ready turn, and the journal
-        // already holds every turn up to it.
+        // already holds every turn up to it. A turn outside that range would
+        // make a resumed client replay turns it has already run, or skip
+        // some, so such a state is not kept.
         if let Some(TransferDone::SaveSnapshot { floor, state }) = &done {
             let last = self.ctx.turns.ready_turn();
-            tracing::info!(
-                first = floor,
-                last,
-                bytes = state.len(),
-                "save: client state pulled"
-            );
-            if let Some(pull) = self.ctx.client_pull.as_mut() {
-                pull.saved = true;
+            match snapshot_turn(state).filter(|t| (*floor..=last).contains(t)) {
+                Some(turn) => {
+                    tracing::info!(turn, bytes = state.len(), "save: client state pulled");
+                    if let Some(pull) = self.ctx.client_pull.as_mut() {
+                        pull.saved = true;
+                    }
+                    self.ctx.effects.push(Effect::SaveState {
+                        turn,
+                        state: state.clone(),
+                    });
+                }
+                None => tracing::warn!(
+                    ?peer,
+                    first = floor,
+                    last,
+                    "save: client state has no turn in range, not saved"
+                ),
             }
-            self.ctx.effects.push(Effect::SaveClientState {
-                first: *floor,
-                last,
-                state: state.clone(),
-            });
         }
         // Kept even with saving off, since healing the AI host needs it too.
         if let Some(TransferDone::AiSnapshot { floor, state }) = &done {
             let last = self.ctx.turns.ready_turn();
-            tracing::info!(
-                first = floor,
-                last,
-                bytes = state.len(),
-                "sidecar: AI host state pulled"
-            );
-            self.ctx.ai_state = Some(Seed {
-                turns: *floor..=last,
-                state: state.clone(),
-            });
-            if self.ctx.config.saving {
-                self.ctx.effects.push(Effect::SaveAiState {
-                    first: *floor,
+            match snapshot_turn(state).filter(|t| (*floor..=last).contains(t)) {
+                Some(turn) => {
+                    tracing::info!(turn, bytes = state.len(), "sidecar: AI host state pulled");
+                    self.ctx.ai_state = Some(BaseState {
+                        turn,
+                        state: state.clone(),
+                    });
+                    if self.ctx.config.saving {
+                        self.ctx.effects.push(Effect::SaveAiState {
+                            turn,
+                            state: state.clone(),
+                        });
+                    }
+                }
+                None => tracing::warn!(
+                    ?peer,
+                    first = floor,
                     last,
-                    state: state.clone(),
-                });
+                    "sidecar: AI host state has no turn in range, not kept"
+                ),
             }
         }
         if let Some(TransferDone::JoinSnapshot {
@@ -4722,7 +4719,7 @@ impl Server<Resuming> {
     // The AI host comes back the way a lost one is healed, from its own
     // saved state up to the stopped turn, while everyone is held anyway.
     fn resume_ai_host(&mut self, ai: AiResume) {
-        tracing::info!(ai_players = ?ai.players, turns = ?ai.state.turns, "sidecar: bringing the AI host back");
+        tracing::info!(ai_players = ?ai.players, turn = ai.state.turn, "sidecar: bringing the AI host back");
         self.st.settings.ai_json = Some(ai.settings);
         self.st.settings.ai_players = ai.players.clone();
         self.ctx.ai_state = Some(ai.state);

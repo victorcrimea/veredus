@@ -7,11 +7,14 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::io::Write;
 use std::net::Ipv4Addr;
 
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 
 use veredus::enet::PeerID;
 use veredus::relay::gamestate_transfer::KIND_RUNNING_GAME;
@@ -117,14 +120,12 @@ fn clone_effect(effect: &Effect) -> Effect {
         },
         Effect::SaveSlots(slots) => Effect::SaveSlots(slots.clone()),
         Effect::SaveStatus(status) => Effect::SaveStatus(*status),
-        Effect::SaveClientState { first, last, state } => Effect::SaveClientState {
-            first: *first,
-            last: *last,
+        Effect::SaveState { turn, state } => Effect::SaveState {
+            turn: *turn,
             state: state.clone(),
         },
-        Effect::SaveAiState { first, last, state } => Effect::SaveAiState {
-            first: *first,
-            last: *last,
+        Effect::SaveAiState { turn, state } => Effect::SaveAiState {
+            turn: *turn,
             state: state.clone(),
         },
     }
@@ -408,6 +409,15 @@ impl Harness {
     // payload, so a joiner may then report LOADED_GAME: the server refuses
     // one from a joiner it never handed a snapshot.
     pub fn serve_snapshot(&mut self) -> Vec<Effect> {
+        self.serve_snapshot_bytes(vec![0u8; 4])
+    }
+
+    // For the pulls the server reads the turn of, which join snapshots are not.
+    pub fn serve_snapshot_at(&mut self, turn: u32) -> Vec<Effect> {
+        self.serve_snapshot_bytes(running_game(turn))
+    }
+
+    fn serve_snapshot_bytes(&mut self, data: Vec<u8>) -> Vec<Effect> {
         let (source, request_id) = self
             .log
             .iter()
@@ -420,7 +430,6 @@ impl Harness {
                 _ => None,
             })
             .expect("serve_snapshot: no snapshot was requested");
-        let data = vec![0u8; 4];
         self.input(Input::Received {
             peer: source,
             msg: WireMessage::GamestateResponse(GamestateResponse {
@@ -497,6 +506,18 @@ pub fn expect_send<T>(
         found.len()
     );
     found.pop()
+}
+
+// A running game's state as a client frames it, with a stand-in for the
+// simulation state the server never reads.
+pub fn running_game(turn: u32) -> Vec<u8> {
+    let mut payload = turn.to_le_bytes().to_vec();
+    payload.extend_from_slice(&[7; 16]);
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&payload).unwrap();
+    let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+    framed.extend(encoder.finish().unwrap());
+    framed
 }
 
 pub fn turn_sealed(peer: PeerID, turn: u32) -> Input {

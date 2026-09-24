@@ -305,7 +305,7 @@ pub fn run_game_server(
                 }) => {
                     runs.last_result = Some((id, turn, json));
                     if let Some(save) = &save {
-                        let _ = save.send(SaveItem::Checkpoint {
+                        let _ = save.send(SaveItem::State {
                             turn,
                             state: Arc::new(state.clone()),
                         });
@@ -694,12 +694,12 @@ fn drain(
                 forward_save(save, SaveItem::Slots(slots));
                 continue;
             }
-            Effect::SaveClientState { first, last, state } => {
-                forward_save(save, SaveItem::ClientState { first, last, state });
+            Effect::SaveState { turn, state } => {
+                forward_save(save, SaveItem::State { turn, state });
                 continue;
             }
-            Effect::SaveAiState { first, last, state } => {
-                forward_save(save, SaveItem::AiState { first, last, state });
+            Effect::SaveAiState { turn, state } => {
+                forward_save(save, SaveItem::AiState { turn, state });
                 continue;
             }
             Effect::SaveStatus(status) => {

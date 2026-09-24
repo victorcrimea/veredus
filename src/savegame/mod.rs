@@ -81,18 +81,14 @@ pub enum SaveItem {
         hash: Vec<u8>,
     },
     Slots(SlotsSnapshot),
-    Checkpoint {
+    // A sidecar checkpoint or a state pulled from a playing client: both
+    // carry the turn they are at, so the bundle keeps them alike.
+    State {
         turn: u32,
         state: Arc<Vec<u8>>,
     },
-    ClientState {
-        first: u32,
-        last: u32,
-        state: Arc<Vec<u8>>,
-    },
     AiState {
-        first: u32,
-        last: u32,
+        turn: u32,
         state: Arc<Vec<u8>>,
     },
     Status {

@@ -15,7 +15,6 @@ use crate::savegame::SaveSetup;
 use crate::savegame::SlotsSnapshot;
 use crate::savegame::Status;
 use crate::savegame::bundle;
-use crate::savegame::bundle::ClientStateMeta;
 use crate::savegame::bundle::FORMAT_VERSION;
 use crate::savegame::bundle::Lock;
 use crate::savegame::bundle::Manifest;
@@ -153,11 +152,8 @@ impl Writer {
             }
             SaveItem::Hash { turn, hash } => self.append(&Record::Hash { turn, hash }),
             SaveItem::Slots(slots) => self.write_slots(slots),
-            SaveItem::Checkpoint { turn, state } => self.write_state(turn, &state),
-            SaveItem::ClientState { first, last, state } => {
-                self.write_client_state(first, last, &state)
-            }
-            SaveItem::AiState { first, last, state } => self.write_ai_state(first, last, &state),
+            SaveItem::State { turn, state } => self.write_state(turn, &state),
+            SaveItem::AiState { turn, state } => self.write_ai_state(turn, &state),
             SaveItem::Status { now, status } => self.set_status(now, status),
             SaveItem::Sync => self.flush(),
         }
@@ -272,39 +268,26 @@ impl Writer {
             return;
         }
         if let Err(error) = bundle::write_atomic(&self.dir.join(bundle::STATE), state) {
-            return self.fail("cannot write the checkpoint state", error);
+            return self.fail("cannot write the saved state", error);
         }
         let meta = StateMeta::of(turn, state);
         if let Err(error) = bundle::write_json(&self.dir.join(bundle::STATE_META), &meta) {
-            self.fail("cannot write the checkpoint turn", error);
+            self.fail("cannot write the saved state's turn", error);
         }
     }
 
-    fn write_client_state(&mut self, first: u32, last: u32, state: &[u8]) {
-        if self.manifest.is_none() {
-            return;
-        }
-        if let Err(error) = bundle::write_atomic(&self.dir.join(bundle::CLIENT_STATE), state) {
-            return self.fail("cannot write the client state", error);
-        }
-        let meta = ClientStateMeta::of(first, last, state);
-        if let Err(error) = bundle::write_json(&self.dir.join(bundle::CLIENT_STATE_META), &meta) {
-            self.fail("cannot write the client state turns", error);
-        }
-    }
-
-    // Pulled from the AI host the same way a client state is pulled from a
-    // player, so it carries the same kind of turn range.
-    fn write_ai_state(&mut self, first: u32, last: u32, state: &[u8]) {
+    // Kept apart from the players' state: it carries the AI host's own
+    // registration, which must never reach a stock client.
+    fn write_ai_state(&mut self, turn: u32, state: &[u8]) {
         if self.manifest.is_none() {
             return;
         }
         if let Err(error) = bundle::write_atomic(&self.dir.join(bundle::AI_STATE), state) {
             return self.fail("cannot write the AI host state", error);
         }
-        let meta = ClientStateMeta::of(first, last, state);
+        let meta = StateMeta::of(turn, state);
         if let Err(error) = bundle::write_json(&self.dir.join(bundle::AI_STATE_META), &meta) {
-            self.fail("cannot write the AI host state turns", error);
+            self.fail("cannot write the AI host state turn", error);
         }
     }
 
