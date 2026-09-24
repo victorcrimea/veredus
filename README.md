@@ -115,18 +115,21 @@ To keep each match's result as a JSON file, add `--outcome-dir results`.
 The server saves every running match as it goes, into a `saves` folder next
 to where you start it (`--save-dir` picks another folder). If you stop the
 server during a match, or it crashes, it picks the match up again the next
-time it starts, on the same port:
+time it starts:
 
-1. Players reconnect the way they joined, by address and port.
-2. Each player gets their own slot back. Anyone else can only watch.
+1. Players reconnect the way they joined. Outside the lobby that is the
+   same address and port. In the lobby, the match shows up in the game
+   list again, under the same server name.
+2. Each player gets their own slot back. Anyone else can only watch. AI
+   opponents come back on their own.
 3. The match stays paused until the host types `!resume` in chat. After
    five minutes, any returning player can.
 
-This needs the sidecar, and for now it works only outside the lobby and
-without AI opponents. Without the sidecar, set
-`[game] client_state_interval_secs` (for example 300). Every so often the
-server then asks one player's game for a copy of the match, which pauses the
-game for a moment. To start fresh instead, run with `--no-resume`.
+This works best with the sidecar, and matches with AI opponents need it.
+Without the sidecar, set `[game] client_state_interval_secs` (for example
+300). Every so often the server then asks one player's game for a copy of
+the match, which pauses the game for a moment. To start fresh instead, run
+with `--no-resume`.
 
 ## Hosting in the multiplayer lobby
 
