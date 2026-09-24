@@ -15,30 +15,33 @@ connection, lag or departure affects everyone; with Veredus no player hosts.
 
 ## Key features
 
-- One player's PC and connection carry the match -> no player hosts; the
-  match survives anyone leaving, and waits for a dropped or lagging player
-  only as long as their pause budget lasts.
-- Joining must not need extra software -> players use the stock 0.28.0 game,
-  nothing to install.
-- Someone has to set up every lobby game -> type `hostme` in the lobby chat
-  and a fresh game is hosted for you, with you as its host, many at once.
-- A disconnected or timed-out player loses their place -> they get their
-  own slot back when they return; so does a kicked player who was not banned.
-- A server restart or crash ends the match -> every match is saved as it
-  goes and continues after a restart, paused until the host types `!resume`.
+- **No player hosts the match.** In a normal game the host's PC and
+  connection carry it. Here the match survives anyone leaving, and waits for
+  a dropped or lagging player only as long as their pause budget lasts.
+- **Nothing to install for players.** They join with the stock 0 A.D. 0.28.0
+  game.
+- **Lobby games on request.** Instead of someone setting up each game, a
+  player types `hostme` in the lobby chat and gets a fresh game with them as
+  its host; many games run at once.
+- **Your slot is kept.** A player who disconnects or times out gets their own
+  slot back when they return; so does a kicked player who was not banned.
+- **Matches survive a server restart or crash.** Every match is saved as it
+  goes and continues when the server starts again, paused until the host
+  types `!resume`.
 
 With the [sidecar](#extra-features-with-the-sidecar), a patched headless
 0 A.D. run next to the server:
 
-- Rejoining makes a player's game stop to send a copy -> the server builds
-  the joiner's copy itself.
-- AI opponents load one player's PC -> the AI runs on the server.
-- Games with AI cannot be rejoined -> with server-hosted AI they can.
-- An AI crash spoils the match -> the server pauses, restarts the AI and
-  catches it up.
-- Players leave before the end and the result is lost -> the server works
-  it out anyway and, with `--outcome-dir`, keeps it with a replay the game
-  can play (for any match that played at least one turn).
+- **Rejoins without stopping the game.** Normally another player's game
+  stops to send the joiner a copy of the match; here the server builds it.
+- **AI runs on the server.** It no longer loads one player's PC.
+- **Games with AI can be rejoined.**
+- **The AI recovers from a crash.** The server pauses the match, restarts
+  the AI and catches it up.
+- **Match results and replays.** The server works out who won even if
+  everyone left before the end and, with `--outcome-dir`, keeps the result
+  with a replay the game can play (for any match that played at least one
+  turn).
 
 ## Quick start
 
