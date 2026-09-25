@@ -22,6 +22,7 @@ use veredus::lobby::LobbyConfig;
 use veredus::lobby::LobbyEvent;
 use veredus::lobby::LobbyManager;
 use veredus::lobby::link::LobbyLink;
+use veredus::lobby::terms;
 use veredus::relay::password;
 use veredus::relay::server_fsm::Config;
 use veredus::savegame::SaveSetup;
@@ -79,6 +80,18 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer().with_filter(stdout_filter))
         .with(build_loki_layer(&config.log).map(|layer| layer.with_filter(loki_filter)))
         .init();
+
+    // Before anything else logs, so the terms and the prompt are not broken
+    // up by log lines.
+    if mode.lobby.as_ref().is_some_and(|l| l.personal.is_some()) {
+        let accepted = config
+            .personal
+            .i_accept_terms_of_service_and_terms_of_use_and_privacy_policy;
+        if let Err(error) = terms::ensure_accepted(accepted, mode.config_path.as_deref()).await {
+            tracing::error!("{error}");
+            std::process::exit(1);
+        }
+    }
 
     serve_metrics(config.metrics.host, config.metrics.port);
 

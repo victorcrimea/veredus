@@ -41,6 +41,7 @@ sasl = "0.5"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 toml = "1.1.6"
 prometheus = { version = "0.13", features = ["process"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 unicode-general-category = "1.1.0"
 toml_edit = "0.23"
 documented = "0.10.0"

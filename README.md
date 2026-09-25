@@ -244,7 +244,13 @@ public_ip = "203.0.113.10"
 - The lobby server and room default to the official Wildfire Games lobby.
 
 Start the server with `./veredus` (or `./veredus --personal` if `enabled`
-is not set in the file). Then, in 0 A.D., choose **Multiplayer**, then
+is not set in the file). Because it logs in as you, the first start shows
+the lobby's Terms of Service, Terms of Use and Privacy Policy and asks you
+to type `YES`, then remembers that in the config file. A server started
+without a console (a service, Docker) cannot ask: read the three documents
+at the links it prints, then set
+`i_accept_terms_of_service_and_terms_of_use_and_privacy_policy = true` in
+`[personal]` yourself. Then, in 0 A.D., choose **Multiplayer**, then
 **Join game**, and enter the server's address and port 20595.
 
 - Do not log in to the lobby with the same account while the server uses

@@ -80,6 +80,9 @@ pub enum Command {
 pub struct RunMode {
     // The config file with every command line override applied.
     pub config: FileConfig,
+    // The file it was read from, None when there was none. Personal mode
+    // writes the terms acceptance back to it.
+    pub config_path: Option<PathBuf>,
     // Some selects pool-lobby mode, or personal mode when it says so.
     pub lobby: Option<LobbyConfig>,
 }
@@ -96,6 +99,10 @@ pub fn parse_args() -> Result<Command, String> {
         Some(path) => FileConfig::load(path, true)?,
         None => FileConfig::load(DEFAULT_CONFIG_PATH.as_ref(), false)?,
     };
+    let config_path = args
+        .config
+        .clone()
+        .or_else(|| Some(PathBuf::from(DEFAULT_CONFIG_PATH)).filter(|p| p.exists()));
 
     if let Some(host) = args.host {
         config.server.host = host;
@@ -143,7 +150,11 @@ pub fn parse_args() -> Result<Command, String> {
         lobby.validate()?;
     }
 
-    Ok(Command::Run(Box::new(RunMode { config, lobby })))
+    Ok(Command::Run(Box::new(RunMode {
+        config,
+        config_path,
+        lobby,
+    })))
 }
 
 fn load_lobby_json(path: &Path) -> Result<LobbyConfig, String> {

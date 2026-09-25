@@ -3495,6 +3495,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "prometheus",
+ "reqwest",
  "rocket",
  "sasl",
  "serde",

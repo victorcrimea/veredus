@@ -273,7 +273,7 @@ pub struct PersonalSection {
     pub game_password: String,
     /// The lobby server your account lives on.
     pub lobby_server: String,
-    /// The lobby room. The account sits in it like a player, but never
+    /// The lobby room. The account sits in it on your behalf, but never
     /// says anything there.
     pub muc_room: String,
     /// The bot that keeps the game list.
@@ -282,6 +282,13 @@ pub struct PersonalSection {
     pub rating_bot_jid: String,
     /// Must match the clients.
     pub engine_version: String,
+    /// Set to true to accept the Wildfire Games lobby's Terms of Service,
+    /// Terms of Use and Privacy Policy, the ones the 0.28.0 game shows at
+    /// its lobby login, from
+    /// https://gitea.wildfiregames.com/0ad/0ad/src/tag/v0.28.0/binaries/data/mods/public/gui/prelobby/common/terms/
+    /// While this is false, personal mode shows them at startup and asks
+    /// you to type YES, which then sets it here.
+    pub i_accept_terms_of_service_and_terms_of_use_and_privacy_policy: bool,
 }
 
 impl Default for PersonalSection {
@@ -301,6 +308,7 @@ impl Default for PersonalSection {
             bot_jid: "wfgbot28@lobby.wildfiregames.com/CC".to_string(),
             rating_bot_jid: "echelon28@lobby.wildfiregames.com/CC".to_string(),
             engine_version: crate::lobby::default_engine_version(),
+            i_accept_terms_of_service_and_terms_of_use_and_privacy_policy: false,
         }
     }
 }

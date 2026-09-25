@@ -7,6 +7,7 @@ pub mod game_report;
 pub mod gamelist;
 pub mod link;
 pub mod rating;
+pub mod terms;
 
 use std::collections::HashMap;
 use std::pin::Pin;
