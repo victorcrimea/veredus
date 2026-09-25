@@ -113,6 +113,7 @@ To host games from the in-game lobby instead, see
 - On this page: [the sidecar](#extra-features-with-the-sidecar),
   [restarts](#restarts), [lobby hosting](#hosting-in-the-multiplayer-lobby),
   [configuration](#configuration), [running as a service](#running-as-a-service),
+  [Docker](#running-with-docker),
   [building from source](#building-from-source),
   [building the sidecar](#building-the-sidecar) and [license](#license).
 - `./veredus --help` lists every flag; `./veredus --gen-config` writes a
@@ -274,6 +275,36 @@ Create the `veredus` user (or change `User=`), then run
 
 On Windows, run `veredus.exe` from Task Scheduler ("At startup") or wrap it
 as a service with a tool such as [NSSM](https://nssm.cc/).
+
+## Running with Docker
+
+Images for x86_64 and ARM64 Linux are published with each release. The
+server alone:
+
+```sh
+docker run -d --name veredus --restart unless-stopped --stop-timeout 60 \
+  -p 20595:20595/udp -v veredus:/data ghcr.io/victorcrimea/veredus
+```
+
+With the [sidecar](#extra-features-with-the-sidecar), use the
+`ghcr.io/victorcrimea/veredus:latest-sidecar` image instead; nothing else
+changes. A version number such as `:0.3.3` or `:0.3.3-sidecar` pins a
+release.
+
+Everything the server keeps (its config file, saved matches, results) lives
+in `/data`, so keep that volume to let a match continue after the container
+is recreated. To edit the config, put `config.toml` in the volume, or
+mount a folder of your own there with `-v /srv/veredus:/data`; that folder
+must be writable by user id 1000. Flags go after the image name, for
+example `ghcr.io/victorcrimea/veredus --outcome-dir results`.
+
+For [lobby hosting](#hosting-in-the-multiplayer-lobby), use
+`--network host` instead of `-p`, because lobby games use the whole port
+range 20595 to 20695, and set `public_ip` in the config: the server cannot
+find out its public address from inside a container.
+
+`--stop-timeout 60` gives the server time to finish writing a match's result
+when you stop it.
 
 ## Building from source
 
