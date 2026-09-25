@@ -23,6 +23,10 @@ pub struct Session {
     pub uuid: Option<Guid>,
     // Only ever set in lobby mode, by the lobby-auth IQ.
     pub lobby_name: Option<String>,
+    // Personal mode: its ACK carried no lobby-auth prompt because it came
+    // from a trusted network while nobody else could be joining, so only the
+    // initiator's own name is accepted from it.
+    pub unprompted: bool,
     pub admitted: Option<Admitted>,
     pub mean_rtt: TimeDelta,
     pub since_last_received: TimeDelta,
@@ -79,6 +83,7 @@ impl Session {
             addr,
             uuid: None,
             lobby_name: None,
+            unprompted: false,
             admitted: None,
             mean_rtt: TimeDelta::zero(),
             since_last_received: TimeDelta::zero(),

@@ -232,14 +232,20 @@ Fill in the `[personal]` table of your config file:
 enabled = true
 name = "yourname"
 password = "..."
-trusted_address = "198.51.100.7"
+trusted_networks = "192.168.0.0/16,10.0.0.0/8"
 public_ip = "203.0.113.10"
 ```
 
 - `name` and `password` are your lobby login.
-- `trusted_address` is the IP address your own game connects from. Only you,
-  from that address and under your lobby name, get in without the lobby, and
-  you are the host.
+- `trusted_networks` lists the networks your own game connects from,
+  separated by commas, such as `192.168.0.0/16` or a single address like
+  `198.51.100.7`. The default covers the usual home networks. Only you,
+  from one of these networks and under your lobby name, get in without the
+  lobby, and you are the host. Join first: other players connecting from
+  a trusted network go through the lobby as usual once your game is
+  listed. `0.0.0.0/0` trusts every address; it works, but it is insecure,
+  since while you are not in the game anyone who knows your lobby name can
+  join as you.
 - `public_ip` is the address other players connect to.
 - The lobby server and room default to the official Wildfire Games lobby.
 

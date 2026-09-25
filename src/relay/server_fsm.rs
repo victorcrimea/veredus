@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use chrono::DateTime;
 use chrono::TimeDelta;
 use chrono::Utc;
+use ipnet::Ipv4Net;
 
 use crate::enet::PeerID;
 use crate::lobby::game_report;
@@ -141,6 +143,9 @@ const RATING_NEEDS_SIDECAR: &str = "This server cannot report rated games: \
 const RATING_NEEDS_OWN_SLOTS: &str = "A rated game cannot have a shared player. \
      Turn rating off or unshare the slot to start the match.";
 
+// How long a lobby player handed the address is expected to take to connect.
+const JOINER_EXPECTED_WINDOW: TimeDelta = TimeDelta::seconds(30);
+
 // Typed in setup chat by a player, followed by an observer's name, when
 // `Config::shared_slots` is on.
 const SHARE_COMMAND: &str = "!share";
@@ -165,6 +170,8 @@ pub enum Input {
         username: String,
         token: String,
     },
+    // The lobby account handed a lobby player the game's address.
+    LobbyJoinerExpected,
     // Time and peer timing both enter here, so the FSM never reads a clock.
     Tick {
         now: DateTime<Utc>,
@@ -408,11 +415,12 @@ pub struct Config {
     // no secret to prove it is the host with.
     pub lobby_host_name: String,
     // Some selects personal mode, where the lobby account is the initiator's
-    // own: lobby_host_name is that player, who joins by direct IP from this
-    // address and is let in without lobby authentication or the password.
+    // own: lobby_host_name is that player, who joins by direct IP from any
+    // address in these networks and is let in without lobby authentication
+    // or the password.
     // The game is listed only while they are in it, and a rated start is
     // refused without a sidecar, which the rated report needs.
-    pub initiator_addr: Option<Ipv4Addr>,
+    pub initiator_nets: Option<Vec<Ipv4Net>>,
     // When set, a joiner no live client can serve gets its snapshot from a
     // one-shot pyrogenesis instead of being dropped, and a match that ran is
     // replayed for its outcome once it ends. The IO side owns the actual
@@ -538,7 +546,7 @@ impl Default for Config {
             afk_pause: true,
             idle_shutdown: None,
             lobby_host_name: String::new(),
-            initiator_addr: None,
+            initiator_nets: None,
             sidecar_dumps: false,
             hosted_ai: false,
             checkpoint_interval_turns: 0,
@@ -696,6 +704,11 @@ pub(crate) struct Context {
     // rather than by the operator's stop, so no outcome is worked out for a
     // match that has not ended.
     kept_for_restart: bool,
+    // Personal mode: when lobby players were handed the address while the
+    // game was unlisted, each still owed a lobby-auth prompt. A player
+    // rejoining a running match can still ask for the address then, and
+    // without this it would be taken for the initiator.
+    joiners_expected: VecDeque<DateTime<Utc>>,
     counters: Counters,
     effects: Vec<Effect>,
 }
@@ -918,7 +931,7 @@ impl Context {
     }
 
     fn is_initiator(&self, session: &Session) -> bool {
-        self.config.initiator_addr.is_some()
+        self.config.initiator_nets.is_some()
             && session.admitted.is_some()
             && session
                 .lobby_name
@@ -926,16 +939,53 @@ impl Context {
                 .is_some_and(|n| n.eq_ignore_ascii_case(&self.config.lobby_host_name))
     }
 
+    fn in_initiator_nets(&self, addr: Ipv4Addr) -> bool {
+        self.config
+            .initiator_nets
+            .as_ref()
+            .is_some_and(|nets| nets.iter().any(|net| net.contains(&addr)))
+    }
+
+    fn expect_lobby_joiner(&mut self) {
+        if self.config.initiator_nets.is_some()
+            && let Some(now) = self.now
+        {
+            self.prune_joiners_expected();
+            self.joiners_expected.push_back(now);
+        }
+    }
+
+    fn prune_joiners_expected(&mut self) {
+        if let Some(now) = self.now {
+            self.joiners_expected
+                .retain(|at| now.signed_duration_since(*at) < JOINER_EXPECTED_WINDOW);
+        }
+    }
+
+    // While the game is unlisted no lobby player should be arriving, so a
+    // connection from a trusted network is the initiator and is not
+    // prompted; once it is listed, everyone is. Every connection made while
+    // unlisted uses up one expected lobby joiner, so a scan can only cost a
+    // real joiner a retry, never let it past lobby auth.
+    fn skip_lobby_auth(&mut self, addr: Ipv4Addr) -> bool {
+        if !self.lobby_hidden() {
+            return false;
+        }
+        self.prune_joiners_expected();
+        let expected = self.joiners_expected.pop_front().is_some();
+        !expected && self.in_initiator_nets(addr)
+    }
+
     // In personal mode the game is listed only while its initiator is in it.
     fn lobby_hidden(&self) -> bool {
-        self.config.initiator_addr.is_some()
+        self.config.initiator_nets.is_some()
             && !self.sessions.values().any(|s| self.is_initiator(s))
     }
 
     // A rated match is reported from the outcome replay, so personal mode
     // refuses to start one that nothing could report.
     fn rating_unreportable(&self) -> bool {
-        self.config.initiator_addr.is_some() && !self.config.sidecar_dumps
+        self.config.initiator_nets.is_some() && !self.config.sidecar_dumps
     }
 
     fn push_lobby_started(&mut self) {
@@ -1640,7 +1690,7 @@ impl AnyServer {
     // report is sent for. None for an observer, or outside personal mode.
     pub fn initiator_player_id(&self) -> Option<i32> {
         let ctx = self.ctx();
-        ctx.config.initiator_addr?;
+        ctx.config.initiator_nets.as_ref()?;
         let host = &ctx.config.lobby_host_name;
         ctx.slots
             .entries()
@@ -1856,6 +1906,7 @@ impl<S: PhaseMarker> Server<S> {
             Input::Received { peer, msg } => self.on_common_message(peer, msg),
             Input::Disconnected { peer } => self.on_disconnected(peer),
             Input::LobbyAuth { username, token } => self.on_lobby_auth(username, token),
+            Input::LobbyJoinerExpected => self.ctx.expect_lobby_joiner(),
             Input::Tick { now, stats } => self.on_tick(now, stats),
             // Only the in-game phase waits on dumps; everywhere else the
             // result arrives for a game that has moved on.
@@ -2353,8 +2404,11 @@ impl<S: PhaseMarker> Server<S> {
         let ai_host = addr.is_some_and(|a| self.ctx.ai_host_expected(a));
         // The initiator joins by direct IP, with no lobby session to answer
         // the prompt from.
-        let trusted = addr.is_some() && addr == self.ctx.config.initiator_addr;
-        let flags = if self.ctx.config.lobby_mode && !ai_host && !trusted {
+        let unprompted = !ai_host && addr.is_some_and(|a| self.ctx.skip_lobby_auth(a));
+        if unprompted && let Some(session) = self.ctx.sessions.get_mut(&peer) {
+            session.unprompted = true;
+        }
+        let flags = if self.ctx.config.lobby_mode && !ai_host && !unprompted {
             ACK_FLAG_LOBBY_AUTH
         } else {
             0
@@ -2404,8 +2458,7 @@ impl<S: PhaseMarker> Server<S> {
             self.ctx.ai_host_expected(session.addr) && msg.name == self.ctx.ai_host_name;
         // Never prompted for lobby auth, so the address and the name below
         // are all that vouch for it.
-        let from_initiator_addr =
-            !is_ai_host && Some(session.addr) == self.ctx.config.initiator_addr;
+        let from_initiator_addr = !is_ai_host && session.unprompted;
         if self.ctx.config.lobby_mode && lobby_name.is_none() && !is_ai_host && !from_initiator_addr
         {
             // The client has not been prompted yet, so this cannot be its
@@ -3615,6 +3668,7 @@ impl Server<Idle> {
                 client_pull: None,
                 ai_state: None,
                 kept_for_restart: false,
+                joiners_expected: VecDeque::new(),
                 counters: Counters::default(),
                 effects: Vec::new(),
             },
@@ -3639,7 +3693,7 @@ impl Server<Idle> {
         let settings = frozen_settings(&data.settings, data.turn_length_ms);
         let slots = data.slots;
         // A personal match is listed again only once its initiator is back.
-        if self.ctx.config.lobby_mode && self.ctx.config.initiator_addr.is_none() {
+        if self.ctx.config.lobby_mode && self.ctx.config.initiator_nets.is_none() {
             // Re-listed at once as a match in progress, since the bot dropped
             // it when the old process left. Nobody is back yet, so the saved
             // players stand in for the connected ones the listing counts.

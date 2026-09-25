@@ -10,6 +10,7 @@ use tokio_xmpp::parsers::iq::Iq;
 use tokio_xmpp::parsers::jid::Jid;
 
 use crate::lobby::link::LobbyAuthToken;
+use crate::lobby::link::LobbyToGame;
 
 pub const NS_LOBBYAUTH: &str = "jabber:iq:lobbyauth";
 
@@ -22,14 +23,14 @@ pub async fn handle(
     from: Jid,
     id: String,
     payload: &Element,
-    auth_tx: Option<&std::sync::mpsc::Sender<LobbyAuthToken>>,
+    auth_tx: Option<&std::sync::mpsc::Sender<LobbyToGame>>,
 ) {
     if let Some(token) = payload.get_child("token", NS_LOBBYAUTH).map(|t| t.text())
         && let Some(username) = from.node().map(|n| n.to_string())
         && let Some(tx) = auth_tx
     {
         crate::metrics::LOBBY_AUTH_TOTAL.inc();
-        let _ = tx.send(LobbyAuthToken { username, token });
+        let _ = tx.send(LobbyToGame::Auth(LobbyAuthToken { username, token }));
     }
 
     let result = Iq::empty_result(from, id);

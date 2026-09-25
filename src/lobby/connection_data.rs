@@ -80,6 +80,7 @@ fn connection_data_outcome(outcome: &str) {
 // Checks run in PROTOCOL.md Sec. 17.4 order. `failures` is the per-assignment
 // counter the account task owns: it is cleared whenever a game ends, because
 // the ban is scoped to one assignment, not to the account's whole lifetime.
+// True when the game's address was handed out, since a connection follows.
 pub async fn handle(
     client: &mut Client,
     from: Jid,
@@ -87,18 +88,18 @@ pub async fn handle(
     payload: &Element,
     assigned: Option<(&Assignment, &mut HashMap<String, u32>)>,
     public_ip: &str,
-) {
+) -> bool {
     let Some((assignment, failures)) = assigned else {
         connection_data_outcome("no_game");
         reply(client, from, id, error_reply("not_server")).await;
-        return;
+        return false;
     };
 
     let username = from.node().map(|n| n.to_string()).unwrap_or_default();
     if failures.get(&username).copied().unwrap_or(0) >= MAX_FAILURES {
         connection_data_outcome("banned");
         reply(client, from, id, error_reply("banned")).await;
-        return;
+        return false;
     }
 
     let (client_password, client_salt) = parse_request(payload);
@@ -116,7 +117,7 @@ pub async fn handle(
             tracing::error!(%error, "connection-data password hash failed");
             connection_data_outcome("error");
             reply(client, from, id, error_reply("invalid_password")).await;
-            return;
+            return false;
         }
     };
 
@@ -124,10 +125,11 @@ pub async fn handle(
         *failures.entry(username).or_insert(0) += 1;
         connection_data_outcome("wrong_password");
         reply(client, from, id, error_reply("invalid_password")).await;
-        return;
+        return false;
     }
 
     failures.remove(&username);
     connection_data_outcome("ok");
     reply(client, from, id, response_reply(public_ip, assignment.port)).await;
+    true
 }

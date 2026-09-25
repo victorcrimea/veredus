@@ -22,6 +22,7 @@ use crate::lobby::link::GameReport;
 use crate::lobby::link::GameToLobby;
 use crate::lobby::link::LobbyAuthToken;
 use crate::lobby::link::LobbyLink;
+use crate::lobby::link::LobbyToGame;
 use crate::metrics::GameMetrics;
 use crate::network_message::InboundNetworkMessage;
 use crate::network_message::OutboundNetworkMessage;
@@ -272,20 +273,22 @@ pub fn run_game_server(
         // ahead of the AUTHENTICATE it is meant to precede.
         if let Some(lobby) = &lobby {
             loop {
-                match lobby.auth_rx.try_recv() {
-                    Ok(LobbyAuthToken { username, token }) => {
-                        server = Some(
-                            server
-                                .take()
-                                .expect("server is always present")
-                                .handle(Input::LobbyAuth { username, token }),
-                        );
+                let input = match lobby.auth_rx.try_recv() {
+                    Ok(LobbyToGame::Auth(LobbyAuthToken { username, token })) => {
+                        Input::LobbyAuth { username, token }
                     }
+                    Ok(LobbyToGame::JoinerExpected) => Input::LobbyJoinerExpected,
                     Err(TryRecvError::Empty) => break,
                     // The account was released or the lobby side is gone; the
                     // game keeps running, just with no more auth prompts.
                     Err(TryRecvError::Disconnected) => break,
-                }
+                };
+                server = Some(
+                    server
+                        .take()
+                        .expect("server is always present")
+                        .handle(input),
+                );
             }
         }
 

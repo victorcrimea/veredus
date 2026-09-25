@@ -18,6 +18,14 @@ pub struct LobbyAuthToken {
     pub token: String,
 }
 
+pub enum LobbyToGame {
+    Auth(LobbyAuthToken),
+    // A lobby player was just handed the game's address, so its connection
+    // is about to arrive. Personal mode uses this to tell a lobby player on a
+    // trusted network from the initiator while the game is unlisted.
+    JoinerExpected,
+}
+
 // The map fields of Sec. 17.3's register attributes, derived from the
 // controller's GAME_SETTINGS (Sec. 5) once one has arrived. None until then:
 // a hostme game is listed before any settings exist.
@@ -107,7 +115,7 @@ impl LobbyMap {
 // The game-side half of a game's lobby channels, passed into
 // `run_game_server`. Each game owns its own pair (A5).
 pub struct LobbyLink {
-    pub auth_rx: std::sync::mpsc::Receiver<LobbyAuthToken>,
+    pub auth_rx: std::sync::mpsc::Receiver<LobbyToGame>,
     pub events_tx: tokio::sync::mpsc::UnboundedSender<GameToLobby>,
     // Personal mode only. The account's, not the game's: a rated result is
     // known only once the outcome replay is done, long after the game

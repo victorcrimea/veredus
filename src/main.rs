@@ -110,7 +110,7 @@ async fn main() {
     let result = match mode.lobby {
         Some(lobby_config) if lobby_config.personal.is_some() => {
             let base = Config {
-                initiator_addr: config.personal.trusted_address().ok(),
+                initiator_nets: config.personal.trusted_networks().ok(),
                 ..base
             };
             let resumable = pick_personal_resumable(&config, save.as_ref(), &base).await;

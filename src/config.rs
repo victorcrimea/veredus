@@ -13,6 +13,7 @@ use std::time::Duration;
 use chrono::TimeDelta;
 use documented::Documented;
 use documented::DocumentedFields;
+use ipnet::Ipv4Net;
 use serde::Deserialize;
 use serde::Serialize;
 use toml_edit::Decor;
@@ -250,7 +251,7 @@ impl LobbySection {
 }
 
 /// Personal mode: one player's own lobby account hosts their games, one
-/// after another. That player joins by direct IP from the trusted address,
+/// after another. That player joins by direct IP from a trusted network,
 /// and the game is listed in the lobby only while they are in it.
 #[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
 #[serde(default, deny_unknown_fields)]
@@ -261,10 +262,16 @@ pub struct PersonalSection {
     pub name: String,
     /// Your lobby password. Keep this file private.
     pub password: String,
-    /// The IPv4 address your own game client connects from. Only a client
-    /// from this address, playing under your name, is let in without lobby
-    /// authentication, and it becomes the host.
-    pub trusted_address: String,
+    /// The IPv4 networks your own game client connects from, in CIDR form
+    /// and separated by commas, for example "192.168.0.0/16,10.0.0.0/8". A
+    /// bare address counts as that one host. Only a client from one of
+    /// these networks, playing under your name, is let in without lobby
+    /// authentication, and it becomes the host. This applies only while you
+    /// are not in the game: once it is listed, clients from these networks
+    /// go through the lobby like everyone else. "0.0.0.0/0" trusts every
+    /// address, which is insecure: while you are away, anyone who knows your
+    /// name gets in as you.
+    pub trusted_networks: String,
     /// The address other players connect to.
     pub public_ip: String,
     /// Shown in the lobby game list.
@@ -299,7 +306,7 @@ impl Default for PersonalSection {
             enabled: false,
             name: String::new(),
             password: String::new(),
-            trusted_address: String::new(),
+            trusted_networks: "192.168.0.0/16,10.0.0.0/8".to_string(),
             public_ip: String::new(),
             server_name: crate::lobby::default_server_name(),
             game_password: String::new(),
@@ -314,13 +321,27 @@ impl Default for PersonalSection {
 }
 
 impl PersonalSection {
-    pub fn trusted_address(&self) -> Result<Ipv4Addr, String> {
-        self.trusted_address.parse().map_err(|error| {
-            format!(
-                "[personal] trusted_address '{}' is not an IPv4 address: {error}",
-                self.trusted_address
-            )
-        })
+    pub fn trusted_networks(&self) -> Result<Vec<Ipv4Net>, String> {
+        let networks = self
+            .trusted_networks
+            .split(',')
+            .map(str::trim)
+            .filter(|piece| !piece.is_empty())
+            .map(|piece| {
+                piece
+                    .parse::<Ipv4Net>()
+                    .or_else(|_| piece.parse::<Ipv4Addr>().map(Ipv4Net::from))
+                    .map_err(|_| {
+                        format!(
+                            "[personal] trusted_networks entry '{piece}' is not an IPv4 network or address"
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if networks.is_empty() {
+            return Err("[personal] is enabled but trusted_networks is empty".to_string());
+        }
+        Ok(networks)
     }
 
     // The fields default to empty only so the generated file can show them;
@@ -329,7 +350,6 @@ impl PersonalSection {
         for (key, value) in [
             ("name", &self.name),
             ("password", &self.password),
-            ("trusted_address", &self.trusted_address),
             ("public_ip", &self.public_ip),
             ("lobby_server", &self.lobby_server),
             ("muc_room", &self.muc_room),
@@ -340,7 +360,7 @@ impl PersonalSection {
                 return Err(format!("[personal] is enabled but {key} is empty"));
             }
         }
-        self.trusted_address()?;
+        self.trusted_networks()?;
         Ok(LobbyConfig {
             accounts: vec![XmppCredentials {
                 jid: format!("{}@{}", self.name, self.lobby_server),

@@ -213,7 +213,7 @@ impl GamePool {
             Some(setup) => {
                 let (tx, rx) = mpsc::channel::<SaveItem>();
                 let meta = BundleMeta {
-                    mode: if server_config.initiator_addr.is_some() {
+                    mode: if server_config.initiator_nets.is_some() {
                         Mode::Personal
                     } else if server_config.lobby_mode {
                         Mode::Lobby

@@ -47,7 +47,7 @@ use tracing::Instrument;
 use crate::lobby::connection_data::Assignment;
 use crate::lobby::link::GameReport;
 use crate::lobby::link::GameToLobby;
-use crate::lobby::link::LobbyAuthToken;
+use crate::lobby::link::LobbyToGame;
 
 // Spread out so the lobby server's TCP accept queue never sees every account
 // connect in the same instant.
@@ -155,7 +155,7 @@ pub enum LobbyEvent {
 // LobbyManager -> XMPP account task.
 enum AccountControl {
     Assign {
-        auth_tx: std::sync::mpsc::Sender<LobbyAuthToken>,
+        auth_tx: std::sync::mpsc::Sender<LobbyToGame>,
         events_rx: mpsc::UnboundedReceiver<GameToLobby>,
         port: u16,
         password_hash: String,
@@ -325,7 +325,7 @@ impl LobbyManager {
     pub fn assign(
         &self,
         account: usize,
-        auth_tx: std::sync::mpsc::Sender<LobbyAuthToken>,
+        auth_tx: std::sync::mpsc::Sender<LobbyToGame>,
         events_rx: mpsc::UnboundedReceiver<GameToLobby>,
         port: u16,
         password_hash: String,
@@ -458,7 +458,7 @@ fn reconnect_jitter(spread: Duration) -> Duration {
 
 // What this account knows about the game it currently hosts.
 struct Assigned {
-    auth_tx: std::sync::mpsc::Sender<LobbyAuthToken>,
+    auth_tx: std::sync::mpsc::Sender<LobbyToGame>,
     events_rx: mpsc::UnboundedReceiver<GameToLobby>,
     assignment: Assignment,
     // Sec. 17.4: scoped to this assignment, not the account's whole lifetime.
@@ -880,8 +880,12 @@ async fn handle_iq(
             ..
         } if payload.is("connectiondata", connection_data::NS_CONNECTIONDATA) => {
             let assigned_ref = assigned.as_mut().map(|a| (&a.assignment, &mut a.failures));
-            connection_data::handle(client, from, id, payload, assigned_ref, &config.public_ip)
-                .await;
+            let handed_out =
+                connection_data::handle(client, from, id, payload, assigned_ref, &config.public_ip)
+                    .await;
+            if handed_out && let Some(a) = assigned.as_ref() {
+                let _ = a.auth_tx.send(LobbyToGame::JoinerExpected);
+            }
         }
         Iq::Get {
             from: Some(from),
