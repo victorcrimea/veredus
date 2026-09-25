@@ -36,9 +36,9 @@ const DEFAULT_CHECKPOINT_INTERVAL_TURNS: u32 = 600;
 // How long a pooled-lobby game may sit with nobody ever having joined, or
 // with everybody gone, before it shuts itself down and frees its account.
 const DEFAULT_IDLE_SHUTDOWN_SECS: u64 = 60;
-// Loopback by default: the endpoint names players, so exposing it further is
-// a decision for the operator, not a default.
-const DEFAULT_METRICS_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+// Every interface, because a loopback endpoint inside a container cannot be
+// scraped from outside it.
+const DEFAULT_METRICS_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 const DEFAULT_METRICS_PORT: u16 = 9091;
 // The message header counts its length in 16 bits, so no packet larger than
 // this can hold a message; it is also the floor, since a lower cap would drop
@@ -415,9 +415,9 @@ impl SavesSection {
 #[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetricsSection {
-    /// Where the endpoint listens. Loopback by default: the endpoint
-    /// names players, so exposing it further is the operator's decision,
-    /// not a default.
+    /// Where the endpoint listens; every interface by default. The endpoint
+    /// names players, so on a public host firewall the port or set
+    /// 127.0.0.1.
     pub host: IpAddr,
     /// Port of the endpoint; 0 disables it.
     pub port: u16,

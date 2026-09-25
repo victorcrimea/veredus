@@ -53,7 +53,7 @@ struct Args {
     /// [default: 600]
     #[arg(long)]
     checkpoint_interval_turns: Option<u32>,
-    /// Bind address of the Prometheus /metrics endpoint [default: 127.0.0.1]
+    /// Bind address of the Prometheus /metrics endpoint [default: 0.0.0.0]
     #[arg(long)]
     metrics_host: Option<IpAddr>,
     /// Port of the Prometheus /metrics endpoint; 0 disables it [default: 9091]
