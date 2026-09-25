@@ -49,11 +49,13 @@ impl Slots {
     // client take over a slot left behind by a departed one. The UUID of the
     // entry that was displaced is returned, so a caller that keys per-match
     // state off the UUID can carry it over to the one now holding the slot.
-    pub fn add(&mut self, uuid: Guid, name: String, recover: bool) -> Option<Guid> {
+    // `shared` lets a slot be reclaimed while another client holds it, so a
+    // partner who dropped out of a shared slot gets it back.
+    pub fn add(&mut self, uuid: Guid, name: String, recover: bool, shared: bool) -> Option<Guid> {
         let mut slot = UNASSIGNED;
         let mut displaced = None;
 
-        if recover && let Some(index) = self.recoverable(&uuid, &name) {
+        if recover && let Some(index) = self.recoverable(&uuid, &name, shared) {
             let previous = self.entries.remove(index);
             slot = previous.slot;
             displaced = Some(previous.uuid);
@@ -70,10 +72,13 @@ impl Slots {
         displaced
     }
 
-    // By UUID first, then by name, and never a slot a connected player holds.
-    fn recoverable(&self, uuid: &Guid, name: &str) -> Option<usize> {
+    // By UUID first, then by name, and never a slot a connected player holds
+    // unless slots may be shared.
+    fn recoverable(&self, uuid: &Guid, name: &str, shared: bool) -> Option<usize> {
         let free = |slot: i8| {
-            slot == UNASSIGNED || !self.entries.iter().any(|e| e.connected && e.slot == slot)
+            shared
+                || slot == UNASSIGNED
+                || !self.entries.iter().any(|e| e.connected && e.slot == slot)
         };
 
         self.entries
@@ -112,6 +117,26 @@ impl Slots {
         if let Some(entry) = self.entries.iter_mut().find(|e| &e.uuid == uuid) {
             entry.slot = slot;
         }
+    }
+
+    // Unlike `assign`, the slot's current holder keeps it: both clients then
+    // command the same player.
+    pub fn share(&mut self, slot: i8, uuid: &Guid) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| &e.uuid == uuid) {
+            entry.slot = slot;
+        }
+    }
+
+    pub fn has_shared(&self) -> bool {
+        let held: Vec<i8> = self
+            .entries
+            .iter()
+            .filter(|e| e.connected && e.slot != UNASSIGNED)
+            .map(|e| e.slot)
+            .collect();
+        held.iter()
+            .enumerate()
+            .any(|(i, slot)| held[i + 1..].contains(slot))
     }
 
     pub fn reset_pregame(&mut self) {

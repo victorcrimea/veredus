@@ -288,6 +288,9 @@ Things people commonly change:
 - `[observers] delay_turns` sets how far behind observers watch
   (0 means live).
 - `[pause] budget_secs` limits how long each player may pause.
+- `[match] shared_slots` lets two people play one civilisation together:
+  the second joins as an observer, and in the game setup chat the player
+  types `!share <their name>`.
 
 The file runs from the settings most servers change to the ones almost none
 do; `[advanced]` at the end is best left alone. A config file written for an

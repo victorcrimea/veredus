@@ -77,6 +77,7 @@ use crate::relay::script_value::ScriptValue;
 use crate::relay::session::Admitted;
 use crate::relay::session::Role;
 use crate::relay::session::Session;
+use crate::relay::slots::PlayerSlot;
 use crate::relay::slots::STATUS_NOT_READY;
 use crate::relay::slots::Slots;
 use crate::relay::slots::UNASSIGNED;
@@ -134,6 +135,15 @@ const RESUME_COMMAND: &str = "!resume";
 // with, so it says so and refuses to start such a match.
 const RATING_NEEDS_SIDECAR: &str = "This server cannot report rated games: \
      it runs without pyrogenesis. Turn rating off to start the match.";
+
+// Every player's client reports a rated result, and the rating bot expects
+// one report per player, not two for a shared one.
+const RATING_NEEDS_OWN_SLOTS: &str = "A rated game cannot have a shared player. \
+     Turn rating off or unshare the slot to start the match.";
+
+// Typed in setup chat by a player, followed by an observer's name, when
+// `Config::shared_slots` is on.
+const SHARE_COMMAND: &str = "!share";
 
 // The per-slot fields that make a stock client register and run an AI.
 const AI_FIELDS: [&str; 3] = ["AI", "AIDiff", "AIBehavior"];
@@ -358,6 +368,9 @@ pub struct Config {
     // must also be lobby_host_name.
     pub controller_secret: String,
     pub allow_duplicate_names: bool,
+    // Lets a player hand its slot to an observer in setup with `!share`, so
+    // two clients play one civilisation together.
+    pub shared_slots: bool,
     pub late_observer_policy: LateObserverPolicy,
     pub observer_limit: usize,
     // None means an observer never blocks turn release.
@@ -511,6 +524,7 @@ impl Default for Config {
             server_password_hash: String::new(),
             controller_secret: String::new(),
             allow_duplicate_names: false,
+            shared_slots: false,
             late_observer_policy: LateObserverPolicy::default(),
             observer_limit: 8,
             observer_lag_limit: None,
@@ -1088,23 +1102,31 @@ impl Context {
     // until its client is back in-game, so a rejoiner cannot stall the
     // others in sync for free, and a player whose quota is spent is let go.
     fn afk_absent(&self) -> Vec<Guid> {
+        let away = |e: &PlayerSlot| {
+            let session = self
+                .sessions
+                .values()
+                .find(|s| s.uuid.as_ref() == Some(&e.uuid));
+            match session {
+                None => true,
+                Some(s) if !e.connected || !s.is_in_game() => true,
+                Some(s) => s.since_last_received > AFK_SILENCE_LIMIT,
+            }
+        };
+        // A shared player is still being played while any partner is here.
+        let partner_here = |e: &PlayerSlot| {
+            self.slots
+                .entries()
+                .any(|o| o.slot == e.slot && o.uuid != e.uuid && !away(o))
+        };
         self.slots
             .entries()
             .filter(|e| e.slot != UNASSIGNED)
             .filter(|e| !self.forfeited.contains(&e.uuid))
             .filter(|e| !self.resigned.contains(&i32::from(e.slot)))
             .filter(|e| self.pause_budget.remaining(&e.uuid) > TimeDelta::zero())
-            .filter(|e| {
-                let session = self
-                    .sessions
-                    .values()
-                    .find(|s| s.uuid.as_ref() == Some(&e.uuid));
-                match session {
-                    None => true,
-                    Some(s) if !e.connected || !s.is_in_game() => true,
-                    Some(s) => s.since_last_received > AFK_SILENCE_LIMIT,
-                }
-            })
+            .filter(|e| away(e))
+            .filter(|e| !partner_here(e))
             .map(|e| e.uuid.clone())
             .collect()
     }
@@ -2646,6 +2668,7 @@ impl<S: PhaseMarker> Server<S> {
             uuid.clone(),
             name,
             matches!(S::PHASE, Phase::InGame | Phase::Resuming),
+            self.ctx.config.shared_slots,
         );
         if let Some(old) = displaced {
             self.ctx.pause_budget.inherit(&old, &uuid);
@@ -3709,6 +3732,14 @@ impl Server<Setup> {
     }
 
     fn on_message(mut self, peer: PeerID, msg: WireMessage) -> AnyServer {
+        if let WireMessage::Chat(chat) = &msg
+            && self.ctx.config.shared_slots
+            && let Some(name) = share_command_target(&chat.message)
+        {
+            let name = name.to_string();
+            self.on_share_command(peer, &name);
+            return self.into();
+        }
         let Some(msg) = self.on_setup_message(peer, msg) else {
             return self.into();
         };
@@ -3728,6 +3759,46 @@ impl Server<Setup> {
         self.into()
     }
 
+    fn on_share_command(&mut self, peer: PeerID, name: &str) {
+        let Ok(uuid) = self.ctx.speaker(peer, Session::is_setup) else {
+            return;
+        };
+        let slot = self.ctx.slots.slot_of(&uuid).unwrap_or(UNASSIGNED);
+        if slot == UNASSIGNED {
+            self.ctx
+                .server_chat(Some(peer), "Only a player can share its slot.");
+            return;
+        }
+        let target = self
+            .ctx
+            .sessions
+            .iter()
+            .find(|(_, s)| s.is_setup() && s.name() == Some(name))
+            .and_then(|(p, s)| Some((*p, s.uuid.clone()?)));
+        let Some((target, target_uuid)) = target.filter(|(p, u)| {
+            *p != peer && !self.ctx.is_ai_host(*p) && !self.ctx.is_ai_host_uuid(u)
+        }) else {
+            self.ctx
+                .server_chat(Some(peer), &format!("There is no observer called {name}."));
+            return;
+        };
+        if self.ctx.slots.slot_of(&target_uuid) != Some(UNASSIGNED) {
+            self.ctx.server_chat(
+                Some(peer),
+                &format!("{name} already plays; only an observer can share your slot."),
+            );
+            return;
+        }
+        tracing::info!(?peer, ?target, slot, "slot shared");
+        self.ctx.slots.share(slot, &target_uuid);
+        self.broadcast_player_slots();
+        let owner = self.ctx.name_of(&uuid).unwrap_or_default();
+        self.ctx.server_chat(
+            None,
+            &format!("{name} now plays player {slot} together with {owner}."),
+        );
+    }
+
     // None means the start was rejected or ignored and nothing was sent.
     fn on_start_settings(&mut self, peer: PeerID, msg: StartSettings) -> Option<StartOutcome> {
         if self.ctx.require_controller(peer).is_err() {
@@ -3743,6 +3814,11 @@ impl Server<Setup> {
         if self.ctx.rating_unreportable() && game_report::is_rated(&msg.init_attributes) {
             tracing::warn!(?peer, "start rejected: {RATING_NEEDS_SIDECAR}");
             self.ctx.server_chat(Some(peer), RATING_NEEDS_SIDECAR);
+            return None;
+        }
+        if self.ctx.slots.has_shared() && game_report::is_rated(&msg.init_attributes) {
+            tracing::info!(?peer, "start rejected: {RATING_NEEDS_OWN_SLOTS}");
+            self.ctx.server_chat(Some(peer), RATING_NEEDS_OWN_SLOTS);
             return None;
         }
 
@@ -5364,6 +5440,14 @@ fn has_ai_players(json: &[u8]) -> bool {
 
 fn is_resume_command(message: &str) -> bool {
     message.trim().eq_ignore_ascii_case(RESUME_COMMAND)
+}
+
+fn share_command_target(message: &str) -> Option<&str> {
+    let (command, name) = message.trim().split_once(' ')?;
+    command
+        .eq_ignore_ascii_case(SHARE_COMMAND)
+        .then(|| name.trim())
+        .filter(|n| !n.is_empty())
 }
 
 // A duration as the chat line announcing it reads it.

@@ -375,6 +375,10 @@ pub struct MatchSection {
     /// When set, two clients may play under the same name outside lobby
     /// mode.
     pub allow_duplicate_names: bool,
+    /// When set, a player can type `!share <name>` in the game setup chat
+    /// to let that observer control the same player together with them.
+    /// Rated games cannot start with a shared player.
+    pub shared_slots: bool,
     /// How long a decided match keeps running for the players who stay
     /// to watch or chat before the game shuts down.
     pub post_game_linger_secs: u64,
@@ -389,6 +393,7 @@ impl Default for MatchSection {
             welcome_message: config.welcome_message,
             controller_secret: config.controller_secret,
             allow_duplicate_names: config.allow_duplicate_names,
+            shared_slots: config.shared_slots,
             post_game_linger_secs: delta_to_secs(config.post_game_linger),
         }
     }
@@ -852,6 +857,7 @@ impl FileConfig {
             turn_length_ms: advanced.turn_length_ms,
             controller_secret: game_match.controller_secret.clone(),
             allow_duplicate_names: game_match.allow_duplicate_names,
+            shared_slots: game_match.shared_slots,
             late_observer_policy: observers.policy.into(),
             observer_limit: observers.limit,
             observer_lag_limit: (advanced.observer_lag_limit != 0)
