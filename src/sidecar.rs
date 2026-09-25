@@ -1046,14 +1046,23 @@ fn write_commands_txt(
             context: format!("writing {}", path.display()),
             error,
         })?;
+        let turn_start = idx;
         while idx < request.commands.len() && request.commands[idx].turn == wire_turn {
-            writeln!(out, "cmd {} {}", request.commands[idx].player, decoded[idx]).map_err(
+            idx += 1;
+        }
+        // Clients run a turn's commands by sender client id, each sender's in
+        // the order sent, whatever order they reached the relay in. Arrival
+        // order lets the replay drift from the live match whenever two
+        // clients' commands in one turn interact.
+        let mut order: Vec<usize> = (turn_start..idx).collect();
+        order.sort_by_key(|&i| request.commands[i].client);
+        for i in order {
+            writeln!(out, "cmd {} {}", request.commands[i].player, decoded[i]).map_err(
                 |error| SidecarError::Io {
                     context: format!("writing {}", path.display()),
                     error,
                 },
             )?;
-            idx += 1;
         }
         writeln!(out, "end").map_err(|error| SidecarError::Io {
             context: format!("writing {}", path.display()),
