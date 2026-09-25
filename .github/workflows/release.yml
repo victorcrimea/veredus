@@ -8,7 +8,71 @@ permissions:
   contents: write
 
 jobs:
+  # Fails a tag in seconds, before the long builds, when Cargo.toml or
+  # CHANGELOG.md was not prepared for it.
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the version and extract the changelog
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [[ "$cargo_version" != "$version" ]]; then
+            echo "::error::Cargo.toml version $cargo_version does not match tag $GITHUB_REF_NAME"
+            exit 1
+          fi
+          # A plain string match, so the dots and a -rc suffix need no escaping.
+          awk -v head="## [$version]" '
+            index($0, head) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > section.md
+          if ! grep -q '[^[:space:]]' section.md; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+          {
+            cat section.md
+            echo
+            echo "---"
+            echo
+            cat <<'EOF'
+          Works with 0 A.D. 0.28.0 clients.
+
+          | Download | For |
+          |---|---|
+          | `x86_64-unknown-linux-musl` | Linux on x86_64, any distribution (static) |
+          | `aarch64-unknown-linux-musl` | Linux on ARM64, any distribution (static) |
+          | `x86_64-unknown-linux-gnu` | Linux on x86_64 with glibc |
+          | `x86_64-pc-windows-msvc` | Windows 10/11 and Server, 64-bit |
+
+          The Linux downloads also come as `-sidecar` archives, which add a
+          ready-to-run sidecar (hosted AI, rejoin snapshots, match results):
+          0 A.D. 0.28.0 with the patches in `sidecar/`, in the `sidecar`
+          folder, and a `config.toml` that points the server at it: start
+          `./veredus` from the archive folder.
+          The sidecar needs glibc 2.36 or newer (Debian 12, Ubuntu 24.04 or
+          later), also in the musl archives. There is no Windows sidecar
+          yet. Its source is `sidecar/patches` and 0 A.D.'s v0.28.0 tag, see
+          `sidecar/SOURCE.txt` in the archive.
+
+          Docker images for x86_64 and ARM64:
+          `ghcr.io/victorcrimea/veredus` and, with the sidecar,
+          `ghcr.io/victorcrimea/veredus:latest-sidecar`.
+          EOF
+          } > notes.md
+          cat notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: notes.md
+
   build:
+    needs: notes
     strategy:
       fail-fast: false
       matrix:
@@ -91,6 +155,7 @@ jobs:
             veredus-*.sha256
 
   sidecar:
+    needs: notes
     uses: ./.github/workflows/sidecar.yml
     with:
       upload: true
@@ -230,7 +295,7 @@ jobs:
           labels: ${{ steps.sidecar.outputs.labels }}
 
   release:
-    needs: [build, package-sidecar]
+    needs: [notes, build, package-sidecar]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -238,34 +303,16 @@ jobs:
           pattern: release-*
           merge-multiple: true
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: notes
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
-          generate_release_notes: true
-          body: |
-            Works with 0 A.D. 0.28.0 clients.
-
-            | Download | For |
-            |---|---|
-            | `x86_64-unknown-linux-musl` | Linux on x86_64, any distribution (static) |
-            | `aarch64-unknown-linux-musl` | Linux on ARM64, any distribution (static) |
-            | `x86_64-unknown-linux-gnu` | Linux on x86_64 with glibc |
-            | `x86_64-pc-windows-msvc` | Windows 10/11 and Server, 64-bit |
-
-            The Linux downloads also come as `-sidecar` archives, which add a
-            ready-to-run sidecar (hosted AI, rejoin snapshots, match results):
-            0 A.D. 0.28.0 with the patches in `sidecar/`, in the `sidecar`
-            folder, and a `config.toml` that points the server at it: start
-            `./veredus` from the archive folder.
-            The sidecar needs glibc 2.36 or newer (Debian 12, Ubuntu 24.04 or
-            later), also in the musl archives. There is no Windows sidecar
-            yet. Its source is `sidecar/patches` and 0 A.D.'s v0.28.0 tag, see
-            `sidecar/SOURCE.txt` in the archive.
-
-            Docker images for x86_64 and ARM64:
-            `ghcr.io/victorcrimea/veredus` and, with the sidecar,
-            `ghcr.io/victorcrimea/veredus:latest-sidecar`.
+          body_path: notes/notes.md
           files: |
             veredus-*.tar.gz
             veredus-*.zip
