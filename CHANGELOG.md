@@ -3,6 +3,69 @@
 What changed in each Veredus release, for people running the server.
 The newest release is first.
 
+## [0.4.0] - 2026-09-25
+
+Changes since 0.3.0, including the 0.3.x patch releases.
+
+### Changed
+- **Breaking:** The config file is split into topic tables, ordered from the
+  settings you are most likely to edit to the least: `[server]`, `[lobby]`,
+  `[personal]`, `[match]`, `[observers]`, `[pause]`, `[saves]`, `[metrics]`,
+  `[log]`, `[sidecar]`, `[limits]`, `[timeouts]`, `[advanced]`. A config
+  file from 0.3.0 is refused. Regenerate it with `--gen-config` and copy
+  your values across. Command line flags are unchanged.
+- **Breaking:** The server no longer assumes a sidecar. Pass
+  `--pyrogenesis-path` (or set it in `[sidecar]`) to use one. The `-sidecar`
+  downloads come with a `config.toml` that already points at their bundled
+  sidecar, so `./veredus` alone starts with it.
+- **Breaking:** Metrics now listen on every interface by default, so they
+  can be scraped from outside a container. Firewall port 9091, or set
+  `[metrics] host` to `127.0.0.1` to keep them local.
+- **Breaking:** A match saved by 0.3.0 without the sidecar cannot be
+  resumed. Finish those matches before you upgrade, or start fresh with
+  `--no-resume`.
+- Without the sidecar, the server now asks a player's game for a copy of
+  the match every 2 minutes by default (`[saves]
+  client_state_interval_secs`, 0 turns it off). Rejoining players are
+  served that copy, so a rejoin no longer pauses a player's game.
+- A lobby game only lets others in after the player who typed `hostme` has
+  joined.
+- With AI opponents, when every human has left or stopped, the match waits
+  for the remaining clients instead of the AI playing on at full speed.
+
+### Added
+- Personal mode (`--personal`, `[personal]` table): the server logs in with
+  your own lobby account and hosts one game after another on `--port`. You
+  join by IP from one of `[personal] trusted_networks` and become host; the
+  game is listed in the lobby only while you are in it. Rated 1v1 games are
+  reported to the lobby (needs the sidecar). On first start you are asked to
+  accept the lobby's terms, as the game itself does.
+- Shared player slots (`[match] shared_slots`, off by default): during
+  setup a player types `!share <name>` so that observer controls the same
+  civilisation.
+- Lobby hosting resumes every saved lobby match after a restart, each on a
+  free lobby account, and lists it again at once.
+- Matches with AI opponents survive a restart, and an AI that crashes or
+  drops mid-match is restarted and caught up while the players wait
+  (`[sidecar] ai_heal_attempts`, `ai_heal_timeout_secs`,
+  `ai_state_interval_turns`).
+- With the sidecar and `--outcome-dir`, each finished match also gets a
+  replay folder the game can play.
+- A match saved with the sidecar can be resumed on a server without one.
+- Docker images on ghcr.io, with and without the sidecar.
+- `--gen-config` shows example lobby accounts.
+
+### Fixed
+- Replays, results, checkpoints and resumed matches could drift from the
+  game actually played when two players' orders in one turn interacted
+  (most turns with AI opponents).
+- A finished match with AI opponents was taken for an AI crash and kept as
+  stopped, with no result or replay.
+- `hostme` from the stock game was ignored, and a fresh lobby game was not
+  listed until somebody joined it.
+- The save was not written safely to disk while a match was being played,
+  so a power loss could lose more than the last second.
+
 ## [0.3.4] - 2026-09-25
 
 The first release with a changelog. This entry lists everything the server
