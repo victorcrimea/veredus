@@ -4,7 +4,16 @@ name: Sidecar
 # v0.28.0 and compile: nothing is uploaded, because an artifact on a public
 # repo is a binary release. The release workflow calls it with upload set,
 # and then it also stages a relocatable sidecar tree for the archives.
+#
+# It also runs on master when the sidecar changes, because a cache saved by a
+# release tag is visible only to that tag, while one saved on master is
+# visible to every tag: without this, each release rebuilds SpiderMonkey.
 on:
+  push:
+    branches: [master]
+    paths:
+      - "sidecar/**"
+      - ".github/workflows/sidecar.yml"
   workflow_dispatch:
   workflow_call:
     inputs:
