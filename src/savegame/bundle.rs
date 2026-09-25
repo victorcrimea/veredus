@@ -39,6 +39,7 @@ pub const LOCK: &str = "lock";
 pub enum Mode {
     Standalone,
     Lobby,
+    Personal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

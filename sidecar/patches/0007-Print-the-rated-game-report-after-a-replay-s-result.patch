@@ -1,0 +1,249 @@
+From ae38e320f655664c55a56574bb100f24a6dfeb4a Mon Sep 17 00:00:00 2001
+From: Viktor Semenov <suit.uanic@gmail.com>
+Date: Fri, 25 Sep 2026 14:09:00 +0000
+Subject: [PATCH 7/7] Print the rated game report after a replay's result
+
+A replay now also prints REPLAY_REPORT, the game report the lobby client
+sends the rating bot at the end of a match, so a dedicated server can send
+it on a player's behalf. It is built by the session's own
+LobbyRatingReporter, loaded unchanged into a script interface next to the
+simulation's, with the few engine calls it makes answered from the final
+state. playerID is left out: the report is the same for every player but
+for it, and the server fills it in for the player it reports for.
+
+The conversion of the report into stanza attributes, renames included,
+moves from XmppClient into GameReportAttributes.h, header-only and free of
+gloox, so the replay produces exactly the attributes the lobby client
+sends without linking the lobby.
+---
+ source/lobby/GameReportAttributes.h | 61 ++++++++++++++++++++++
+ source/lobby/XmppClient.cpp         | 21 ++------
+ source/ps/Replay.cpp                | 81 +++++++++++++++++++++++++++++
+ 3 files changed, 145 insertions(+), 18 deletions(-)
+ create mode 100644 source/lobby/GameReportAttributes.h
+
+diff --git a/source/lobby/GameReportAttributes.h b/source/lobby/GameReportAttributes.h
+new file mode 100644
+index 0000000000..815cce09bd
+--- /dev/null
++++ b/source/lobby/GameReportAttributes.h
+@@ -0,0 +1,61 @@
++/* Copyright (C) 2026 Wildfire Games.
++ * This file is part of 0 A.D.
++ *
++ * 0 A.D. is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * 0 A.D. is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with 0 A.D.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef INCLUDED_GAMEREPORTATTRIBUTES
++#define INCLUDED_GAMEREPORTATTRIBUTES
++
++#include "lib/utf8.h"
++#include "scriptinterface/Object.h"
++#include "scriptinterface/ScriptRequest.h"
++
++#include <map>
++#include <string>
++#include <utility>
++#include <vector>
++
++/**
++ * The attributes of the game report stanza, from the report object the
++ * session's LobbyRatingReporter builds. Header-only and free of gloox, so
++ * a dedicated server's replay sidecar can produce exactly the report the
++ * lobby client sends without linking the lobby.
++ */
++inline std::vector<std::pair<std::string, std::string>> GameReportAttributes(
++	const ScriptRequest& rq, JS::HandleValue data)
++{
++	std::vector<std::string> properties;
++	Script::EnumeratePropertyNames(rq, data, true, properties);
++
++	// https://gitea.wildfiregames.com/0ad/0ad/issues/8687
++	const std::map<std::string, std::string> mappings{
++		{ "civilianUnitsLost", "femaleCitizenUnitsLost" },
++		{ "civilianUnitsTrained", "femaleCitizenUnitsTrained" },
++		{ "enemyCivilianUnitsKilled", "enemyFemaleCitizenUnitsKilled"}
++	};
++	std::vector<std::pair<std::string, std::string>> attributes;
++	for (const std::string& p : properties)
++	{
++		std::wstring value;
++		Script::GetProperty(rq, data, p.c_str(), value);
++		if (mappings.contains(p))
++			attributes.emplace_back(mappings.at(p), utf8_from_wstring(value));
++		else
++			attributes.emplace_back(p, utf8_from_wstring(value));
++	}
++	return attributes;
++}
++
++#endif // INCLUDED_GAMEREPORTATTRIBUTES
+diff --git a/source/lobby/XmppClient.cpp b/source/lobby/XmppClient.cpp
+index 4641821462..a75f9c5d92 100644
+--- a/source/lobby/XmppClient.cpp
++++ b/source/lobby/XmppClient.cpp
+@@ -23,6 +23,7 @@
+ #include "i18n/L10n.h"
+ #include "lib/external_libraries/gloox.h"
+ #include "lib/utf8.h"
++#include "lobby/GameReportAttributes.h"
+ #include "lobby/IXmppClient.h"
+ #include "network/NetClient.h"
+ #include "network/NetServer.h"
+@@ -392,24 +393,8 @@ void XmppClient::SendIqGameReport(const ScriptRequest& rq, JS::HandleValue data)
+ 	gloox::Tag* report = new gloox::Tag("game");
+ 
+ 	// Iterate through all the properties reported and add them to the stanza.
+-	std::vector<std::string> properties;
+-	Script::EnumeratePropertyNames(rq, data, true, properties);
+-
+-	// https://gitea.wildfiregames.com/0ad/0ad/issues/8687
+-	const std::map<std::string, std::string> mappings{
+-		{ "civilianUnitsLost", "femaleCitizenUnitsLost" },
+-		{ "civilianUnitsTrained", "femaleCitizenUnitsTrained" },
+-		{ "enemyCivilianUnitsKilled", "enemyFemaleCitizenUnitsKilled"}
+-	};
+-	for (const std::string& p : properties)
+-	{
+-		std::wstring value;
+-		Script::GetProperty(rq, data, p.c_str(), value);
+-		if (mappings.contains(p))
+-			report->addAttribute(mappings.at(p), utf8_from_wstring(value));
+-		else
+-			report->addAttribute(p, utf8_from_wstring(value));
+-	}
++	for (const auto& [name, value] : GameReportAttributes(rq, data))
++		report->addAttribute(name, value);
+ 
+ 	// Add stanza to IQ
+ 	game->m_GameReport.emplace_back(report);
+diff --git a/source/ps/Replay.cpp b/source/ps/Replay.cpp
+index f936da63ef..4dcd6d3339 100644
+--- a/source/ps/Replay.cpp
++++ b/source/ps/Replay.cpp
+@@ -24,12 +24,15 @@
+ #include "lib/debug.h"
+ #include "lib/external_libraries/zlib.h"
+ #include "lib/file/file_system.h"
++#include "lib/file/vfs/vfs_util.h"
+ #include "lib/path.h"
+ #include "lib/timer.h"
++#include "lobby/GameReportAttributes.h"
+ #include "ps/CLogger.h"
+ #include "ps/CStr.h"
+ #include "ps/Compress.h"
+ #include "ps/Errors.h"
++#include "ps/Filesystem.h"
+ #include "ps/Game.h"
+ #include "ps/GameSetup/CmdLineArgs.h"
+ #include "ps/GameSetup/GameSetup.h"
+@@ -42,6 +45,8 @@
+ #include "ps/Pyrogenesis.h"
+ #include "ps/Util.h"
+ #include "ps/VisualReplay.h"
++#include "ps/scripting/JSInterface_VFS.h"
++#include "scriptinterface/FunctionWrapper.h"
+ #include "scriptinterface/JSON.h"
+ #include "scriptinterface/Object.h"
+ #include "scriptinterface/ScriptContext.h"
+@@ -199,6 +204,81 @@ void CheckReplayMods(const std::vector<Mod::ModData>& replayMods)
+ 		LOGWARNING("Incompatible replay mods detected.\nThe mods of the replay are:\n%s\nThese mods are enabled:\n%s",
+ 			ModListToString(replayData), ModListToString(g_Mods.GetEnabledModsData()));
+ }
++
++/**
++ * Runs the session's own LobbyRatingReporter outside a session, standing in
++ * for the engine calls it makes, so the report is built exactly as the
++ * lobby client builds it. The report is the same for every player but for
++ * playerID, which is left for the dedicated server to fill in for the
++ * player it reports for.
++ */
++constexpr const char* RATING_REPORT_SCRIPT = R"(
++function BuildRatingReport(metadata, initAttributes)
++{
++	globalThis.g_InitAttributes = initAttributes;
++	globalThis.g_ResourceData = new Resources();
++	let report;
++	Engine.GetPlayerID = () => -1;
++	Engine.GuiInterfaceCall = () => ({
++		"timeElapsed": metadata.timeElapsed,
++		"players": metadata.playerStates
++	});
++	Engine.SendGameReport = data => { report = data; };
++	LobbyRatingReporter.prototype.onPlayersFinished([]);
++	if (report)
++		delete report.playerID;
++	return report;
++}
++)";
++
++/**
++ * Prints the game report the lobby client sends the rating bot at the end of
++ * a match, so a dedicated server can send it on a player's behalf. Printed
++ * next to every result; whether the match is rated is the server's call.
++ */
++void PrintRatingReport(const ScriptInterface& simInterface, JS::HandleValue metadata)
++{
++	// A neighbor of the simulation's interface, so the final state is read in
++	// place rather than cloned.
++	ScriptInterface scriptInterface("Engine", "RatingReport", simInterface);
++	ScriptRequest rq(scriptInterface);
++	JSI_VFS::RegisterScriptFunctions_ReadOnlySimulation(rq);
++
++	VfsPaths reportParts;
++	if (vfs::GetPathnames(g_VFS, L"gui/session/lobby/LobbyRatingReport/", L"*.js", reportParts) != INFO::OK)
++	{
++		LOGERROR("Could not list the rating report scripts");
++		return;
++	}
++	bool loaded = scriptInterface.LoadGlobalScripts() &&
++		scriptInterface.LoadGlobalScriptFile(L"gui/session/lobby/LobbyRatingReporter.js");
++	for (const VfsPath& path : reportParts)
++		loaded = loaded && scriptInterface.LoadGlobalScriptFile(path);
++	loaded = loaded && scriptInterface.LoadGlobalScript(L"sidecar/RatingReport.js", RATING_REPORT_SCRIPT);
++	if (!loaded)
++	{
++		LOGERROR("Could not load the rating reporter");
++		return;
++	}
++
++	JS::RootedValue initAttributes(rq.cx);
++	g_Game->GetSimulation2()->GetInitAttributes(&initAttributes);
++	JS::RootedValue global(rq.cx, rq.globalValue());
++	JS::RootedValue report(rq.cx);
++	if (!ScriptFunction::Call(rq, global, "BuildRatingReport", &report, metadata, initAttributes) ||
++		!report.isObject())
++	{
++		LOGERROR("Could not build the rating report");
++		return;
++	}
++
++	JS::RootedValue attributes(rq.cx);
++	Script::CreateObject(rq, &attributes);
++	for (const auto& [name, value] : GameReportAttributes(rq, report))
++		Script::SetProperty(rq, attributes, name.c_str(), value);
++	std::cout << "REPLAY_REPORT " << Script::StringifyJSON(rq, &attributes, false) << "\n";
++	std::cout.flush();
++}
+ } // anonymous namespace
+ 
+ void CReplayPlayer::Replay(const bool serializationtest, const int rejointestturn, const bool ooslog, const bool testHashFull, const bool testHashQuick,
+@@ -424,6 +504,7 @@ void CReplayPlayer::Replay(const bool serializationtest, const int rejointesttur
+ 			// that, so this writes to stdout directly instead.
+ 			std::cout << "REPLAY_RESULT " << Script::StringifyJSON(rq, &metadata, false) << "\n";
+ 			std::cout.flush();
++			PrintRatingReport(g_Game->GetSimulation2()->GetScriptInterface(), metadata);
+ 		}
+ 		else
+ 			LOGERROR("Could not get replay result: GuiInterface component missing!");

@@ -1,7 +1,7 @@
 From efba8d1b561d48fe1ae15aa3ccff8d52efef8f8e Mon Sep 17 00:00:00 2001
 From: Viktor Semenov <suit.uanic@gmail.com>
 Date: Tue, 22 Sep 2026 00:49:47 +0000
-Subject: [PATCH 5/6] Host AI in a headless sidecar client and add sidecar
+Subject: [PATCH 5/7] Host AI in a headless sidecar client and add sidecar
  replay debug modes
 
 Adds -autostart-ai-host: a headless client that joins over the network,

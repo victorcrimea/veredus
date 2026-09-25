@@ -36,6 +36,7 @@ use crate::relay::turn::needs_full_hash;
 
 const DECODE_ERROR_MARKER: &str = "{\"__decode_error__\":true}";
 const REPLAY_RESULT_PREFIX: &str = "REPLAY_RESULT ";
+const REPLAY_REPORT_PREFIX: &str = "REPLAY_REPORT ";
 
 // How often a running engine step is polled for exit. Short enough that a
 // cancelled run dies promptly, long enough that the dump thread spends its
@@ -395,6 +396,11 @@ pub struct ReplayResult {
     pub time_elapsed: f64,
     #[serde(rename = "playerStates", default)]
     pub player_states: Vec<PlayerState>,
+    // The rated-game report the engine builds next to the result, as a JSON
+    // object of the stanza's attributes without playerID. Opaque here (A6);
+    // None from an engine that does not print one.
+    #[serde(skip)]
+    pub report: Option<String>,
 }
 
 // Indexed by player id, so entry 0 is Gaia.
@@ -949,7 +955,11 @@ fn parse_result(output: &std::process::Output) -> Result<(ReplayResult, String),
         .lines()
         .find_map(|line| line.strip_prefix(REPLAY_RESULT_PREFIX))
         .ok_or(SidecarError::NoResult)?;
-    let result = serde_json::from_str(line).map_err(SidecarError::ResultJson)?;
+    let mut result: ReplayResult = serde_json::from_str(line).map_err(SidecarError::ResultJson)?;
+    result.report = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(REPLAY_REPORT_PREFIX))
+        .map(str::to_string);
     Ok((result, line.to_string()))
 }
 
@@ -1152,7 +1162,7 @@ fn run_logged(
     for line in String::from_utf8_lossy(&stdout).lines() {
         // The result line runs to tens of kilobytes, past what a log sink
         // accepts as one line; the caller reports it in its own terms.
-        if line.starts_with(REPLAY_RESULT_PREFIX) {
+        if line.starts_with(REPLAY_RESULT_PREFIX) || line.starts_with(REPLAY_REPORT_PREFIX) {
             continue;
         }
         tracing::debug!(step, "sidecar: {line}");

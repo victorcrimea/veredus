@@ -12,6 +12,7 @@ use chrono::TimeDelta;
 use chrono::Utc;
 
 use crate::enet::PeerID;
+use crate::lobby::game_report;
 use crate::lobby::link::LobbyMap;
 use crate::relay::auth;
 use crate::relay::auth::LateObserverPolicy;
@@ -72,6 +73,7 @@ use crate::relay::pause_budget::PauseBudget;
 use crate::relay::rate_limit::Limits;
 use crate::relay::rate_limit::Verdict;
 use crate::relay::script_value;
+use crate::relay::script_value::ScriptValue;
 use crate::relay::session::Admitted;
 use crate::relay::session::Role;
 use crate::relay::session::Session;
@@ -127,6 +129,11 @@ const RESUME_HINT_INTERVAL: TimeDelta = TimeDelta::seconds(30);
 // Typed in chat, this restarts a resumed match. A stock client sends a line
 // starting with "!" as ordinary chat, unlike one starting with "/".
 const RESUME_COMMAND: &str = "!resume";
+
+// Personal mode without a sidecar has nothing to work a rated result out
+// with, so it says so and refuses to start such a match.
+const RATING_NEEDS_SIDECAR: &str = "This server cannot report rated games: \
+     it runs without pyrogenesis. Turn rating off to start the match.";
 
 // The per-slot fields that make a stock client register and run an AI.
 const AI_FIELDS: [&str; 3] = ["AI", "AIDiff", "AIBehavior"];
@@ -206,6 +213,10 @@ pub enum Effect {
         nbp: u32,
         players: String,
     },
+    // Personal mode: the initiator left, so the game comes off the list until
+    // they are back, when a LobbyListing (and LobbyStarted once the match
+    // runs) lists it again.
+    LobbyUnlisted,
     // The idle-shutdown timeout elapsed (A7). The game thread reacts by
     // shutting every session down and returning.
     GameOver,
@@ -383,6 +394,12 @@ pub struct Config {
     // the only account that may become controller, since a stock client has
     // no secret to prove it is the host with.
     pub lobby_host_name: String,
+    // Some selects personal mode, where the lobby account is the initiator's
+    // own: lobby_host_name is that player, who joins by direct IP from this
+    // address and is let in without lobby authentication or the password.
+    // The game is listed only while they are in it, and a rated start is
+    // refused without a sidecar, which the rated report needs.
+    pub initiator_addr: Option<Ipv4Addr>,
     // When set, a joiner no live client can serve gets its snapshot from a
     // one-shot pyrogenesis instead of being dropped, and a match that ran is
     // replayed for its outcome once it ends. The IO side owns the actual
@@ -507,6 +524,7 @@ impl Default for Config {
             afk_pause: true,
             idle_shutdown: None,
             lobby_host_name: String::new(),
+            initiator_addr: None,
             sidecar_dumps: false,
             hosted_ai: false,
             checkpoint_interval_turns: 0,
@@ -649,6 +667,9 @@ pub(crate) struct Context {
     // (Sec. 17.3). None until the controller has sent one; a decode failure
     // keeps whatever was last decoded rather than clearing it.
     lobby_map: Option<LobbyMap>,
+    // Whether the controller's latest GAME_SETTINGS asks for a rated match,
+    // so the warning that it cannot be reported is given once per change.
+    rating_enabled: bool,
     // The slot table as last saved. None until the match starts saving, so
     // no snapshot is taken of a table that is not a match yet.
     saved_slots: Option<SlotsSnapshot>,
@@ -882,7 +903,39 @@ impl Context {
             .unwrap_or_else(|| self.config.lobby_host_name.clone())
     }
 
+    fn is_initiator(&self, session: &Session) -> bool {
+        self.config.initiator_addr.is_some()
+            && session.admitted.is_some()
+            && session
+                .lobby_name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&self.config.lobby_host_name))
+    }
+
+    // In personal mode the game is listed only while its initiator is in it.
+    fn lobby_hidden(&self) -> bool {
+        self.config.initiator_addr.is_some()
+            && !self.sessions.values().any(|s| self.is_initiator(s))
+    }
+
+    // A rated match is reported from the outcome replay, so personal mode
+    // refuses to start one that nothing could report.
+    fn rating_unreportable(&self) -> bool {
+        self.config.initiator_addr.is_some() && !self.config.sidecar_dumps
+    }
+
+    fn push_lobby_started(&mut self) {
+        if self.lobby_hidden() {
+            return;
+        }
+        let (nbp, players) = self.lobby_counts();
+        self.effects.push(Effect::LobbyStarted { nbp, players });
+    }
+
     fn push_lobby_listing(&mut self) {
+        if self.lobby_hidden() {
+            return;
+        }
         let (nbp, players) = self.lobby_counts();
         let host_username = self.lobby_host_username();
         self.effects.push(Effect::LobbyListing {
@@ -1561,6 +1614,20 @@ impl AnyServer {
         }
     }
 
+    // Personal mode: the player id the initiator played, which the rated
+    // report is sent for. None for an observer, or outside personal mode.
+    pub fn initiator_player_id(&self) -> Option<i32> {
+        let ctx = self.ctx();
+        ctx.config.initiator_addr?;
+        let host = &ctx.config.lobby_host_name;
+        ctx.slots
+            .entries()
+            .find(|e| {
+                e.slot != UNASSIGNED && auth::suffix_stripped(&e.name).eq_ignore_ascii_case(host)
+            })
+            .map(|e| i32::from(e.slot))
+    }
+
     // The span of the client behind `peer`, while it has a session.
     pub fn peer_span(&self, peer: PeerID) -> Option<tracing::Span> {
         self.ctx().sessions.get(&peer).map(|s| s.span.clone())
@@ -1938,6 +2005,10 @@ impl<S: PhaseMarker> Server<S> {
                 self.broadcast_player_slots();
             }
         }
+        if self.ctx.is_initiator(&session) {
+            tracing::info!(?peer, "initiator left, unlisting the game");
+            self.ctx.effects.push(Effect::LobbyUnlisted);
+        }
 
         // A departed client no longer blocks release, and hash comparison no
         // longer waits for it.
@@ -2258,7 +2329,10 @@ impl<S: PhaseMarker> Server<S> {
         // The AI host has no lobby account to authenticate with.
         let addr = self.ctx.sessions.get(&peer).map(|s| s.addr);
         let ai_host = addr.is_some_and(|a| self.ctx.ai_host_expected(a));
-        let flags = if self.ctx.config.lobby_mode && !ai_host {
+        // The initiator joins by direct IP, with no lobby session to answer
+        // the prompt from.
+        let trusted = addr.is_some() && addr == self.ctx.config.initiator_addr;
+        let flags = if self.ctx.config.lobby_mode && !ai_host && !trusted {
             ACK_FLAG_LOBBY_AUTH
         } else {
             0
@@ -2301,12 +2375,17 @@ impl<S: PhaseMarker> Server<S> {
         if session.admitted.is_some() {
             return Err(PeerFault::WrongPhase);
         }
-        let lobby_name = session.lobby_name.clone();
+        let mut lobby_name = session.lobby_name.clone();
         // It has no lobby account and is never handed the game password, so
         // the checks that depend on either are skipped for it alone.
         let is_ai_host =
             self.ctx.ai_host_expected(session.addr) && msg.name == self.ctx.ai_host_name;
-        if self.ctx.config.lobby_mode && lobby_name.is_none() && !is_ai_host {
+        // Never prompted for lobby auth, so the address and the name below
+        // are all that vouch for it.
+        let from_initiator_addr =
+            !is_ai_host && Some(session.addr) == self.ctx.config.initiator_addr;
+        if self.ctx.config.lobby_mode && lobby_name.is_none() && !is_ai_host && !from_initiator_addr
+        {
             // The client has not been prompted yet, so this cannot be its
             // real answer.
             return Err(PeerFault::WrongPhase);
@@ -2317,6 +2396,21 @@ impl<S: PhaseMarker> Server<S> {
         if S::PHASE == Phase::Loading {
             self.disconnect(peer, DisconnectReason::ServerLoading);
             return Ok(());
+        }
+
+        // Only the initiator's own name is taken from the trusted address;
+        // it then counts as that lobby name for every rule below.
+        if from_initiator_addr {
+            let host = self.ctx.config.lobby_host_name.clone();
+            if !auth::suffix_stripped(&sanitized).eq_ignore_ascii_case(&host) {
+                self.disconnect(peer, DisconnectReason::LobbyAuthFailed);
+                return Ok(());
+            }
+            if let Some(session) = self.ctx.sessions.get_mut(&peer) {
+                session.span.record("lobby_name", host.as_str());
+                session.lobby_name = Some(host.clone());
+            }
+            lobby_name = Some(host);
         }
 
         if self.ctx.config.lobby_mode && !is_ai_host {
@@ -2350,7 +2444,7 @@ impl<S: PhaseMarker> Server<S> {
         // always run: an empty server password hashes to "", which is exactly
         // what a client with no password sends.
         let expected = password::hash(&self.ctx.config.server_password_hash, msg.name.as_bytes());
-        if expected != msg.password && !is_ai_host {
+        if expected != msg.password && !is_ai_host && !from_initiator_addr {
             self.ctx.effects.push(Effect::PasswordRejected { peer });
             self.disconnect(peer, DisconnectReason::Refused);
             return Ok(());
@@ -2416,6 +2510,12 @@ impl<S: PhaseMarker> Server<S> {
             tracing::info!(?peer, "sidecar: AI host admitted");
         }
         self.admit_session(peer, uuid, name, joining, &msg.controller_secret);
+        // In setup the slot broadcast has listed the game already; a running
+        // match is listed as one again.
+        if from_initiator_addr && S::PHASE != Phase::Setup {
+            self.ctx.push_lobby_listing();
+            self.ctx.push_lobby_started();
+        }
         Ok(())
     }
 
@@ -3307,12 +3407,17 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
         // Decoded only for the lobby listing (Sec. 17.3, A6); relay stays
         // verbatim and content is never validated (Sec. 10.2), so a decode
         // failure here must not become a peer fault.
-        match script_value::decode(&msg.data).map(|v| LobbyMap::from_settings(&v)) {
-            Ok(Some(map)) if Some(&map) != self.ctx.lobby_map.as_ref() => {
-                self.ctx.lobby_map = Some(map);
-                self.ctx.push_lobby_listing();
+        match script_value::decode(&msg.data) {
+            Ok(root) => {
+                match LobbyMap::from_settings(&root) {
+                    Some(map) if Some(&map) != self.ctx.lobby_map.as_ref() => {
+                        self.ctx.lobby_map = Some(map);
+                        self.ctx.push_lobby_listing();
+                    }
+                    _ => {}
+                }
+                self.warn_unreportable_rating(&root);
             }
-            Ok(_) => {}
             Err(e) => {
                 tracing::debug!(error = %e, "GAME_SETTINGS did not decode for the lobby listing");
             }
@@ -3320,6 +3425,25 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
         let relayed = WireMessage::GameSettings(msg);
         self.ctx.broadcast(&relayed, |s| s.is_setup());
         Ok(())
+    }
+
+    // Said when rating is switched on, not on every settings change, so the
+    // chat is not flooded while the host edits the rest.
+    fn warn_unreportable_rating(&mut self, root: &ScriptValue) {
+        if !self.ctx.rating_unreportable() {
+            return;
+        }
+        // Only an update that carries the whole settings says anything about
+        // rating; one without them leaves the last answer standing.
+        let Some(settings) = root.get("initAttribs").and_then(|a| a.get("settings")) else {
+            return;
+        };
+        let rated = matches!(settings.get("RatingEnabled"), Some(ScriptValue::Bool(true)));
+        if rated && !self.ctx.rating_enabled {
+            tracing::warn!("{RATING_NEEDS_SIDECAR}");
+            self.ctx.server_chat(None, RATING_NEEDS_SIDECAR);
+        }
+        self.ctx.rating_enabled = rated;
     }
 
     fn on_map_player_id_to_slot(
@@ -3420,8 +3544,7 @@ impl<S: SetupPhase + PhaseMarker> Server<S> {
         // The last listing update the match ever gets: Sec. 17.3 wants
         // register followed by changestate, and register already went out
         // from the broadcast_player_slots call in begin_match.
-        let (nbp, players) = self.ctx.lobby_counts();
-        self.ctx.effects.push(Effect::LobbyStarted { nbp, players });
+        self.ctx.push_lobby_started();
         self.with_state(Loading {
             settings,
             saved_state: None,
@@ -3464,6 +3587,7 @@ impl Server<Idle> {
                 ai_host_name: format!("AI host {}", &Guid::new().0[..8]),
                 ai_host: None,
                 lobby_map: None,
+                rating_enabled: false,
                 saved_slots: None,
                 client_pull: None,
                 ai_state: None,
@@ -3491,7 +3615,8 @@ impl Server<Idle> {
         let turn = data.last_turn();
         let settings = frozen_settings(&data.settings, data.turn_length_ms);
         let slots = data.slots;
-        if self.ctx.config.lobby_mode {
+        // A personal match is listed again only once its initiator is back.
+        if self.ctx.config.lobby_mode && self.ctx.config.initiator_addr.is_none() {
             // Re-listed at once as a match in progress, since the bot dropped
             // it when the old process left. Nobody is back yet, so the saved
             // players stand in for the connected ones the listing counts.
@@ -3613,6 +3738,11 @@ impl Server<Setup> {
         // that follow, stranding every client on the loading screen.
         if !self.ctx.slots.all_ready() {
             tracing::info!(?peer, "start rejected: not every connected player is ready");
+            return None;
+        }
+        if self.ctx.rating_unreportable() && game_report::is_rated(&msg.init_attributes) {
+            tracing::warn!(?peer, "start rejected: {RATING_NEEDS_SIDECAR}");
+            self.ctx.server_chat(Some(peer), RATING_NEEDS_SIDECAR);
             return None;
         }
 

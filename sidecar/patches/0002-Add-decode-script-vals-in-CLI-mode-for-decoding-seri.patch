@@ -1,7 +1,7 @@
 From befb3f2bd60c5ef20635d697ef2e327936e4b2f4 Mon Sep 17 00:00:00 2001
 From: Viktor Semenov <suit.uanic@gmail.com>
 Date: Wed, 26 Aug 2026 10:27:19 +0000
-Subject: [PATCH 2/6] Add decode-script-vals-in CLI mode for decoding
+Subject: [PATCH 2/7] Add decode-script-vals-in CLI mode for decoding
  serialized script values
 
 Adds a standalone tool invoked via --decode-script-vals-in to decode

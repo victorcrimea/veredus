@@ -19,6 +19,7 @@ use toml_edit::Decor;
 use toml_edit::DocumentMut;
 
 use crate::lobby::LobbyConfig;
+use crate::lobby::PersonalLobby;
 use crate::lobby::XmppCredentials;
 use crate::relay::auth::LateObserverPolicy;
 use crate::relay::enet_task::EnetLimits;
@@ -81,6 +82,7 @@ const GENERATED_HEADER: &str = "# veredus configuration. Command line flags over
 pub struct FileConfig {
     pub server: ServerSection,
     pub lobby: LobbySection,
+    pub personal: PersonalSection,
     #[serde(rename = "match")]
     pub game_match: MatchSection,
     pub observers: ObserversSection,
@@ -242,6 +244,110 @@ impl LobbySection {
             server_name: self.server_name.clone(),
             engine_version: self.engine_version.clone(),
             game_password: self.game_password.clone(),
+            personal: None,
+        })
+    }
+}
+
+/// Personal mode: one player's own lobby account hosts their games, one
+/// after another. That player joins by direct IP from the trusted address,
+/// and the game is listed in the lobby only while they are in it.
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersonalSection {
+    /// Set to run personal mode off this table.
+    pub enabled: bool,
+    /// Your lobby name, exactly as you type it into the game's login.
+    pub name: String,
+    /// Your lobby password. Keep this file private.
+    pub password: String,
+    /// The IPv4 address your own game client connects from. Only a client
+    /// from this address, playing under your name, is let in without lobby
+    /// authentication, and it becomes the host.
+    pub trusted_address: String,
+    /// The address other players connect to.
+    pub public_ip: String,
+    /// Shown in the lobby game list.
+    pub server_name: String,
+    /// Optional password set on every game.
+    pub game_password: String,
+    /// The lobby server your account lives on.
+    pub lobby_server: String,
+    /// The lobby room. The account sits in it like a player, but never
+    /// says anything there.
+    pub muc_room: String,
+    /// The bot that keeps the game list.
+    pub bot_jid: String,
+    /// The bot that rates games.
+    pub rating_bot_jid: String,
+    /// Must match the clients.
+    pub engine_version: String,
+}
+
+impl Default for PersonalSection {
+    // The stock client's own lobby settings, so a player only has to fill
+    // in what they type into its login.
+    fn default() -> Self {
+        PersonalSection {
+            enabled: false,
+            name: String::new(),
+            password: String::new(),
+            trusted_address: String::new(),
+            public_ip: String::new(),
+            server_name: crate::lobby::default_server_name(),
+            game_password: String::new(),
+            lobby_server: "lobby.wildfiregames.com".to_string(),
+            muc_room: "arena28@conference.lobby.wildfiregames.com".to_string(),
+            bot_jid: "wfgbot28@lobby.wildfiregames.com/CC".to_string(),
+            rating_bot_jid: "echelon28@lobby.wildfiregames.com/CC".to_string(),
+            engine_version: crate::lobby::default_engine_version(),
+        }
+    }
+}
+
+impl PersonalSection {
+    pub fn trusted_address(&self) -> Result<Ipv4Addr, String> {
+        self.trusted_address.parse().map_err(|error| {
+            format!(
+                "[personal] trusted_address '{}' is not an IPv4 address: {error}",
+                self.trusted_address
+            )
+        })
+    }
+
+    // The fields default to empty only so the generated file can show them;
+    // a personal run with any of them empty could never log in or be joined.
+    pub fn to_lobby_config(&self) -> Result<LobbyConfig, String> {
+        for (key, value) in [
+            ("name", &self.name),
+            ("password", &self.password),
+            ("trusted_address", &self.trusted_address),
+            ("public_ip", &self.public_ip),
+            ("lobby_server", &self.lobby_server),
+            ("muc_room", &self.muc_room),
+            ("bot_jid", &self.bot_jid),
+            ("rating_bot_jid", &self.rating_bot_jid),
+        ] {
+            if value.is_empty() {
+                return Err(format!("[personal] is enabled but {key} is empty"));
+            }
+        }
+        self.trusted_address()?;
+        Ok(LobbyConfig {
+            accounts: vec![XmppCredentials {
+                jid: format!("{}@{}", self.name, self.lobby_server),
+                password: self.password.clone(),
+            }],
+            muc_room: self.muc_room.clone(),
+            bot_jid: self.bot_jid.clone(),
+            public_ip: self.public_ip.clone(),
+            server_name: self.server_name.clone(),
+            engine_version: self.engine_version.clone(),
+            game_password: self.game_password.clone(),
+            personal: Some(PersonalLobby {
+                name: self.name.clone(),
+                rating_bot_jid: self.rating_bot_jid.clone(),
+            }),
         })
     }
 }
@@ -845,6 +951,9 @@ impl FileConfig {
         if self.advanced.enet_max_waiting_bytes == 0 {
             return Err("[advanced] enet_max_waiting_bytes must be at least 1".to_string());
         }
+        if self.lobby.enabled && self.personal.enabled {
+            return Err("[lobby] and [personal] cannot both be enabled".to_string());
+        }
         Ok(())
     }
 
@@ -878,6 +987,7 @@ impl FileConfig {
 fn decorate_default(doc: &mut DocumentMut) {
     decorate_section::<ServerSection>(doc, "server");
     decorate_section::<LobbySection>(doc, "lobby");
+    decorate_section::<PersonalSection>(doc, "personal");
     decorate_section::<MatchSection>(doc, "match");
     decorate_section::<ObserversSection>(doc, "observers");
     decorate_section::<PauseSection>(doc, "pause");

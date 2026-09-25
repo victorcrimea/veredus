@@ -218,6 +218,46 @@ Then start the server as usual with `./veredus`.
 
 Lobby games use UDP ports **20595 to 20695**, so open that whole range.
 
+### Hosting from your own lobby account
+
+Personal mode lets you host your own lobby games on the server. The server
+logs in to the lobby as you. You join your game by IP address, and the game
+appears in the lobby's game list under your name. Other players join it from
+the lobby as usual.
+
+Fill in the `[personal]` table of your config file:
+
+```toml
+[personal]
+enabled = true
+name = "yourname"
+password = "..."
+trusted_address = "198.51.100.7"
+public_ip = "203.0.113.10"
+```
+
+- `name` and `password` are your lobby login.
+- `trusted_address` is the IP address your own game connects from. Only you,
+  from that address and under your lobby name, get in without the lobby, and
+  you are the host.
+- `public_ip` is the address other players connect to.
+- The lobby server and room default to the official Wildfire Games lobby.
+
+Start the server with `./veredus` (or `./veredus --personal` if `enabled`
+is not set in the file). Then, in 0 A.D., choose **Multiplayer**, then
+**Join game**, and enter the server's address and port 20595.
+
+- Do not log in to the lobby with the same account while the server uses
+  it.
+- The game is listed only while you are in it, and the server never writes
+  in the lobby chat.
+- When a match ends, the server opens a fresh game. It is listed once you
+  join it.
+- For a rated game, the server sends your result to the rating bot for
+  you. This needs the [sidecar](#extra-features-with-the-sidecar). Without
+  it, a rated game will not start.
+- Only UDP port **20595** is used (or the one `--port` sets).
+
 ## Configuration
 
 The defaults are fine to start with. To change anything, write a config
@@ -237,6 +277,7 @@ Things people commonly change:
   game port for a server outside the lobby.
 - `[lobby]` turns lobby hosting on and holds the public address and the
   accounts.
+- `[personal]` hosts from your own lobby account instead.
 - `[match] server_name` and `welcome_message` set what players see.
 - `[observers] delay_turns` sets how far behind observers watch
   (0 means live).

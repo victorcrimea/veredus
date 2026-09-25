@@ -17,6 +17,8 @@ use chrono::TimeDelta;
 use chrono::Utc;
 
 use crate::enet::PeerID;
+use crate::lobby::game_report;
+use crate::lobby::link::GameReport;
 use crate::lobby::link::GameToLobby;
 use crate::lobby::link::LobbyAuthToken;
 use crate::lobby::link::LobbyLink;
@@ -101,6 +103,7 @@ struct CheckpointDone {
     players: Vec<String>,
     turn: u32,
     json: String,
+    report: Option<String>,
 }
 
 // The one-shot runs this game can have in flight, with the channels their
@@ -112,12 +115,14 @@ struct OneShotRuns {
     dump_slot: DumpSlot,
     checkpoint_tx: Sender<(u32, Option<CheckpointDone>)>,
     checkpoint_slot: CheckpointSlot,
-    // The newest checkpoint result as (run id, turn, JSON), kept in case the
-    // FSM finds that this run decided the match and it becomes the outcome.
-    last_result: Option<(u32, u32, String)>,
+    // The newest checkpoint result as (run id, turn, JSON, rated report),
+    // kept in case the FSM finds that this run decided the match and it
+    // becomes the outcome.
+    last_result: Option<(u32, u32, String, Option<String>)>,
     // The result of the run that decided the match, which no outcome replay
-    // follows, kept as the replay folder's metadata.
+    // follows, kept as the replay folder's metadata, and its rated report.
     decided_result: Option<String>,
+    decided_report: Option<String>,
 }
 
 // The hosted-AI process for this game, if one is running. It lives on this
@@ -242,9 +247,11 @@ pub fn run_game_server(
         checkpoint_slot: CheckpointSlot::default(),
         last_result: None,
         decided_result: None,
+        decided_report: None,
     };
     let mut outcome_request: Option<DumpRequest> = None;
     let mut replay_request: Option<DumpRequest> = None;
+    let mut initiator_player: Option<i32> = None;
     let mut ai_host = AiHostSlot {
         pyrogenesis_path: pyrogenesis_path.clone(),
         connect: ai_host_connect,
@@ -307,8 +314,9 @@ pub fn run_game_server(
                     players,
                     turn,
                     json,
+                    report,
                 }) => {
-                    runs.last_result = Some((id, turn, json));
+                    runs.last_result = Some((id, turn, json, report));
                     if let Some(save) = &save {
                         let _ = save.send(SaveItem::State {
                             turn,
@@ -418,6 +426,7 @@ pub fn run_game_server(
                 let current = server.take().expect("server is always present");
                 outcome_request = current.outcome_request();
                 replay_request = current.replay_request();
+                initiator_player = current.initiator_player_id();
                 observe_final(&current, &latest_stats, &latest_loss, metrics);
                 // Outside post-game this is the idle timeout, where normally
                 // no human is admitted to read the line.
@@ -450,6 +459,7 @@ pub fn run_game_server(
             if !current.saved_on_stop() {
                 outcome_request = current.outcome_request();
                 replay_request = current.replay_request();
+                initiator_player = current.initiator_player_id();
             }
             observe_final(&current, &latest_stats, &latest_loss, metrics);
             let effects = current.stop();
@@ -485,12 +495,25 @@ pub fn run_game_server(
     // The two shutdown paths consume the server, so they read the record
     // first; every other way out leaves it in place.
     let outcome = outcome_request.or_else(|| server.as_ref()?.outcome_request());
+    let replay_request = replay_request.or_else(|| server.as_ref()?.replay_request());
+    // Only a match that ran has settings to tell whether it was rated.
+    let rated = replay_request
+        .as_ref()
+        .is_some_and(|r| game_report::is_rated(&r.init_attributes));
+    let report = lobby
+        .as_ref()
+        .and_then(|l| l.report_tx.clone())
+        .zip(initiator_player.or_else(|| server.as_ref()?.initiator_player_id()))
+        .filter(|_| rated)
+        .map(|(tx, player_id)| PendingReport { tx, player_id });
     // Kept next to the outcome, in a folder of its own named after the game,
     // laid out the way the game keeps its own replays.
-    let replay = replay_request
-        .or_else(|| server.as_ref()?.replay_request())
-        .zip(runs.outcome_path.as_ref().map(|p| p.with_extension("")));
+    let replay = replay_request.zip(runs.outcome_path.as_ref().map(|p| p.with_extension("")));
     if outcome.is_none() && replay.is_none() {
+        // A checkpoint decided the match, and nothing is left to replay.
+        if let Some(report) = report {
+            report.send(runs.decided_report.as_deref());
+        }
         return None;
     }
     let path = pyrogenesis_path?;
@@ -498,9 +521,39 @@ pub fn run_game_server(
         path,
         outcome,
         replay,
-        runs.decided_result.take(),
+        runs.decided_result
+            .take()
+            .map(|json| (json, runs.decided_report.take())),
         runs.outcome_path.take(),
+        report,
     ))
+}
+
+// A rated match's report, waiting for the run that builds it.
+struct PendingReport {
+    tx: tokio::sync::mpsc::UnboundedSender<GameReport>,
+    player_id: i32,
+}
+
+impl PendingReport {
+    // `report` is the engine's own, as the sidecar printed it.
+    fn send(self, report: Option<&str>) {
+        let Some(report) = report else {
+            tracing::warn!("the sidecar printed no rated report, the game is not reported");
+            return;
+        };
+        match game_report::for_player(report, self.player_id) {
+            Some(report) => {
+                // The account sends it once it is online; a closed channel
+                // means the lobby side is gone with the process.
+                let _ = self.tx.send(report);
+            }
+            None => tracing::info!(
+                player_id = self.player_id,
+                "the match is not finished, the rated game is not reported"
+            ),
+        }
+    }
 }
 
 // Stats are cached rather than fed straight in, so the FSM sees timing only on
@@ -624,6 +677,12 @@ fn drain(
                 }
                 continue;
             }
+            Effect::LobbyUnlisted => {
+                if let Some(lobby) = lobby {
+                    let _ = lobby.events_tx.send(GameToLobby::Unlisted);
+                }
+                continue;
+            }
             Effect::GameOver => {
                 outcome.game_over = true;
                 continue;
@@ -631,7 +690,7 @@ fn drain(
             Effect::MatchEnded { checkpoint } => {
                 // The deciding run already wrote this result as progress;
                 // now it is marked final, and no replay has to follow.
-                if let Some((id, turn, json)) = runs.last_result.take()
+                if let Some((id, turn, json, report)) = runs.last_result.take()
                     && checkpoint == Some(id)
                 {
                     tracing::info!(turn, "match outcome resolved");
@@ -642,6 +701,7 @@ fn drain(
                         write_outcome(path, turn, true, &json);
                     }
                     runs.decided_result = Some(json);
+                    runs.decided_report = report;
                 }
                 if let Some(lobby) = lobby {
                     let _ = lobby.events_tx.send(GameToLobby::Ended);
@@ -849,12 +909,14 @@ fn spawn_checkpoint(runs: &mut OneShotRuns, id: u32, turn: u32, request: DumpReq
                 {
                     write_outcome(&path, turn, false, &json);
                 }
+                let report = result.report;
                 let players = result.player_states.into_iter().map(|p| p.state).collect();
                 Some(CheckpointDone {
                     state: bytes,
                     players,
                     turn,
                     json,
+                    report,
                 })
             }
             Ok(Err(error)) => {
@@ -889,8 +951,9 @@ fn spawn_outcome(
     pyrogenesis_path: PathBuf,
     request: Option<DumpRequest>,
     replay: Option<(DumpRequest, PathBuf)>,
-    decided_result: Option<String>,
+    decided: Option<(String, Option<String>)>,
     outcome_path: Option<PathBuf>,
+    report: Option<PendingReport>,
 ) -> JoinHandle<()> {
     // Read here, on the game thread, for the same reasons as in spawn_dump.
     let now = chrono::Utc::now();
@@ -900,8 +963,13 @@ fn spawn_outcome(
         let resolved = request.and_then(|request| {
             resolve_outcome(&pyrogenesis_path, &request, outcome_path.as_deref(), now)
         });
+        let (metadata, rated_report) = resolved.or(decided).unzip();
+        // Ahead of the replay file, which replays the whole match again: the
+        // rating bot waits only so long for the other player's report.
+        if let Some(report) = report {
+            report.send(rated_report.flatten().as_deref());
+        }
         if let Some((request, out)) = replay {
-            let metadata = resolved.or(decided_result);
             write_replay(&pyrogenesis_path, &request, metadata.as_deref(), &out, now);
         }
     })
@@ -912,7 +980,7 @@ fn resolve_outcome(
     request: &DumpRequest,
     outcome_path: Option<&std::path::Path>,
     now: DateTime<Utc>,
-) -> Option<String> {
+) -> Option<(String, Option<String>)> {
     let from = request.first_turn();
     let turn = request.last_turn();
     tracing::info!(from, turn, "sidecar: replaying match for its outcome");
@@ -946,7 +1014,7 @@ fn resolve_outcome(
     if let Some(path) = outcome_path {
         write_outcome(path, turn, true, &json);
     }
-    Some(json)
+    Some((json, result.report))
 }
 
 fn write_replay(

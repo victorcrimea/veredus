@@ -109,6 +109,17 @@ impl LobbyMap {
 pub struct LobbyLink {
     pub auth_rx: std::sync::mpsc::Receiver<LobbyAuthToken>,
     pub events_tx: tokio::sync::mpsc::UnboundedSender<GameToLobby>,
+    // Personal mode only. The account's, not the game's: a rated result is
+    // known only once the outcome replay is done, long after the game
+    // thread has dropped `events_tx` and the account has moved on.
+    pub report_tx: Option<tokio::sync::mpsc::UnboundedSender<GameReport>>,
+}
+
+// A rated match's result, as the attributes of the stock client's
+// jabber:iq:gamereport stanza, sent on behalf of the player the account
+// belongs to.
+pub struct GameReport {
+    pub attrs: Vec<(String, String)>,
 }
 
 // Game-server thread -> XMPP account task. Dropping the sending half (by the
@@ -129,6 +140,10 @@ pub enum GameToLobby {
     // The match has been decided. The game keeps running for whoever stays,
     // but it is no longer one to list.
     Ended,
+    // Personal mode: the player the account belongs to has left, so the game
+    // is taken off the list until they are back. The account keeps
+    // answering for it, so players who know it can still come back.
+    Unlisted,
 }
 
 #[cfg(test)]

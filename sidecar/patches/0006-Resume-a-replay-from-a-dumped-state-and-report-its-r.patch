@@ -1,7 +1,7 @@
 From 036825275f5fed4521a60a083ae65f919a47a732 Mon Sep 17 00:00:00 2001
 From: Viktor Semenov <suit.uanic@gmail.com>
 Date: Tue, 22 Sep 2026 09:40:23 +0000
-Subject: [PATCH 6/6] Resume a replay from a dumped state and report its result
+Subject: [PATCH 6/7] Resume a replay from a dumped state and report its result
  on dump runs
 
 -replay-initial-state=PATH loads a state written by -dump-state-out once

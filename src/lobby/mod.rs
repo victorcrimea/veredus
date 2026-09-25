@@ -3,8 +3,10 @@
 
 pub mod auth;
 pub mod connection_data;
+pub mod game_report;
 pub mod gamelist;
 pub mod link;
+pub mod rating;
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -35,12 +37,14 @@ use tokio_xmpp::parsers::message::Message as XmppMessage;
 use tokio_xmpp::parsers::message::MessageType;
 use tokio_xmpp::parsers::muc::Muc;
 use tokio_xmpp::parsers::presence::Presence;
+use tokio_xmpp::parsers::presence::Show;
 use tokio_xmpp::parsers::presence::Type as PresenceType;
 use tokio_xmpp::xmlstream::PendingFeaturesRecv;
 use tokio_xmpp::xmlstream::Timeouts;
 use tracing::Instrument;
 
 use crate::lobby::connection_data::Assignment;
+use crate::lobby::link::GameReport;
 use crate::lobby::link::GameToLobby;
 use crate::lobby::link::LobbyAuthToken;
 
@@ -90,6 +94,19 @@ pub struct LobbyConfig {
     pub engine_version: String,
     #[serde(default)]
     pub game_password: String,
+    // Some selects personal mode, which is configured only from the TOML
+    // file's [personal] table.
+    #[serde(skip)]
+    pub personal: Option<PersonalLobby>,
+}
+
+// The player whose own account hosts in personal mode.
+#[derive(Debug, Clone)]
+pub struct PersonalLobby {
+    // As typed into the stock login: its MUC nick and the salt of its
+    // password hash both keep that capitalization.
+    pub name: String,
+    pub rating_bot_jid: String,
 }
 
 impl LobbyConfig {
@@ -102,6 +119,14 @@ impl LobbyConfig {
         self.muc_room
             .parse::<BareJid>()
             .map_err(|error| format!("invalid lobby muc_room '{}': {error}", self.muc_room))?;
+        if let Some(personal) = &self.personal {
+            personal.rating_bot_jid.parse::<Jid>().map_err(|error| {
+                format!(
+                    "invalid rating_bot_jid '{}': {error}",
+                    personal.rating_bot_jid
+                )
+            })?;
+        }
         // Parsed with a resource of the shape the account task appends, so
         // this accepts exactly what the task will.
         let resource = format!("0ad-{}", uuid::Uuid::nil());
@@ -146,6 +171,7 @@ struct AccountSlot {
     // with. Known before the account is online, so a resumed match can be
     // hosted without waiting for a hostme to report it.
     host_jid: String,
+    report_tx: mpsc::UnboundedSender<GameReport>,
 }
 
 pub struct LobbyManager {
@@ -178,10 +204,19 @@ impl LobbyManager {
             .parse()
             .expect("muc_room is checked by LobbyConfig::validate");
 
+        let personal = self.config.personal.as_ref().map(|p| PersonalAccount {
+            nick: p.name.clone(),
+            rating_bot_jid: p
+                .rating_bot_jid
+                .parse()
+                .expect("rating_bot_jid is checked by LobbyConfig::validate"),
+        });
+
         let account_config = AccountConfig {
             muc_room: self.config.muc_room.clone(),
             muc_bare,
             bot_jid,
+            personal,
             public_ip: self.config.public_ip.clone(),
             server_name: self.config.server_name.clone(),
             has_password: !self.config.game_password.is_empty(),
@@ -197,6 +232,7 @@ impl LobbyManager {
 
         for (idx, creds) in self.config.accounts.iter().enumerate() {
             let (control_tx, control_rx) = mpsc::channel::<AccountControl>(16);
+            let (report_tx, report_rx) = mpsc::unbounded_channel::<GameReport>();
 
             let creds = creds.clone();
             let account_config = account_config.clone();
@@ -225,6 +261,7 @@ impl LobbyManager {
                         resource,
                         account_config,
                         control_rx,
+                        report_rx,
                         task_main_tx,
                     )
                     .await;
@@ -237,6 +274,7 @@ impl LobbyManager {
                 handle: Some(handle),
                 in_use: false,
                 host_jid,
+                report_tx,
             });
         }
 
@@ -272,6 +310,15 @@ impl LobbyManager {
         self.accounts
             .get(account)
             .map(|slot| slot.host_jid.as_str())
+    }
+
+    // Personal mode only: where a finished match's rated report goes. It
+    // outlives the game, whose own channel is gone before the report is.
+    pub fn report_sender(&self, account: usize) -> Option<mpsc::UnboundedSender<GameReport>> {
+        self.config.personal.as_ref()?;
+        self.accounts
+            .get(account)
+            .map(|slot| slot.report_tx.clone())
     }
 
     pub fn assign(
@@ -340,10 +387,18 @@ struct AccountConfig {
     muc_room: String,
     muc_bare: BareJid,
     bot_jid: Jid,
+    // Some in personal mode, where the account is one player's own.
+    personal: Option<PersonalAccount>,
     public_ip: String,
     server_name: String,
     has_password: bool,
     reconnect_spread: Duration,
+}
+
+#[derive(Clone)]
+struct PersonalAccount {
+    nick: String,
+    rating_bot_jid: Jid,
 }
 
 // Wraps the connector `Client::new` would use. tokio-xmpp calls `connect`
@@ -471,20 +526,71 @@ impl Registration {
     }
 }
 
-fn build_muc_presence(muc_room: &str, bound_jid: &Jid) -> Presence {
-    let nickname = bound_jid
-        .node()
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "dedicated".to_string());
-    let to: Jid = format!("{muc_room}/{nickname}")
-        .parse()
-        .expect("muc_room plus a JID nickname is a valid JID");
+fn muc_nickname(config: &AccountConfig, bound_jid: &Jid) -> String {
+    match &config.personal {
+        Some(personal) => personal.nick.clone(),
+        None => bound_jid
+            .node()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "dedicated".to_string()),
+    }
+}
 
+fn muc_occupant(config: &AccountConfig, bound_jid: &Jid) -> Jid {
+    let nickname = muc_nickname(config, bound_jid);
+    format!("{}/{nickname}", config.muc_room)
+        .parse()
+        .expect("muc_room plus a JID nickname is a valid JID")
+}
+
+fn build_muc_presence(config: &AccountConfig, bound_jid: &Jid) -> Presence {
     let mut presence = Presence::new(PresenceType::None);
     presence.from = Some(bound_jid.clone());
-    presence.to = Some(to);
+    presence.to = Some(muc_occupant(config, bound_jid));
     presence.add_payload(Muc::new());
     presence
+}
+
+// Personal mode shows the account the way a stock client shows its player:
+// "playing" (dnd) while it hosts a listed game, available otherwise. The
+// client sends these to its room occupant without the join payload.
+async fn send_playing(client: &mut Client, config: &AccountConfig, bound_jid: &Jid, playing: bool) {
+    let mut presence = Presence::new(PresenceType::None);
+    presence.from = Some(bound_jid.clone());
+    presence.to = Some(muc_occupant(config, bound_jid));
+    presence.show = playing.then_some(Show::Dnd);
+    let _ = client.send_stanza(presence.into()).await;
+}
+
+// Only a change is sent, and only once online: a new session sends the
+// current state itself after joining the room.
+async fn set_playing(
+    client: &mut Client,
+    config: &AccountConfig,
+    bound_jid: Option<&Jid>,
+    playing: &mut bool,
+    value: bool,
+) {
+    if config.personal.is_none() || *playing == value {
+        return;
+    }
+    *playing = value;
+    if let Some(bound_jid) = bound_jid {
+        send_playing(client, config, bound_jid, value).await;
+    }
+}
+
+async fn send_report(client: &mut Client, config: &AccountConfig, report: &GameReport) {
+    let Some(personal) = &config.personal else {
+        return;
+    };
+    tracing::info!("sending the rated game report");
+    let _token = client
+        .send_iq(
+            Some(personal.rating_bot_jid.clone()),
+            tokio_xmpp::IqRequest::Set(rating::report(report)),
+        )
+        .await;
 }
 
 // Main loop for one lobby account. A dropped connection never surfaces here:
@@ -497,18 +603,28 @@ async fn run_account(
     resource: String,
     config: AccountConfig,
     mut control_rx: mpsc::Receiver<AccountControl>,
+    mut report_rx: mpsc::UnboundedReceiver<GameReport>,
     main_tx: mpsc::UnboundedSender<LobbyEvent>,
 ) {
     let jid: Jid = format!("{}/{resource}", creds.jid)
         .parse()
         .expect("account jids are checked by LobbyConfig::validate");
-    let username = jid.node().map(|n| n.to_string()).unwrap_or_default();
+    // The stock client salts with the name as typed, which the JID may not
+    // keep.
+    let username = match &config.personal {
+        Some(personal) => personal.nick.clone(),
+        None => jid.node().map(|n| n.to_string()).unwrap_or_default(),
+    };
     // The lobby server stores the SASL-hashed form, so the client-side hash
     // has to happen before login rather than being left to XMPP SASL itself.
     let login_password = sasl_password(&creds.password, &username);
 
     let mut assigned: Option<Assigned> = None;
     let mut registration = Registration::default();
+    // Personal mode only.
+    let mut playing = false;
+    let mut boardlist_sent = false;
+    let mut unsent_reports: Vec<GameReport> = Vec::new();
 
     loop {
         tracing::info!("connecting to lobby");
@@ -539,6 +655,7 @@ async fn run_account(
                             tracing::info!("lobby account released its game");
                             assigned = None;
                             registration.clear();
+                            set_playing(&mut client, &config, bound_jid.as_ref(), &mut playing, false).await;
                         }
                         Some(AccountControl::Shutdown) | None => break 'connection true,
                     }
@@ -569,6 +686,10 @@ async fn run_account(
                                 has_password: config.has_password,
                                 map: map.as_ref(),
                             }));
+                            if let Some(a) = assigned.as_mut() {
+                                a.unlisted = false;
+                            }
+                            set_playing(&mut client, &config, bound_jid.as_ref(), &mut playing, true).await;
                         }
                         Some(GameToLobby::Started { nbp, players }) => {
                             if bound_jid.is_some() {
@@ -588,6 +709,18 @@ async fn run_account(
                                 a.unlisted = true;
                             }
                         }
+                        Some(GameToLobby::Unlisted) => {
+                            let already = assigned.as_ref().is_some_and(|a| a.unlisted);
+                            registration.clear();
+                            if bound_jid.is_some() && !already {
+                                tracing::info!("withdrawing the listing until the host is back");
+                                send_unregister(&mut client, &config).await;
+                            }
+                            if let Some(a) = assigned.as_mut() {
+                                a.unlisted = true;
+                            }
+                            set_playing(&mut client, &config, bound_jid.as_ref(), &mut playing, false).await;
+                        }
                         None => {
                             // The game thread dropped its sender: the match ended.
                             let unlisted = assigned.as_ref().is_some_and(|a| a.unlisted);
@@ -596,8 +729,17 @@ async fn run_account(
                             if bound_jid.is_some() && !unlisted {
                                 send_unregister(&mut client, &config).await;
                             }
+                            set_playing(&mut client, &config, bound_jid.as_ref(), &mut playing, false).await;
                             let _ = main_tx.send(LobbyEvent::GameEnded { account });
                         }
+                    }
+                }
+
+                Some(report) = report_rx.recv() => {
+                    if bound_jid.is_some() {
+                        send_report(&mut client, &config, &report).await;
+                    } else {
+                        unsent_reports.push(report);
                     }
                 }
 
@@ -631,8 +773,29 @@ async fn run_account(
                             .with_label_values(&[if resumed { "true" } else { "false" }])
                             .inc();
                         bound_jid = Some(online_jid.clone());
-                        let presence = build_muc_presence(&config.muc_room, &online_jid);
+                        let presence = build_muc_presence(&config, &online_jid);
                         let _ = client.send_stanza(presence.into()).await;
+                        if config.personal.is_some() {
+                            if playing {
+                                send_playing(&mut client, &config, &online_jid, true).await;
+                            }
+                            // Once per login, as the stock client does from its
+                            // login page; its own reconnects do not repeat it.
+                            if !boardlist_sent
+                                && let Some(personal) = &config.personal
+                            {
+                                boardlist_sent = true;
+                                let _token = client
+                                    .send_iq(
+                                        Some(personal.rating_bot_jid.clone()),
+                                        tokio_xmpp::IqRequest::Get(rating::get_leaderboard()),
+                                    )
+                                    .await;
+                            }
+                            for report in std::mem::take(&mut unsent_reports) {
+                                send_report(&mut client, &config, &report).await;
+                            }
+                        }
                         // A resumed session never left the MUC, so the bot
                         // still has the game.
                         if !resumed {
@@ -748,7 +911,8 @@ fn handle_muc_message(
     account: usize,
     main_tx: &mpsc::UnboundedSender<LobbyEvent>,
 ) {
-    if msg.type_ != MessageType::Groupchat {
+    // A personal account hosts only for its own player, never on request.
+    if config.personal.is_some() || msg.type_ != MessageType::Groupchat {
         return;
     }
     // A groupchat-typed message sent straight to our JID would otherwise let

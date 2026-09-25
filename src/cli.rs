@@ -37,6 +37,10 @@ struct Args {
     /// mode with it in place of the config file's [lobby] table
     #[arg(long)]
     lobby_config: Option<PathBuf>,
+    /// Run personal mode off the config file's [personal] table: your own
+    /// lobby account hosts your games, one after another, on --port
+    #[arg(long)]
+    personal: bool,
     /// Path to the pyrogenesis binary; when set, joiners no live client can
     /// serve get their snapshot from a one-shot replay instead of a drop, and
     /// AI slots are played by a headless pyrogenesis instead of every client
@@ -76,7 +80,7 @@ pub enum Command {
 pub struct RunMode {
     // The config file with every command line override applied.
     pub config: FileConfig,
-    // Some selects pool-lobby mode.
+    // Some selects pool-lobby mode, or personal mode when it says so.
     pub lobby: Option<LobbyConfig>,
 }
 
@@ -120,12 +124,19 @@ pub fn parse_args() -> Result<Command, String> {
     if args.no_resume {
         config.saves.resume = false;
     }
+    if args.personal {
+        config.personal.enabled = true;
+    }
 
     config.validate()?;
 
+    if config.personal.enabled && args.lobby_config.is_some() {
+        return Err("--lobby-config and personal mode cannot be used together".to_string());
+    }
     let lobby = match args.lobby_config {
         Some(path) => Some(load_lobby_json(&path)?),
         None if config.lobby.enabled => Some(config.lobby.to_lobby_config()?),
+        None if config.personal.enabled => Some(config.personal.to_lobby_config()?),
         None => None,
     };
     if let Some(lobby) = &lobby {

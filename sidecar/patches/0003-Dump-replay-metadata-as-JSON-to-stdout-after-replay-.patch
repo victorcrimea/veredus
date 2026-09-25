@@ -1,7 +1,7 @@
 From 24ab9689e200ea1eb21d0eff8db739d3d85cecd4 Mon Sep 17 00:00:00 2001
 From: Viktor Semenov <suit.uanic@gmail.com>
 Date: Wed, 26 Aug 2026 10:27:30 +0000
-Subject: [PATCH 3/6] Dump replay metadata as JSON to stdout after replay
+Subject: [PATCH 3/7] Dump replay metadata as JSON to stdout after replay
  playback
 
 debug_printf's formatting buffer is a fixed 16KB and silently drops

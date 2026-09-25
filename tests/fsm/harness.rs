@@ -78,6 +78,7 @@ fn clone_effect(effect: &Effect) -> Effect {
             nbp: *nbp,
             players: players.clone(),
         },
+        Effect::LobbyUnlisted => Effect::LobbyUnlisted,
         Effect::GameOver => Effect::GameOver,
         Effect::StateDump { id, turn, request } => Effect::StateDump {
             id: *id,

@@ -1,7 +1,7 @@
 From 54619460d42712fbfe687f56bab491f22ddbe97b Mon Sep 17 00:00:00 2001
 From: Viktor Semenov <suit.uanic@gmail.com>
 Date: Tue, 3 Mar 2026 16:46:34 +0000
-Subject: [PATCH 1/6] Route AI through network and fix non-host saves
+Subject: [PATCH 1/7] Route AI through network and fix non-host saves
 
 This also allows to rejoin multiplayer games with AI.
 

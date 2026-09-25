@@ -95,6 +95,23 @@ async fn main() {
     let base = config.server_config(pyrogenesis_path.is_some());
 
     let result = match mode.lobby {
+        Some(lobby_config) if lobby_config.personal.is_some() => {
+            let base = Config {
+                initiator_addr: config.personal.trusted_address().ok(),
+                ..base
+            };
+            let resumable = pick_personal_resumable(&config, save.as_ref(), &base).await;
+            run_personal_mode(
+                &mut pool,
+                lobby_config,
+                &config,
+                base,
+                pyrogenesis_path,
+                outcome_dir,
+                resumable,
+            )
+            .await
+        }
         Some(lobby_config) => {
             let base = Config {
                 idle_shutdown: config.lobby.idle_shutdown(),
@@ -141,7 +158,7 @@ async fn main() {
     veredus::sidecar::remove_work_root();
 
     if let Err(error) = result {
-        tracing::error!(%error, "standalone game could not be hosted");
+        tracing::error!(%error, "game could not be hosted");
         std::process::exit(1);
     }
 }
@@ -316,6 +333,25 @@ async fn pick_resumable(
         .unwrap_or_default()
 }
 
+// The saved personal match to pick up first. Like standalone mode, personal
+// mode hosts one game at a time on one port.
+async fn pick_personal_resumable(
+    config: &FileConfig,
+    save: Option<&SaveSetup>,
+    server_config: &Config,
+) -> Option<Resumable> {
+    let setup = save.filter(|_| config.saves.resume)?;
+    let expect = Expect::new(
+        Mode::Personal,
+        server_config,
+        config.advanced.max_resume_attempts,
+    );
+    let root = setup.root.clone();
+    tokio::task::spawn_blocking(move || resume::pick(&root, &expect))
+        .await
+        .unwrap_or_default()
+}
+
 // Every saved lobby match that can be resumed here. A lobby server has an
 // account pool rather than one port, so it takes them all.
 async fn pick_lobby_resumables(
@@ -412,6 +448,9 @@ struct LobbyHosting {
     server_name: String,
     // The node of each account's JID, recorded in its games' save bundles.
     account_nodes: Vec<String>,
+    // Personal mode's fixed port, which its player dials directly; None
+    // lets the pool pick one.
+    port: Option<u16>,
 }
 
 // Which account hosts what, and for whom.
@@ -486,9 +525,13 @@ async fn host_lobby_game(
 
     let resumed = resume.is_some();
     let created = pool.create_game(GameConfig {
-        port: None,
+        port: hosting.port,
         server: server_config,
-        lobby: Some(LobbyLink { auth_rx, events_tx }),
+        lobby: Some(LobbyLink {
+            auth_rx,
+            events_tx,
+            report_tx: lobby_mgr.report_sender(account),
+        }),
         pyrogenesis_path: hosting.pyrogenesis_path.clone(),
         outcome_dir: hosting.outcome_dir.clone(),
         save: hosting.save.clone().map(|setup| SaveSetup {
@@ -608,6 +651,7 @@ async fn run_pool_lobby_mode(
             .iter()
             .map(|a| a.jid.split('@').next().unwrap_or_default().to_string())
             .collect(),
+        port: None,
     };
 
     let mut lobby_mgr = LobbyManager::new(lobby_config);
@@ -690,6 +734,112 @@ async fn run_pool_lobby_mode(
 
     lobby_mgr.shutdown().await;
     tracing::info!("lobby event loop ended, XMPP accounts shut down");
+}
+
+// Personal mode has one account, and so one game at a time.
+const PERSONAL_ACCOUNT: usize = 0;
+
+// One player's own lobby account hosts one game after another on the
+// standalone port, which that player dials directly. Each game lists itself
+// only while that player is in it, so nothing is listed between games.
+async fn run_personal_mode(
+    pool: &mut GamePool,
+    lobby_config: LobbyConfig,
+    config: &FileConfig,
+    base: Config,
+    pyrogenesis_path: Option<PathBuf>,
+    outcome_dir: Option<PathBuf>,
+    mut resumable: Option<Resumable>,
+) -> Result<(), String> {
+    let name = lobby_config
+        .personal
+        .as_ref()
+        .map(|p| p.name.clone())
+        .unwrap_or_default();
+    tracing::info!(
+        %name,
+        muc_room = %lobby_config.muc_room,
+        port = config.server.port,
+        "personal lobby mode"
+    );
+    if pyrogenesis_path.is_none() {
+        tracing::warn!(
+            "no pyrogenesis path: rated games cannot be reported, so a rated match will not start"
+        );
+    }
+
+    let hosting = LobbyHosting {
+        base,
+        pyrogenesis_path,
+        outcome_dir,
+        save: config.save_setup(&name),
+        engine_version: lobby_config.engine_version.clone(),
+        game_password: lobby_config.game_password.clone(),
+        server_name: lobby_config.server_name.clone(),
+        account_nodes: vec![name.clone()],
+        port: Some(config.server.port),
+    };
+
+    let mut lobby_mgr = LobbyManager::new(lobby_config);
+    let mut events = lobby_mgr.start();
+    // One future for the whole run, so a signal that arrives between two
+    // games is not missed.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    let result = 'host: loop {
+        if !lobby_mgr.reserve(PERSONAL_ACCOUNT) {
+            break Err("the lobby account is still busy with the last game".to_string());
+        }
+        let host_jid = lobby_mgr
+            .host_jid(PERSONAL_ACCOUNT)
+            .unwrap_or_default()
+            .to_string();
+        let resume = resumable.take();
+        if let Some(saved) = &resume {
+            tracing::info!(game_id = %saved.game_id, turn = saved.data.last_turn(), "resuming a saved match");
+        }
+        let hosted = host_lobby_game(
+            pool,
+            &mut lobby_mgr,
+            &hosting,
+            PERSONAL_ACCOUNT,
+            host_jid,
+            name.clone(),
+            resume,
+        )
+        .await;
+        let Some(game_id) = hosted else {
+            // The port is fixed, so trying again at once would only fail again.
+            break Err("the personal game could not be hosted, see above".to_string());
+        };
+
+        loop {
+            tokio::select! {
+                event = events.recv() => match event {
+                    Some(LobbyEvent::GameEnded { .. }) => {
+                        // destroy_game joins both of the game's OS threads, so
+                        // it must not block the async runtime's worker thread.
+                        tokio::task::block_in_place(|| pool.destroy_game(game_id));
+                        lobby_mgr.release(PERSONAL_ACCOUNT);
+                        tracing::info!("game ended, hosting a fresh one");
+                        continue 'host;
+                    }
+                    // A personal account ignores hostme.
+                    Some(LobbyEvent::HostRequested { .. }) => {}
+                    None => break 'host Ok(()),
+                },
+                signal = &mut shutdown => {
+                    tracing::info!(signal, "shutting down");
+                    break 'host Ok(());
+                }
+            }
+        }
+    };
+
+    lobby_mgr.shutdown().await;
+    tracing::info!("lobby account shut down");
+    result
 }
 
 fn hostme_outcome(outcome: &str) {
