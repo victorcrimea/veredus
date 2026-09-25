@@ -63,16 +63,14 @@ With the [sidecar](#extra-features-with-the-sidecar), a patched headless
    Windows: unzip it, open a terminal in that folder and run `veredus.exe`.
    When Windows Firewall asks, allow access.
 
-3. Optional: start it with the [sidecar](#extra-features-with-the-sidecar)
-   instead. From a Linux `-sidecar` download (glibc 2.36 or newer, such as
-   Debian 12, Ubuntu 24.04 and later):
-
-   ```sh
-   ./veredus --pyrogenesis-path sidecar/binaries/system/pyrogenesis
-   ```
+3. Optional: use the [sidecar](#extra-features-with-the-sidecar). A Linux
+   `-sidecar` download (glibc 2.36 or newer, such as Debian 12, Ubuntu
+   24.04 and later) comes with a `config.toml` that already points at it, so
+   `./veredus` started from that folder uses it.
 
    On any other system, [build the sidecar](#building-the-sidecar) yourself
-   and pass its path the same way.
+   and start the server with
+   `./veredus --pyrogenesis-path /path/to/0ad/binaries/system/pyrogenesis`.
 
 4. Allow **UDP port 20595** through your firewall. At home, also forward
    that port on your router to the server machine.
@@ -134,11 +132,12 @@ the game engine running next to it, which we call the sidecar:
 
 The sidecar is 0 A.D. 0.28.0 with a small set of patches, kept in this
 repository. The easiest way to get it is a `-sidecar` download for Linux:
-it has the sidecar in its `sidecar` folder, next to the server. From that
-folder, start the server with:
+it has the sidecar in its `sidecar` folder, next to the server, and a
+`config.toml` whose `pyrogenesis_path` points at it. Start the server from
+that folder:
 
 ```sh
-./veredus --pyrogenesis-path sidecar/binaries/system/pyrogenesis
+./veredus
 ```
 
 The sidecar runs wherever 0 A.D. itself runs; only Linux gets a

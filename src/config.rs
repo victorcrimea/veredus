@@ -118,7 +118,7 @@ impl Default for ServerSection {
         ServerSection {
             host: Ipv4Addr::UNSPECIFIED,
             port: DEFAULT_PORT,
-            pyrogenesis_path: PathBuf::from_str("../0ad/binaries/system/pyrogenesis").unwrap(),
+            pyrogenesis_path: PathBuf::new(),
             exit_after_game: false,
         }
     }

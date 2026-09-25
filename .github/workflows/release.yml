@@ -96,7 +96,8 @@ jobs:
       upload: true
 
   # The sidecar is a glibc program in its own directory, so one x64 build
-  # serves both x64 server builds; Windows gets none.
+  # serves both x64 server builds; Windows gets none. Each runs on its own
+  # architecture because the packaged server writes the archive's config.
   package-sidecar:
     needs: [build, sidecar]
     strategy:
@@ -105,11 +106,14 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: x64
+            os: ubuntu-latest
           - target: x86_64-unknown-linux-gnu
             arch: x64
+            os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             arch: arm64
-    runs-on: ubuntu-latest
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -127,6 +131,12 @@ jobs:
           tar xzf "$plain.tar.gz"
           mv "$plain" "$name"
           tar -C "$name" -xzf "sidecar-linux-${{ matrix.arch }}.tar.gz"
+          # A plain ./veredus from the archive folder then runs with the
+          # sidecar, since ./config.toml is loaded when present.
+          "$name/veredus" --gen-config "$name/config.toml"
+          sed -i 's|^pyrogenesis_path = ""$|pyrogenesis_path = "sidecar/binaries/system/pyrogenesis"|' \
+            "$name/config.toml"
+          grep -qx 'pyrogenesis_path = "sidecar/binaries/system/pyrogenesis"' "$name/config.toml"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 
@@ -246,8 +256,8 @@ jobs:
             The Linux downloads also come as `-sidecar` archives, which add a
             ready-to-run sidecar (hosted AI, rejoin snapshots, match results):
             0 A.D. 0.28.0 with the patches in `sidecar/`, in the `sidecar`
-            folder. Start the server with
-            `./veredus --pyrogenesis-path sidecar/binaries/system/pyrogenesis`.
+            folder, and a `config.toml` that points the server at it: start
+            `./veredus` from the archive folder.
             The sidecar needs glibc 2.36 or newer (Debian 12, Ubuntu 24.04 or
             later), also in the musl archives. There is no Windows sidecar
             yet. Its source is `sidecar/patches` and 0 A.D.'s v0.28.0 tag, see
