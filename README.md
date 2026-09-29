@@ -109,7 +109,8 @@ To host games from the in-game lobby instead, see
 - [Releases](https://github.com/victorcrimea/veredus/releases) and
   [0 A.D.](https://play0ad.com/)
 - On this page: [the sidecar](#extra-features-with-the-sidecar),
-  [restarts](#restarts), [lobby hosting](#hosting-in-the-multiplayer-lobby),
+  [restarts](#restarts), [the showcase](#an-ai-match-that-is-always-on),
+  [lobby hosting](#hosting-in-the-multiplayer-lobby),
   [configuration](#configuration), [running as a service](#running-as-a-service),
   [Docker](#running-with-docker),
   [building from source](#building-from-source),
@@ -176,6 +177,44 @@ copy of the match, which pauses the game for a moment. The same copy is
 given to players and observers who rejoin, so they do not stop the game
 each time. Change how often with `[saves] client_state_interval_secs`, or
 set it to 0 to turn it off. To start fresh instead, run with `--no-resume`.
+
+## An AI match that is always on
+
+The showcase runs AI-only matches one after another, so there is always a
+game anyone can join and watch. The server starts each match itself; nobody
+has to host it. It needs the [sidecar](#extra-features-with-the-sidecar),
+which plays every AI.
+
+A match to start from comes from a game you played with saving on: its
+folder under `saves` holds a `settings_ai.json`. Make every player in it an
+AI (set up the game that way, or edit the file), copy it somewhere, and list
+it in `config.toml`:
+
+```toml
+[showcase]
+enabled = true
+templates = ["showcase/rivers.json"]
+max_match_minutes = 90
+
+[observers]
+limit = 50
+delay_turns = 0
+chat = false
+```
+
+- `templates` can list several files; the server takes turns with them.
+  Every match gets new random seeds, so even one file gives a different game
+  each time.
+- `max_match_minutes` ends a match that is still running after that long, in
+  case the AIs never finish it.
+- Viewers join by address and port as usual and watch as observers. When a
+  match ends they are disconnected and join again for the next one, which
+  starts right away.
+- `chat = false` keeps viewers from chatting, since nobody is there to kick
+  anyone.
+
+The showcase runs on its own port without a lobby, and its matches are not
+saved.
 
 ## Hosting in the multiplayer lobby
 

@@ -466,6 +466,9 @@ pub struct ObserversSection {
     pub delay_turns: u32,
     /// Names that count as buddies under the buddies policy.
     pub buddies: Vec<String>,
+    /// Off, observers cannot chat; the host still can. A showcase has
+    /// no host to kick anyone, so turning this off there keeps it clean.
+    pub chat: bool,
 }
 
 impl Default for ObserversSection {
@@ -478,6 +481,7 @@ impl Default for ObserversSection {
             limit: config.observer_limit,
             delay_turns: config.observer_delay_turns,
             buddies,
+            chat: config.observer_chat,
         }
     }
 }
@@ -920,6 +924,7 @@ impl FileConfig {
                 .iter()
                 .cloned()
                 .collect::<HashSet<String>>(),
+            observer_chat: observers.chat,
             max_sessions: advanced.max_sessions,
             release_controller_on_leave: advanced.release_controller_on_leave,
             server_name: game_match.server_name.clone(),

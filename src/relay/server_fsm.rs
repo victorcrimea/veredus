@@ -391,6 +391,9 @@ pub struct Config {
     // live stream, where they may not pause.
     pub observer_delay_turns: u32,
     pub buddies: HashSet<String>,
+    // Off, observers' chat is dropped. A match with no host, like the
+    // showcase, has nobody to kick a spammer, so there only the relay speaks.
+    pub observer_chat: bool,
     pub max_sessions: usize,
     // Losing the controller is permanent in the stock server, which strands
     // the match with nobody able to start or configure it.
@@ -550,6 +553,7 @@ impl Default for Config {
             observer_lag_limit: None,
             observer_delay_turns: observer_feed::DEFAULT_DELAY_TURNS,
             buddies: HashSet::new(),
+            observer_chat: true,
             max_sessions: MAX_SESSIONS,
             release_controller_on_leave: true,
             server_name: "SERVER".to_string(),
@@ -3293,6 +3297,10 @@ impl<S: PhaseMarker> Server<S> {
     fn on_chat(&mut self, peer: PeerID, msg: Chat) -> Result<(), PeerFault> {
         // A joiner still pulling its snapshot receives chat but cannot send it.
         let uuid = self.ctx.speaker(peer, |s| s.is_setup() || s.is_in_game())?;
+        if !self.ctx.config.observer_chat && self.ctx.is_observer(&uuid) {
+            tracing::debug!(?peer, "observer chat is off, dropped");
+            return Ok(());
+        }
         let max_chars = self.ctx.config.chat_max_chars;
         if max_chars != 0 && msg.message.chars().count() > max_chars {
             tracing::debug!(?peer, "chat message too long, dropped");
