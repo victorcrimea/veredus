@@ -210,15 +210,28 @@ impl TurnManager {
     // Returns every turn that became releasable. Usually one, but a departure
     // can unblock several at once.
     pub fn release(&mut self, observer_lag_limit: Option<u32>) -> Vec<u32> {
+        self.release_paced(observer_lag_limit, None)
+    }
+
+    // `pace` is how many turns the wall clock allows, for a match that no
+    // player's client paces. With it the AI host blocks like any player and
+    // the match runs on with nobody else there.
+    pub fn release_paced(
+        &mut self,
+        observer_lag_limit: Option<u32>,
+        pace: Option<u32>,
+    ) -> Vec<u32> {
         let mut released = Vec::new();
-        while self.everyone_ahead(observer_lag_limit) {
+        while pace.is_none_or(|limit| (released.len() as u32) < limit)
+            && self.everyone_ahead(observer_lag_limit, pace.is_some())
+        {
             self.ready_turn += 1;
             released.push(self.ready_turn);
         }
         released
     }
 
-    fn everyone_ahead(&self, observer_lag_limit: Option<u32>) -> bool {
+    fn everyone_ahead(&self, observer_lag_limit: Option<u32>, clocked: bool) -> bool {
         // With nobody blocking there is nothing to wait for, and `all` over
         // the empty set would be true on every pass, running the turn counter
         // away in an endless loop. That is not only an empty match: once the
@@ -229,12 +242,14 @@ impl TurnManager {
         // no human blocks release it alone would race the match ahead of
         // anyone still watching, or, with nobody watching, play on unseen
         // for as long as the game lingers. Then every remaining client paces
-        // release, and with only the AI host left the match holds.
+        // release, and with only the AI host left the match holds. None of
+        // that applies when the wall clock paces release instead.
         let humans_block = self
             .clients
             .values()
             .any(|c| !c.ai_host && self.blocks(c, observer_lag_limit));
-        let ai_alone = !humans_block
+        let ai_alone = !clocked
+            && !humans_block
             && self
                 .clients
                 .values()

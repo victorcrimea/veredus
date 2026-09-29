@@ -57,6 +57,9 @@ const DEFAULT_SAVE_DIR: &str = "saves";
 const DEFAULT_SAVE_FLUSH_MS: u64 = 1000;
 // A match that crashes the server on every resume must not crash it forever.
 const DEFAULT_MAX_RESUME_ATTEMPTS: u32 = 3;
+// Longer than an AI match that ends on its own usually runs, so the cap only
+// ends the ones that stall.
+const DEFAULT_SHOWCASE_MATCH_MINUTES: u64 = 90;
 
 // One engine per core: a replay is CPU-bound, so running more at once than
 // there are cores only makes each one finish later. Read from the machine, which means a
@@ -481,7 +484,7 @@ impl Default for ObserversSection {
 
 /// Standalone mode only: an AI match that runs around the clock, with
 /// the relay starting each one itself, for anyone to watch.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Documented, DocumentedFields)]
+#[derive(Debug, Clone, Serialize, Deserialize, Documented, DocumentedFields)]
 #[serde(default, deny_unknown_fields)]
 pub struct ShowcaseSection {
     /// Set to host showcase matches instead of waiting for a player to
@@ -492,6 +495,19 @@ pub struct ShowcaseSection {
     /// gets fresh seeds, so one file already makes a different game
     /// each time.
     pub templates: Vec<PathBuf>,
+    /// A match still running after this many minutes of game time is
+    /// ended and the next one starts. 0 never ends one early.
+    pub max_match_minutes: u64,
+}
+
+impl Default for ShowcaseSection {
+    fn default() -> Self {
+        ShowcaseSection {
+            enabled: false,
+            templates: Vec::new(),
+            max_match_minutes: DEFAULT_SHOWCASE_MATCH_MINUTES,
+        }
+    }
 }
 
 /// How long players may hold a match paused.
@@ -945,6 +961,11 @@ impl FileConfig {
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
             scripted: self.showcase.enabled,
+            match_cap_turns: match_cap_turns(
+                self.showcase.enabled,
+                self.showcase.max_match_minutes,
+                advanced.turn_length_ms,
+            ),
             checkpoint_interval_turns,
             ..Config::default()
         }
@@ -1141,6 +1162,15 @@ fn client_state_interval_turns(sidecar: bool, secs: u64, turn_length_ms: u16) ->
     }
     let turns = secs.saturating_mul(1000) / u64::from(turn_length_ms);
     u32::try_from(turns).unwrap_or(u32::MAX).max(1)
+}
+
+// Operators think in minutes of play, the match counts in turns.
+fn match_cap_turns(showcase: bool, minutes: u64, turn_length_ms: u16) -> Option<u32> {
+    if !showcase || minutes == 0 || turn_length_ms == 0 {
+        return None;
+    }
+    let turns = minutes.saturating_mul(60_000) / u64::from(turn_length_ms);
+    Some(u32::try_from(turns).unwrap_or(u32::MAX).max(1))
 }
 
 // Follows the checkpoint interval unless set, and never turns the pulls off

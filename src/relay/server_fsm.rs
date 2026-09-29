@@ -153,6 +153,11 @@ const SHARE_COMMAND: &str = "!share";
 // The per-slot fields that make a stock client register and run an AI.
 const AI_FIELDS: [&str; 3] = ["AI", "AIDiff", "AIBehavior"];
 
+// How many turns a clock-paced match may fall behind the clock before it
+// stops trying to catch up. A held or slow AI host is waited for, not made
+// up afterwards in a burst the watchers would see as a jump.
+const PACE_BACKLOG_TURNS: i64 = 2;
+
 #[derive(Debug)]
 pub enum Input {
     Connected {
@@ -430,8 +435,12 @@ pub struct Config {
     // host that plays them, so no stock client has to compute the AI.
     pub hosted_ai: bool,
     // The showcase: the relay starts every match itself from a template, so
-    // no controller ever exists and nobody waits in setup for one.
+    // no controller ever exists and nobody waits in setup for one. No
+    // player's client paces such a match either, so the wall clock does.
     pub scripted: bool,
+    // A scripted match is ended once it has run this many turns. Nobody
+    // plays in it, and an AI match can stall for hours without a winner.
+    pub match_cap_turns: Option<u32>,
     // How many released turns a match runs between two sidecar checkpoints.
     // Each one resumes from the last, so a joiner is served a recent state
     // without anyone serializing for it, the outcome is followed while the
@@ -553,6 +562,7 @@ impl Default for Config {
             sidecar_dumps: false,
             hosted_ai: false,
             scripted: false,
+            match_cap_turns: None,
             checkpoint_interval_turns: 0,
             post_game_linger: TimeDelta::minutes(5),
             join_source_stall: Some(TimeDelta::seconds(30)),
@@ -682,6 +692,8 @@ pub(crate) struct Context {
     // The newest Input::Tick.now, so a handler can refill a rate limit
     // without reading the clock (A2).
     now: Option<DateTime<Utc>>,
+    // When the last clock-paced turn fell due, for `Config::scripted`.
+    pace_anchor: Option<DateTime<Utc>>,
     // The name the AI host authenticates under. Fixed per game, and only
     // honoured from loopback while an AI host is expected, so a remote client
     // that copies it off the slot list gains nothing.
@@ -1257,7 +1269,19 @@ impl Context {
     }
 
     fn release_turns(&mut self, turn_length_ms: u16) {
-        let released = self.turns.release(self.config.observer_lag_limit);
+        let pace = self
+            .config
+            .scripted
+            .then(|| self.clock_allowance(turn_length_ms));
+        let released = self
+            .turns
+            .release_paced(self.config.observer_lag_limit, pace);
+        if pace.is_some()
+            && let Some(anchor) = self.pace_anchor
+        {
+            let paced = TimeDelta::milliseconds(i64::from(turn_length_ms) * released.len() as i64);
+            self.pace_anchor = Some(anchor + paced);
+        }
         for turn in released {
             self.log.record_turn_length(turn, turn_length_ms);
             if self.config.saving {
@@ -1274,6 +1298,28 @@ impl Context {
             self.broadcast_live(&msg);
         }
         self.advance_feed();
+    }
+
+    // How many turns the clock has made due since the last one released:
+    // one per turn length, at most PACE_BACKLOG_TURNS. A clock that stepped
+    // backwards re-anchors rather than stalling (A7).
+    fn clock_allowance(&mut self, turn_length_ms: u16) -> u32 {
+        let Some(now) = self.now else {
+            return 0;
+        };
+        let turn = TimeDelta::milliseconds(i64::from(turn_length_ms.max(1)));
+        let anchor = *self.pace_anchor.get_or_insert(now);
+        let elapsed = now.signed_duration_since(anchor);
+        if elapsed < TimeDelta::zero() {
+            self.pace_anchor = Some(now);
+            return 0;
+        }
+        if elapsed > turn * PACE_BACKLOG_TURNS as i32 {
+            self.pace_anchor = Some(now - turn);
+            return 1;
+        }
+        let due = elapsed.num_milliseconds() / turn.num_milliseconds();
+        due.min(PACE_BACKLOG_TURNS) as u32
     }
 
     // Counts a player who is rejoining too, so a reconnect does not drain the
@@ -3124,6 +3170,16 @@ impl<S: PhaseMarker> Server<S> {
             self.ctx.effects.push(Effect::GameOver);
             return;
         }
+        // Idle AI players would leave a scripted match standing still until
+        // its cap, while a fresh one is only a minute away.
+        if self.ctx.config.scripted {
+            self.ctx.server_chat(
+                None,
+                "The AI players could not be restored. A new match starts shortly; reconnect then to watch it.",
+            );
+            self.ctx.effects.push(Effect::GameOver);
+            return;
+        }
         if held {
             self.ctx.server_pause(false);
         }
@@ -3672,6 +3728,7 @@ impl Server<Idle> {
                 created_at: None,
                 empty_since: None,
                 now: None,
+                pace_anchor: None,
                 ai_host_name: format!("AI host {}", &Guid::new().0[..8]),
                 ai_host: None,
                 lobby_map: None,
@@ -4322,9 +4379,24 @@ impl Server<InGame> {
                 }
                 self.on_common_input(Input::Disconnected { peer });
             }
+            Input::Tick { now, stats } => {
+                self.on_common_input(Input::Tick { now, stats });
+                // The clock paces a scripted match, so turns fall due
+                // between seals too.
+                if self.ctx.config.scripted {
+                    let turn_length = self.st.settings.turn_length_ms;
+                    self.release_turns(turn_length);
+                }
+            }
             other => self.on_common_input(other),
         }
         if self.resigned_out() {
+            return self.end_match(None).into();
+        }
+        if let Some(cap) = self.ctx.config.match_cap_turns
+            && self.ctx.turns.ready_turn() >= cap
+        {
+            tracing::info!(cap, "match reached its length cap");
             return self.end_match(None).into();
         }
         self.maybe_checkpoint();
@@ -4503,10 +4575,17 @@ impl Server<InGame> {
         if ctx.config.saving {
             ctx.effects.push(Effect::SaveStatus(Status::Finished));
         }
-        let text = format!(
-            "The match is over. This server closes in {}, or once everyone has left.",
-            describe_span(ctx.config.post_game_linger)
-        );
+        let text = if ctx.config.scripted {
+            format!(
+                "The match is over. This game closes in {} and a new match starts right after; reconnect then to watch it.",
+                describe_span(ctx.config.post_game_linger)
+            )
+        } else {
+            format!(
+                "The match is over. This server closes in {}, or once everyone has left.",
+                describe_span(ctx.config.post_game_linger)
+            )
+        };
         ctx.server_chat(None, &text);
         Server {
             ctx,
@@ -5467,6 +5546,10 @@ impl Server<PostGame> {
             Input::StateDumped { id, state } => self.on_state_dumped(id, state),
             Input::Tick { now, stats } => {
                 self.on_tick(now, stats);
+                if self.ctx.config.scripted {
+                    let turn_length = self.st.settings.turn_length_ms;
+                    self.release_turns(turn_length);
+                }
                 if self.close_due(now) {
                     self.ctx.effects.push(Effect::GameOver);
                 }
