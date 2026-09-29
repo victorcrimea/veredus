@@ -495,9 +495,10 @@ pub struct ShowcaseSection {
     /// set one up. Needs pyrogenesis_path.
     pub enabled: bool,
     /// Match settings to take turns with, each a settings_ai.json from a
-    /// saved match's folder in which every slot is an AI. Every match
-    /// gets fresh seeds, so one file already makes a different game
-    /// each time.
+    /// saved match's folder in which every slot is an AI. Empty uses
+    /// the two built-in 4v4s, on Mainland and Islands. Every match gets
+    /// fresh seeds, so one file already makes a different game each
+    /// time.
     pub templates: Vec<PathBuf>,
     /// A match still running after this many minutes of game time is
     /// ended and the next one starts. 0 never ends one early.
@@ -1035,9 +1036,6 @@ impl FileConfig {
             // Every showcase slot is an AI, and only the sidecar plays AI.
             if self.server.pyrogenesis_path().is_none() {
                 return Err("[showcase] needs [server] pyrogenesis_path".to_string());
-            }
-            if self.showcase.templates.is_empty() {
-                return Err("[showcase] templates must name at least one file".to_string());
             }
         }
         Ok(())

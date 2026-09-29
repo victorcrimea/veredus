@@ -1,0 +1,151 @@
+{
+  "gameSpeed": 1,
+  "map": "maps/random/islands",
+  "mapType": "random",
+  "matchID": "9F8ECF8D8D994B90",
+  "script": "islands.js",
+  "settings": {
+    "AISeed": 3863874573,
+    "AllyView": false,
+    "Biome": "generic/steppe",
+    "Ceasefire": 10,
+    "CheatsEnabled": false,
+    "CircularMap": true,
+    "DisableSpies": false,
+    "DisableTreasures": false,
+    "ExploreMap": true,
+    "LastManStanding": false,
+    "LockTeams": false,
+    "Nomad": false,
+    "PlayerData": [
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "ptol",
+        "Color": {
+          "b": 10,
+          "g": 10,
+          "r": 230
+        },
+        "Name": "Cleopatra II Philometora Soteira",
+        "Removed": false,
+        "Team": 0
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "pers",
+        "Color": {
+          "b": 190,
+          "g": 10,
+          "r": 10
+        },
+        "Name": "Darayavahush II",
+        "Removed": false,
+        "Team": 0
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "brit",
+        "Color": {
+          "b": 15,
+          "g": 235,
+          "r": 125
+        },
+        "Name": "Mandubracius",
+        "Removed": false,
+        "Team": 0
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "sele",
+        "Color": {
+          "b": 55,
+          "g": 255,
+          "r": 255
+        },
+        "Name": "Philip II Philoromaeus",
+        "Removed": false,
+        "Team": 0
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "ptol",
+        "Color": {
+          "b": 230,
+          "g": 0,
+          "r": 130
+        },
+        "Name": "Arsinoe IV",
+        "Removed": false,
+        "Team": 1
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "brit",
+        "Color": {
+          "b": 0,
+          "g": 130,
+          "r": 255
+        },
+        "Name": "Prasutagus",
+        "Removed": false,
+        "Team": 1
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "iber",
+        "Color": {
+          "b": 230,
+          "g": 230,
+          "r": 10
+        },
+        "Name": "Minurus",
+        "Removed": false,
+        "Team": 1
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "kush",
+        "Color": {
+          "b": 60,
+          "g": 80,
+          "r": 20
+        },
+        "Name": "Kashta",
+        "Removed": false,
+        "Team": 1
+      }
+    ],
+    "PopulationCap": 10000,
+    "PopulationCapType": "player",
+    "RevealMap": true,
+    "Seed": 2769267586,
+    "Size": 512,
+    "StartingResources": 3000,
+    "TriggerScripts": [
+      "scripts/TriggerHelper.js",
+      "scripts/ConquestCommon.js",
+      "scripts/Conquest.js"
+    ],
+    "VictoryConditions": [
+      "conquest"
+    ],
+    "mapName": "Islands",
+    "mapPreview": "cropped:0.78125,0.5859375:session/icons/mappreview/islands.png"
+  }
+}

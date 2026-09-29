@@ -10,8 +10,22 @@ use uuid::Uuid;
 // as the same number.
 const SEED_MASK: u32 = 0x7FFF_FFFF;
 
+// Built in, so a showcase runs with nothing but `enabled = true`. Both are
+// 4v4s of Petra, recorded from real matches.
+const PRESETS: [(&str, &[u8]); 2] = [
+    (
+        "preset:mainland-4v4",
+        include_bytes!("showcase/presets/mainland-4v4.json"),
+    ),
+    (
+        "preset:islands-4v4",
+        include_bytes!("showcase/presets/islands-4v4.json"),
+    ),
+];
+
 struct Template {
-    path: PathBuf,
+    // The file's path, or the preset's name.
+    label: String,
     json: Value,
 }
 
@@ -23,30 +37,20 @@ pub struct Showcase {
 }
 
 impl Showcase {
+    // No paths means the built-in presets. They go through the same checks
+    // as a file, so a broken one stops the server at startup too.
     pub fn load(paths: &[PathBuf]) -> Result<Showcase, String> {
-        let mut templates = Vec::with_capacity(paths.len());
-        for path in paths {
-            let data = std::fs::read(path).map_err(|error| {
-                format!(
-                    "failed to read showcase template '{}': {error}",
-                    path.display()
-                )
-            })?;
-            let json: Value = serde_json::from_slice(&data).map_err(|error| {
-                format!(
-                    "failed to parse showcase template '{}': {error}",
-                    path.display()
-                )
-            })?;
-            check(&json)
-                .map_err(|error| format!("showcase template '{}' {error}", path.display()))?;
-            templates.push(Template {
-                path: path.clone(),
-                json,
-            });
+        let mut templates = Vec::new();
+        if paths.is_empty() {
+            for (name, data) in PRESETS {
+                templates.push(parse(name.to_string(), data)?);
+            }
         }
-        if templates.is_empty() {
-            return Err("[showcase] templates must name at least one file".to_string());
+        for path in paths {
+            let label = path.display().to_string();
+            let data = std::fs::read(path)
+                .map_err(|error| format!("failed to read showcase template '{label}': {error}"))?;
+            templates.push(parse(label, &data)?);
         }
         // Shuffled once, so a restarted server does not open with the same
         // map every time, and then taken in turn, so none repeats before all
@@ -77,13 +81,20 @@ impl Showcase {
             );
         }
         tracing::info!(
-            template = %template.path.display(),
+            template = %template.label,
             seed,
             ai_seed,
             "showcase: next match"
         );
         serde_json::to_vec(&json).expect("a JSON value always serializes")
     }
+}
+
+fn parse(label: String, data: &[u8]) -> Result<Template, String> {
+    let json: Value = serde_json::from_slice(data)
+        .map_err(|error| format!("failed to parse showcase template '{label}': {error}"))?;
+    check(&json).map_err(|error| format!("showcase template '{label}' {error}"))?;
+    Ok(Template { label, json })
 }
 
 // A slot without an AI would wait for a player the showcase never has.

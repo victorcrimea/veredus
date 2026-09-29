@@ -185,15 +185,12 @@ game anyone can join and watch. The server starts each match itself; nobody
 has to host it. It needs the [sidecar](#extra-features-with-the-sidecar),
 which plays every AI.
 
-A match to start from comes from a game you played with saving on: its
-folder under `saves` holds a `settings_ai.json`. Make every player in it an
-AI (set up the game that way, or edit the file), copy it somewhere, and list
-it in `config.toml`:
+Two matches come built in, 4v4s of Petra on Mainland and Islands, so this
+is all it takes in `config.toml`:
 
 ```toml
 [showcase]
 enabled = true
-templates = ["showcase/rivers.json"]
 max_match_minutes = 90
 
 [observers]
@@ -202,9 +199,13 @@ delay_turns = 0
 chat = false
 ```
 
-- `templates` can list several files; the server takes turns with them.
-  Every match gets new random seeds, so even one file gives a different game
-  each time.
+- To show your own matches instead, list them in `templates`. A match to
+  start from comes from a game you played with saving on: its folder under
+  `saves` holds a `settings_ai.json`. Make every player in it an AI (set up
+  the game that way, or edit the file) and copy it somewhere, then add
+  `templates = ["showcase/rivers.json"]`. The server takes turns with the
+  files, and every match gets new random seeds, so even one file gives a
+  different game each time.
 - `max_match_minutes` ends a match that is still running after that long, in
   case the AIs never finish it.
 - Viewers join by address and port as usual and watch as observers. When a

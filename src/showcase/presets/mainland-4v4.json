@@ -1,0 +1,152 @@
+{
+  "gameSpeed": 1,
+  "map": "maps/random/mainland",
+  "mapType": "random",
+  "matchID": "4BD6C324304CE656",
+  "script": "mainland.js",
+  "settings": {
+    "AISeed": 1549889789,
+    "AllyView": false,
+    "Biome": "generic/sahara",
+    "Ceasefire": 15,
+    "CheatsEnabled": false,
+    "CircularMap": true,
+    "DisableSpies": false,
+    "DisableTreasures": false,
+    "ExploreMap": true,
+    "LastManStanding": false,
+    "LockTeams": true,
+    "Nomad": false,
+    "PlayerData": [
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "cart",
+        "Color": {
+          "b": 10,
+          "g": 10,
+          "r": 230
+        },
+        "Name": "Hanno the Great",
+        "Removed": false,
+        "Team": 0
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "cart",
+        "Color": {
+          "b": 190,
+          "g": 10,
+          "r": 10
+        },
+        "Name": "Hasdrubal the Fair",
+        "Removed": false,
+        "Team": 0
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "mace",
+        "Color": {
+          "b": 15,
+          "g": 235,
+          "r": 125
+        },
+        "Name": "Philip V",
+        "Removed": false,
+        "Team": 0
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "han",
+        "Color": {
+          "b": 55,
+          "g": 255,
+          "r": 255
+        },
+        "Name": "Liu Bing",
+        "Removed": false,
+        "Team": 0
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "pers",
+        "Color": {
+          "b": 230,
+          "g": 0,
+          "r": 130
+        },
+        "Name": "Darayavahush II",
+        "Removed": false,
+        "Team": 1
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "athen",
+        "Color": {
+          "b": 0,
+          "g": 130,
+          "r": 255
+        },
+        "Name": "Cleon",
+        "Removed": false,
+        "Team": 1
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "pers",
+        "Color": {
+          "b": 230,
+          "g": 230,
+          "r": 10
+        },
+        "Name": "Artaxshacha II",
+        "Removed": false,
+        "Team": 1
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "random",
+        "AIDiff": "5",
+        "Civ": "gaul",
+        "Color": {
+          "b": 60,
+          "g": 80,
+          "r": 20
+        },
+        "Name": "Cingetorix",
+        "Removed": false,
+        "Team": 1
+      }
+    ],
+    "PlayerPlacement": "stronghold",
+    "PopulationCap": 10000,
+    "PopulationCapType": "player",
+    "RevealMap": true,
+    "Seed": 169935779,
+    "Size": 384,
+    "StartingResources": 3000,
+    "TriggerScripts": [
+      "scripts/TriggerHelper.js",
+      "scripts/ConquestCommon.js",
+      "scripts/Conquest.js"
+    ],
+    "VictoryConditions": [
+      "conquest"
+    ],
+    "mapName": "Mainland",
+    "mapPreview": "cropped:0.78125,0.5859375:session/icons/mappreview/mainland.png"
+  }
+}
