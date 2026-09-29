@@ -60,6 +60,8 @@ const DEFAULT_MAX_RESUME_ATTEMPTS: u32 = 3;
 // Longer than an AI match that ends on its own usually runs, so the cap only
 // ends the ones that stall.
 const DEFAULT_SHOWCASE_MATCH_MINUTES: u64 = 90;
+// The fastest the engine has been seen to keep up with a 4v4 of Petra.
+const MAX_SHOWCASE_SPEED: f64 = 20.0;
 
 // One engine per core: a replay is CPU-bound, so running more at once than
 // there are cores only makes each one finish later. Read from the machine, which means a
@@ -503,6 +505,10 @@ pub struct ShowcaseSection {
     /// A match still running after this many minutes of game time is
     /// ended and the next one starts. 0 never ends one early.
     pub max_match_minutes: u64,
+    /// How fast matches run: 2 is double speed, 0.5 half. The cap above
+    /// counts game time, so at 2 a 90-minute match ends after 45 real
+    /// minutes. At most 20.
+    pub speed: f64,
 }
 
 impl Default for ShowcaseSection {
@@ -511,6 +517,7 @@ impl Default for ShowcaseSection {
             enabled: false,
             templates: Vec::new(),
             max_match_minutes: DEFAULT_SHOWCASE_MATCH_MINUTES,
+            speed: 1.0,
         }
     }
 }
@@ -972,6 +979,7 @@ impl FileConfig {
                 self.showcase.max_match_minutes,
                 advanced.turn_length_ms,
             ),
+            pace_interval: pace_interval(advanced.turn_length_ms, self.showcase.speed),
             checkpoint_interval_turns,
             ..Config::default()
         }
@@ -1036,6 +1044,12 @@ impl FileConfig {
             // Every showcase slot is an AI, and only the sidecar plays AI.
             if self.server.pyrogenesis_path().is_none() {
                 return Err("[showcase] needs [server] pyrogenesis_path".to_string());
+            }
+            let speed = self.showcase.speed;
+            if !(speed > 0.0 && speed <= MAX_SHOWCASE_SPEED) {
+                return Err(format!(
+                    "[showcase] speed must be above 0 and at most {MAX_SHOWCASE_SPEED}, got {speed}"
+                ));
             }
         }
         Ok(())
@@ -1174,6 +1188,14 @@ fn match_cap_turns(showcase: bool, minutes: u64, turn_length_ms: u16) -> Option<
     }
     let turns = minutes.saturating_mul(60_000) / u64::from(turn_length_ms);
     Some(u32::try_from(turns).unwrap_or(u32::MAX).max(1))
+}
+
+// A turn is always turn_length_ms of game time; speed only changes how
+// soon in wall time the next one is released.
+fn pace_interval(turn_length_ms: u16, speed: f64) -> TimeDelta {
+    let speed = if speed > 0.0 { speed } else { 1.0 };
+    let micros = (f64::from(turn_length_ms) * 1000.0 / speed).round() as i64;
+    TimeDelta::microseconds(micros.max(1))
 }
 
 // Follows the checkpoint interval unless set, and never turns the pulls off

@@ -147,21 +147,23 @@ async fn main() {
             .await;
             Ok(())
         }
-        None if config.showcase.enabled => match Showcase::load(&config.showcase.templates) {
-            Ok(showcase) => {
-                run_standalone(
-                    &mut pool,
-                    &config,
-                    base,
-                    pyrogenesis_path,
-                    outcome_dir,
-                    None,
-                    Some(showcase),
-                )
-                .await
+        None if config.showcase.enabled => {
+            match Showcase::load(&config.showcase.templates, config.showcase.speed) {
+                Ok(showcase) => {
+                    run_standalone(
+                        &mut pool,
+                        &config,
+                        base,
+                        pyrogenesis_path,
+                        outcome_dir,
+                        None,
+                        Some(showcase),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
             }
-            Err(error) => Err(error),
-        },
+        }
         None => {
             let resumable = pick_resumable(&config, save.as_ref(), &base).await;
             run_standalone(

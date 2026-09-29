@@ -34,12 +34,15 @@ struct Template {
 pub struct Showcase {
     templates: Vec<Template>,
     next: usize,
+    // Written into every match as its gameSpeed, since the clients take
+    // their own simulation speed from it; the relay paces turns to match.
+    speed: f64,
 }
 
 impl Showcase {
     // No paths means the built-in presets. They go through the same checks
     // as a file, so a broken one stops the server at startup too.
-    pub fn load(paths: &[PathBuf]) -> Result<Showcase, String> {
+    pub fn load(paths: &[PathBuf], speed: f64) -> Result<Showcase, String> {
         let mut templates = Vec::new();
         if paths.is_empty() {
             for (name, data) in PRESETS {
@@ -59,7 +62,11 @@ impl Showcase {
             let j = (random_u64() % (i as u64 + 1)) as usize;
             templates.swap(i, j);
         }
-        Ok(Showcase { templates, next: 0 })
+        Ok(Showcase {
+            templates,
+            next: 0,
+            speed,
+        })
     }
 
     // Fresh seeds are what make a template a new game: with the same ones
@@ -74,7 +81,14 @@ impl Showcase {
             settings.insert("Seed".to_string(), seed.into());
             settings.insert("AISeed".to_string(), ai_seed.into());
         }
+        // A whole number stays an integer, the way the game writes it.
+        let speed = if self.speed.fract() == 0.0 {
+            Value::from(self.speed as i64)
+        } else {
+            Value::from(self.speed)
+        };
         if let Some(root) = json.as_object_mut() {
+            root.insert("gameSpeed".to_string(), speed);
             root.insert(
                 "matchID".to_string(),
                 format!("{:016X}", random_u64()).into(),
@@ -84,6 +98,7 @@ impl Showcase {
             template = %template.label,
             seed,
             ai_seed,
+            speed = self.speed,
             "showcase: next match"
         );
         serde_json::to_vec(&json).expect("a JSON value always serializes")

@@ -192,6 +192,7 @@ is all it takes in `config.toml`:
 [showcase]
 enabled = true
 max_match_minutes = 90
+speed = 1.0
 
 [observers]
 limit = 50
@@ -208,6 +209,9 @@ chat = false
   different game each time.
 - `max_match_minutes` ends a match that is still running after that long, in
   case the AIs never finish it.
+- `speed` runs the matches faster or slower: 2 is double speed. Viewers see
+  the match at that speed. The minutes above are game time, so at double
+  speed they pass twice as fast.
 - Viewers join by address and port as usual and watch as observers. When a
   match ends they are disconnected and join again for the next one, which
   starts right away.

@@ -444,6 +444,9 @@ pub struct Config {
     // A scripted match is ended once it has run this many turns. Nobody
     // plays in it, and an AI match can stall for hours without a winner.
     pub match_cap_turns: Option<u32>,
+    // The wall time between two clock-paced turns. Each turn is still
+    // turn_length_ms of game time; a shorter interval is a faster match.
+    pub pace_interval: TimeDelta,
     // How many released turns a match runs between two sidecar checkpoints.
     // Each one resumes from the last, so a joiner is served a recent state
     // without anyone serializing for it, the outcome is followed while the
@@ -567,6 +570,7 @@ impl Default for Config {
             hosted_ai: false,
             scripted: false,
             match_cap_turns: None,
+            pace_interval: TimeDelta::milliseconds(200),
             checkpoint_interval_turns: 0,
             post_game_linger: TimeDelta::minutes(5),
             join_source_stall: Some(TimeDelta::seconds(30)),
@@ -1273,18 +1277,14 @@ impl Context {
     }
 
     fn release_turns(&mut self, turn_length_ms: u16) {
-        let pace = self
-            .config
-            .scripted
-            .then(|| self.clock_allowance(turn_length_ms));
+        let pace = self.config.scripted.then(|| self.clock_allowance());
         let released = self
             .turns
             .release_paced(self.config.observer_lag_limit, pace);
         if pace.is_some()
             && let Some(anchor) = self.pace_anchor
         {
-            let paced = TimeDelta::milliseconds(i64::from(turn_length_ms) * released.len() as i64);
-            self.pace_anchor = Some(anchor + paced);
+            self.pace_anchor = Some(anchor + self.config.pace_interval * released.len() as i32);
         }
         for turn in released {
             self.log.record_turn_length(turn, turn_length_ms);
@@ -1305,25 +1305,28 @@ impl Context {
     }
 
     // How many turns the clock has made due since the last one released:
-    // one per turn length, at most PACE_BACKLOG_TURNS. A clock that stepped
-    // backwards re-anchors rather than stalling (A7).
-    fn clock_allowance(&mut self, turn_length_ms: u16) -> u32 {
+    // one per `Config::pace_interval`, at most PACE_BACKLOG_TURNS. A clock
+    // that stepped backwards re-anchors rather than stalling (A7).
+    fn clock_allowance(&mut self) -> u32 {
         let Some(now) = self.now else {
             return 0;
         };
-        let turn = TimeDelta::milliseconds(i64::from(turn_length_ms.max(1)));
+        let interval = self.config.pace_interval;
         let anchor = *self.pace_anchor.get_or_insert(now);
         let elapsed = now.signed_duration_since(anchor);
         if elapsed < TimeDelta::zero() {
             self.pace_anchor = Some(now);
             return 0;
         }
-        if elapsed > turn * PACE_BACKLOG_TURNS as i32 {
-            self.pace_anchor = Some(now - turn);
+        if elapsed > interval * PACE_BACKLOG_TURNS as i32 {
+            self.pace_anchor = Some(now - interval);
             return 1;
         }
-        let due = elapsed.num_milliseconds() / turn.num_milliseconds();
-        due.min(PACE_BACKLOG_TURNS) as u32
+        // Microseconds, since a faster match's interval is no whole number
+        // of milliseconds.
+        let elapsed_us = elapsed.num_microseconds().unwrap_or(i64::MAX);
+        let interval_us = interval.num_microseconds().unwrap_or(1).max(1);
+        (elapsed_us / interval_us).min(PACE_BACKLOG_TURNS) as u32
     }
 
     // Counts a player who is rejoining too, so a reconnect does not drain the
