@@ -3,6 +3,24 @@
 What changed in each Veredus release, for people running the server.
 The newest release is first.
 
+## [0.5.0] - 2026-09-29
+
+Changes since 0.4.0.
+
+### Added
+- Showcase mode (`[showcase]` table, standalone only, needs the sidecar):
+  the server starts AI-only matches one after another, so there is always a
+  game anyone can join and watch. Two 4v4s of Petra, on Mainland and
+  Islands, come built in, so `enabled = true` is all it takes. To show your
+  own matches, list `settings_ai.json` files from saved matches in
+  `templates`. Every match gets new random seeds. `max_match_minutes`
+  (default 90, 0 never) ends a match that runs too long, and `speed`
+  (default 1, up to 20) runs matches faster or slower. When a match ends,
+  viewers are disconnected and join again for the next one. Showcase
+  matches are not saved.
+- `[observers] chat` (on by default): turn it off to stop observers from
+  chatting. The host and the players can still chat.
+
 ## [0.4.0] - 2026-09-25
 
 Changes since 0.3.0, including the 0.3.x patch releases.
