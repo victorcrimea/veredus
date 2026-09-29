@@ -73,6 +73,9 @@ pub struct GameConfig {
     // A saved match to resume instead of hosting a fresh one. It keeps its
     // game id and carries on in its own bundle; it needs `save` for that.
     pub resume: Option<Resumable>,
+    // The showcase's START_SETTINGS: the game starts this match itself
+    // instead of waiting for a controller to set one up.
+    pub scripted_start: Option<Vec<u8>>,
 }
 
 struct GameHandle {
@@ -144,6 +147,7 @@ impl GamePool {
             outcome_dir,
             save,
             resume,
+            scripted_start,
         } = config;
         server_config.saving = save.is_some();
         let resume_game_id = match &resume {
@@ -250,9 +254,10 @@ impl GamePool {
                 let idle = Server::<Idle>::new(server_config);
                 // A fresh game is parked in the listening state, which is
                 // the phase a relay spends its whole idle life in.
-                let initial = match resume_data {
-                    Some(data) => AnyServer::from(idle.resume(data)),
-                    None => AnyServer::from(idle.listen()),
+                let initial = match (resume_data, scripted_start) {
+                    (Some(data), _) => AnyServer::from(idle.resume(data)),
+                    (None, Some(settings)) => idle.listen().scripted_start(settings),
+                    (None, None) => AnyServer::from(idle.listen()),
                 };
                 run_game_server(
                     event_rx,

@@ -10,5 +10,6 @@ pub mod metrics;
 pub mod network_message;
 pub mod relay;
 pub mod savegame;
+pub mod showcase;
 pub mod sidecar;
 pub mod utils;

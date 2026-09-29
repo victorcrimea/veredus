@@ -30,12 +30,16 @@ use veredus::savegame::bundle::Mode;
 use veredus::savegame::resume;
 use veredus::savegame::resume::Expect;
 use veredus::savegame::resume::Resumable;
+use veredus::showcase::Showcase;
 
 // Default directive when neither the environment nor the config file sets one.
 // Rocket logs every request and its launch banner at info through `log`,
 // which tracing has already claimed by the time Rocket starts, so its own
 // log_level setting cannot quiet it; only a directive here can.
 const DEFAULT_LOG_DIRECTIVES: &str = "info,rocket=error,_=error,hyper=error";
+// Between two showcase games: short next to a match, long enough that an
+// engine failing at every start costs little.
+const SHOWCASE_RESTART_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
 
 // musl's own allocator takes one global lock, which every game's socket and
 // tick threads would then contend on.
@@ -143,6 +147,21 @@ async fn main() {
             .await;
             Ok(())
         }
+        None if config.showcase.enabled => match Showcase::load(&config.showcase.templates) {
+            Ok(showcase) => {
+                run_standalone(
+                    &mut pool,
+                    &config,
+                    base,
+                    pyrogenesis_path,
+                    outcome_dir,
+                    None,
+                    Some(showcase),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        },
         None => {
             let resumable = pick_resumable(&config, save.as_ref(), &base).await;
             run_standalone(
@@ -152,6 +171,7 @@ async fn main() {
                 pyrogenesis_path,
                 outcome_dir,
                 resumable,
+                None,
             )
             .await
         }
@@ -388,7 +408,7 @@ async fn pick_lobby_resumables(
 
 // Hosts one game after another on the same port, or only one when
 // `exit_after_game` hands restarting over to a supervisor. `resumable`, when
-// set, is the first game.
+// set, is the first game. With `showcase` every game starts its own match.
 async fn run_standalone(
     pool: &mut GamePool,
     config: &FileConfig,
@@ -396,10 +416,17 @@ async fn run_standalone(
     pyrogenesis_path: Option<PathBuf>,
     outcome_dir: Option<PathBuf>,
     mut resumable: Option<Resumable>,
+    mut showcase: Option<Showcase>,
 ) -> Result<(), String> {
     let port = config.server.port;
     let exit_after_game = config.server.exit_after_game;
-    let save = config.save_setup("");
+    // A showcase match is not worth resuming: nobody plays in it, and the
+    // next one starts within a minute anyway.
+    let save = if showcase.is_some() {
+        None
+    } else {
+        config.save_setup("")
+    };
     // One future for the whole run, so a signal that arrives between two
     // games is not missed.
     let shutdown = shutdown_signal();
@@ -417,6 +444,7 @@ async fn run_standalone(
             outcome_dir: outcome_dir.clone(),
             save: save.clone(),
             resume: resumable.take(),
+            scripted_start: showcase.as_mut().map(Showcase::next_start),
         })?;
         tracing::info!(game_id = %game_id, port, "game running");
 
@@ -447,6 +475,17 @@ async fn run_standalone(
             return Ok(());
         }
         tracing::info!("game ended, hosting a fresh one");
+        // A showcase game that cannot start ends at once, and without a pause
+        // an engine that always fails would be respawned in a tight loop.
+        if showcase.is_some() {
+            tokio::select! {
+                signal = &mut shutdown => {
+                    tracing::info!(signal, "shutting down");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(SHOWCASE_RESTART_PAUSE) => {}
+            }
+        }
     }
 }
 
@@ -552,6 +591,7 @@ async fn host_lobby_game(
             ..setup
         }),
         resume,
+        scripted_start: None,
     });
     let (game_id, port) = match created {
         Ok(created) => created,

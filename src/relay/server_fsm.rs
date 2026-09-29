@@ -429,6 +429,9 @@ pub struct Config {
     // When set, a match whose settings have AI slots gets a pyrogenesis AI
     // host that plays them, so no stock client has to compute the AI.
     pub hosted_ai: bool,
+    // The showcase: the relay starts every match itself from a template, so
+    // no controller ever exists and nobody waits in setup for one.
+    pub scripted: bool,
     // How many released turns a match runs between two sidecar checkpoints.
     // Each one resumes from the last, so a joiner is served a recent state
     // without anyone serializing for it, the outcome is followed while the
@@ -549,6 +552,7 @@ impl Default for Config {
             initiator_nets: None,
             sidecar_dumps: false,
             hosted_ai: false,
+            scripted: false,
             checkpoint_interval_turns: 0,
             post_game_linger: TimeDelta::minutes(5),
             join_source_stall: Some(TimeDelta::seconds(30)),
@@ -2473,6 +2477,14 @@ impl<S: PhaseMarker> Server<S> {
             return Ok(());
         }
 
+        // A scripted match has no setup screen worth waiting in: nobody
+        // would ever send the settings a stock client waits for there, so a
+        // viewer comes back once the match runs and joins it as an observer.
+        if S::PHASE == Phase::Setup && self.ctx.config.scripted && !is_ai_host {
+            self.disconnect(peer, DisconnectReason::ServerLoading);
+            return Ok(());
+        }
+
         // Only the initiator's own name is taken from the trusted address;
         // it then counts as that lobby name for every rule below.
         if from_initiator_addr {
@@ -3886,9 +3898,30 @@ impl Server<Setup> {
             self.begin_match(msg, None);
             return Some(StartOutcome::Started(settings));
         };
+        Some(StartOutcome::AwaitAiHost(self.hold_for_ai_host(split)))
+    }
 
-        // The start goes out only once the AI host is in, so that it loads
-        // with everyone else and holds its place in turn release from turn 1.
+    // The showcase's start, from a template instead of a controller. Every
+    // slot is an AI, so without the AI host there is nothing to start; the
+    // game then ends at once and the next one gets a fresh try.
+    pub fn scripted_start(mut self, init_attributes: Vec<u8>) -> AnyServer {
+        let split = if self.ctx.config.hosted_ai {
+            split_ai_settings(&init_attributes)
+        } else {
+            None
+        };
+        let Some(split) = split else {
+            tracing::error!("showcase: the template has no AI slots or the sidecar is off");
+            self.ctx.effects.push(Effect::GameOver);
+            return self.into();
+        };
+        let held = self.hold_for_ai_host(split);
+        self.with_state(held).into()
+    }
+
+    // The start goes out only once the AI host is in, so that it loads with
+    // everyone else and holds its place in turn release from turn 1.
+    fn hold_for_ai_host(&mut self, split: AiSettingsSplit) -> AwaitAiHost {
         tracing::info!(ai_players = ?split.players, "sidecar: holding start for the AI host");
         let mut settings = self.freeze(&split.stock);
         settings.ai_json = Some(split.ai_host.clone());
@@ -3903,7 +3936,7 @@ impl Server<Setup> {
         });
         let name = self.ctx.ai_host_name.clone();
         self.ctx.effects.push(Effect::SpawnAiHost { name });
-        Some(StartOutcome::AwaitAiHost(AwaitAiHost {
+        AwaitAiHost {
             settings,
             start: StartSettings {
                 init_attributes: split.stock,
@@ -3912,7 +3945,7 @@ impl Server<Setup> {
                 init_attributes: split.ai_host,
             },
             requested_at: None,
-        }))
+        }
     }
 
     // Refused, and deliberately left unimplemented: a stock client offers
@@ -4003,7 +4036,7 @@ impl Server<AwaitAiHost> {
                     .controller
                     .as_ref()
                     .is_some_and(|c| self.ctx.peer_of(c).is_some());
-                if !controller_present {
+                if !controller_present && !self.ctx.config.scripted {
                     return self.refuse_start("the controller left").into();
                 }
                 self.into()
@@ -4064,6 +4097,10 @@ impl Server<AwaitAiHost> {
             None,
             "The AI host failed to start; the game was not started.",
         );
+        // Nobody would send another start, so the next game gets a fresh try.
+        if self.ctx.config.scripted {
+            self.ctx.effects.push(Effect::GameOver);
+        }
         self.with_state(Setup)
     }
 }

@@ -140,6 +140,10 @@ pub fn parse_args() -> Result<Command, String> {
     if config.personal.enabled && args.lobby_config.is_some() {
         return Err("--lobby-config and personal mode cannot be used together".to_string());
     }
+    let any_lobby = args.lobby_config.is_some() || config.lobby.enabled || config.personal.enabled;
+    if config.showcase.enabled && any_lobby {
+        return Err("[showcase] runs in standalone mode only, without a lobby".to_string());
+    }
     let lobby = match args.lobby_config {
         Some(path) => Some(load_lobby_json(&path)?),
         None if config.lobby.enabled => Some(config.lobby.to_lobby_config()?),

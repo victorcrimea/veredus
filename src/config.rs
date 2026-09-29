@@ -87,6 +87,7 @@ pub struct FileConfig {
     #[serde(rename = "match")]
     pub game_match: MatchSection,
     pub observers: ObserversSection,
+    pub showcase: ShowcaseSection,
     pub pause: PauseSection,
     pub saves: SavesSection,
     pub metrics: MetricsSection,
@@ -476,6 +477,21 @@ impl Default for ObserversSection {
             buddies,
         }
     }
+}
+
+/// Standalone mode only: an AI match that runs around the clock, with
+/// the relay starting each one itself, for anyone to watch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Documented, DocumentedFields)]
+#[serde(default, deny_unknown_fields)]
+pub struct ShowcaseSection {
+    /// Set to host showcase matches instead of waiting for a player to
+    /// set one up. Needs pyrogenesis_path.
+    pub enabled: bool,
+    /// Match settings to take turns with, each a settings_ai.json from a
+    /// saved match's folder in which every slot is an AI. Every match
+    /// gets fresh seeds, so one file already makes a different game
+    /// each time.
+    pub templates: Vec<PathBuf>,
 }
 
 /// How long players may hold a match paused.
@@ -928,6 +944,7 @@ impl FileConfig {
             ai_heal_timeout: secs_to_opt_delta(self.sidecar.ai_heal_timeout_secs),
             sidecar_dumps: sidecar,
             hosted_ai: sidecar,
+            scripted: self.showcase.enabled,
             checkpoint_interval_turns,
             ..Config::default()
         }
@@ -988,6 +1005,15 @@ impl FileConfig {
         if self.lobby.enabled && self.personal.enabled {
             return Err("[lobby] and [personal] cannot both be enabled".to_string());
         }
+        if self.showcase.enabled {
+            // Every showcase slot is an AI, and only the sidecar plays AI.
+            if self.server.pyrogenesis_path().is_none() {
+                return Err("[showcase] needs [server] pyrogenesis_path".to_string());
+            }
+            if self.showcase.templates.is_empty() {
+                return Err("[showcase] templates must name at least one file".to_string());
+            }
+        }
         Ok(())
     }
 
@@ -1024,6 +1050,7 @@ fn decorate_default(doc: &mut DocumentMut) {
     decorate_section::<PersonalSection>(doc, "personal");
     decorate_section::<MatchSection>(doc, "match");
     decorate_section::<ObserversSection>(doc, "observers");
+    decorate_section::<ShowcaseSection>(doc, "showcase");
     decorate_section::<PauseSection>(doc, "pause");
     decorate_section::<SavesSection>(doc, "saves");
     decorate_section::<MetricsSection>(doc, "metrics");
