@@ -62,6 +62,11 @@ const DEFAULT_MAX_RESUME_ATTEMPTS: u32 = 3;
 const DEFAULT_SHOWCASE_MATCH_MINUTES: u64 = 90;
 // The fastest the engine has been seen to keep up with a 4v4 of Petra.
 const MAX_SHOWCASE_SPEED: f64 = 20.0;
+// A stock client does not hold its game speed exactly: at 1x it drifts a
+// little either way against a relay releasing one turn per turn length, and
+// nothing in a showcase waits for it. Releasing turns a tenth slower than the
+// match's gameSpeed leaves every viewer that much headroom to stay live.
+const SHOWCASE_PACE_SHARE: f64 = 0.9;
 
 // One engine per core: a replay is CPU-bound, so running more at once than
 // there are cores only makes each one finish later. Read from the machine, which means a
@@ -505,9 +510,10 @@ pub struct ShowcaseSection {
     /// A match still running after this many minutes of game time is
     /// ended and the next one starts. 0 never ends one early.
     pub max_match_minutes: u64,
-    /// How fast matches run: 2 is double speed, 0.5 half. The cap above
-    /// counts game time, so at 2 a 90-minute match ends after 45 real
-    /// minutes. At most 20.
+    /// How fast matches run: 2 is double speed, 0.5 half. Turns are
+    /// released at 90% of it, so viewers never fall behind. The cap above
+    /// counts game time, so at 2 a 90-minute match ends after about 50
+    /// real minutes. At most 20.
     pub speed: f64,
 }
 
@@ -1194,7 +1200,8 @@ fn match_cap_turns(showcase: bool, minutes: u64, turn_length_ms: u16) -> Option<
 // soon in wall time the next one is released.
 fn pace_interval(turn_length_ms: u16, speed: f64) -> TimeDelta {
     let speed = if speed > 0.0 { speed } else { 1.0 };
-    let micros = (f64::from(turn_length_ms) * 1000.0 / speed).round() as i64;
+    let pace = speed * SHOWCASE_PACE_SHARE;
+    let micros = (f64::from(turn_length_ms) * 1000.0 / pace).round() as i64;
     TimeDelta::microseconds(micros.max(1))
 }
 
