@@ -218,8 +218,12 @@ chat = false
 - `chat = false` keeps viewers from chatting, since nobody is there to kick
   anyone.
 
-The showcase runs on its own port without a lobby, and its matches are not
-saved.
+The showcase runs on its own port without a lobby. Its matches are saved
+into `saves` like any other, so you can look into a problem later, but they
+are never resumed: a restarted showcase starts a fresh match. A match that
+ended is deleted unless you set `keep_finished = true` under `[saves]`. Give
+the showcase a `saves` folder of its own, since a normal server started on
+the same folder would resume a showcase match that was stopped.
 
 ## Hosting in the multiplayer lobby
 

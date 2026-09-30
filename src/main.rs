@@ -422,13 +422,10 @@ async fn run_standalone(
 ) -> Result<(), String> {
     let port = config.server.port;
     let exit_after_game = config.server.exit_after_game;
-    // A showcase match is not worth resuming: nobody plays in it, and the
-    // next one starts within a minute anyway.
-    let save = if showcase.is_some() {
-        None
-    } else {
-        config.save_setup("")
-    };
+    // Showcase matches are saved like any other, as a record to debug from,
+    // but never resumed (the caller passes no `resumable`): nobody plays in
+    // one, and the next starts within a minute anyway.
+    let save = config.save_setup("");
     // One future for the whole run, so a signal that arrives between two
     // games is not missed.
     let shutdown = shutdown_signal();

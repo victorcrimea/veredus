@@ -1928,8 +1928,11 @@ impl<S> Server<S> {
     // Without a sidecar or a saved state nothing can rebuild the state, so
     // the line stays the plain one.
     fn stop_saved(mut self, reason: &str) -> Vec<Effect> {
-        let resumable =
-            self.ctx.config.sidecar_dumps || self.ctx.client_pull.as_ref().is_some_and(|p| p.saved);
+        // A scripted match is saved only as a record; the restarted server
+        // starts a fresh one instead.
+        let resumable = !self.ctx.config.scripted
+            && (self.ctx.config.sidecar_dumps
+                || self.ctx.client_pull.as_ref().is_some_and(|p| p.saved));
         if resumable {
             let text = format!(
                 "Server is restarting. This match is saved at turn {} and will continue: reconnect in a minute.",
@@ -3172,6 +3175,20 @@ impl<S: PhaseMarker> Server<S> {
         if S::PHASE == Phase::Resuming {
             return;
         }
+        // Idle AI players would leave a scripted match standing still until
+        // its cap, while a fresh one is only a minute away. Checked before
+        // keeping the match for a restart, since a scripted one never is.
+        if self.ctx.config.scripted {
+            self.ctx.server_chat(
+                None,
+                "The AI players could not be restored. A new match starts shortly; reconnect then to watch it.",
+            );
+            if self.ctx.config.saving {
+                self.ctx.effects.push(Effect::SaveStatus(Status::Finished));
+            }
+            self.ctx.effects.push(Effect::GameOver);
+            return;
+        }
         if self.ctx.config.saving && self.ctx.ai_state.is_some() {
             self.ctx.server_chat(
                 None,
@@ -3179,16 +3196,6 @@ impl<S: PhaseMarker> Server<S> {
             );
             self.ctx.effects.push(Effect::SaveStatus(Status::Stopped));
             self.ctx.kept_for_restart = true;
-            self.ctx.effects.push(Effect::GameOver);
-            return;
-        }
-        // Idle AI players would leave a scripted match standing still until
-        // its cap, while a fresh one is only a minute away.
-        if self.ctx.config.scripted {
-            self.ctx.server_chat(
-                None,
-                "The AI players could not be restored. A new match starts shortly; reconnect then to watch it.",
-            );
             self.ctx.effects.push(Effect::GameOver);
             return;
         }
