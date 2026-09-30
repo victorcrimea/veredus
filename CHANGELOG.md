@@ -3,6 +3,23 @@
 What changed in each Veredus release, for people running the server.
 The newest release is first.
 
+## [0.5.1] - 2026-09-30
+
+### Changed
+- Showcase matches are now saved into `[saves] dir` like any other game, so
+  you can look into a problem afterwards. They are never resumed: a
+  restarted showcase starts a fresh match, and stopping the server no longer
+  tells viewers the match will continue. A match that ended is deleted
+  unless `[saves] keep_finished` is set. Give the showcase its own `saves`
+  folder, because a normal server started on the same folder would resume a
+  showcase match that was stopped.
+
+### Fixed
+- In a showcase, the first viewer to join no longer becomes the controller.
+  Before, that one viewer could slow the match for everyone, and if its game
+  drifted out of sync, later viewers joined from the start of the match
+  instead of near the current turn. Now every viewer is an observer.
+
 ## [0.5.0] - 2026-09-29
 
 Changes since 0.4.0.
