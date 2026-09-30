@@ -2744,8 +2744,13 @@ impl<S: PhaseMarker> Server<S> {
             }
         };
         // The controller flag only ever reaches a client here; there is no
-        // message that promotes an already-connected one.
-        let is_controller = self.ctx.controller.is_none()
+        // message that promotes an already-connected one. A scripted match
+        // has nothing to control, and a controller counts as a player: it
+        // would pace turn release and its hashes would become the reference,
+        // so one viewer's lag or desync would reach every other viewer and
+        // every sidecar checkpoint.
+        let is_controller = !self.ctx.config.scripted
+            && self.ctx.controller.is_none()
             && controller_secret == self.ctx.config.controller_secret
             && is_host
             && !self.ctx.is_ai_host(peer);
