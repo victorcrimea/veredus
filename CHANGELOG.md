@@ -3,6 +3,15 @@
 What changed in each Veredus release, for people running the server.
 The newest release is first.
 
+## [0.5.2] - 2026-09-30
+
+### Changed
+- Showcase matches now play at 90% of `[showcase] speed`, so viewers no
+  longer slowly fall behind the live match. The match itself is still set
+  to that speed. Because `max_match_minutes` counts game time, a capped
+  match now takes a little longer in real time: at speed 2, a 90-minute cap
+  takes about 50 minutes instead of 45.
+
 ## [0.5.1] - 2026-09-30
 
 ### Changed
