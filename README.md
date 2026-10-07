@@ -210,7 +210,7 @@ chat = false
 - `max_match_minutes` ends a match that is still running after that long, in
   case the AIs never finish it.
 - `speed` runs the matches faster or slower: 2 is double speed. The server
-  runs a little behind that, at 90%, so that viewers never fall behind. The
+  runs a little behind that, at 99%, so that viewers never fall behind. The
   minutes above are game time, so at double speed they pass almost twice as
   fast.
 - Viewers join by address and port as usual and watch as observers. When a
