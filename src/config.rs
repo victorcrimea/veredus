@@ -503,9 +503,9 @@ pub struct ShowcaseSection {
     pub enabled: bool,
     /// Match settings to take turns with, each a settings_ai.json from a
     /// saved match's folder in which every slot is an AI. Empty uses
-    /// the two built-in 4v4s, on Mainland and Islands. Every match gets
-    /// fresh seeds, so one file already makes a different game each
-    /// time.
+    /// the two built-in matches, a 4v4 on Mainland and a 1v1 on
+    /// Mediterranean Coves. Every match gets fresh seeds, so one file
+    /// already makes a different game each time.
     pub templates: Vec<PathBuf>,
     /// A match still running after this many minutes of game time is
     /// ended and the next one starts. 0 never ends one early.

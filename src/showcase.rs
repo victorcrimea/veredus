@@ -10,16 +10,16 @@ use uuid::Uuid;
 // as the same number.
 const SEED_MASK: u32 = 0x7FFF_FFFF;
 
-// Built in, so a showcase runs with nothing but `enabled = true`. Both are
-// 4v4s of Petra, recorded from real matches.
+// Built in, so a showcase runs with nothing but `enabled = true`. A 4v4
+// and a 1v1 of Petra, recorded from real matches.
 const PRESETS: [(&str, &[u8]); 2] = [
     (
         "preset:mainland-4v4",
         include_bytes!("showcase/presets/mainland-4v4.json"),
     ),
     (
-        "preset:islands-4v4",
-        include_bytes!("showcase/presets/islands-4v4.json"),
+        "preset:mediterranean-coves-1v1",
+        include_bytes!("showcase/presets/mediterranean-coves-1v1.json"),
     ),
 ];
 

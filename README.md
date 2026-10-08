@@ -185,8 +185,8 @@ game anyone can join and watch. The server starts each match itself; nobody
 has to host it. It needs the [sidecar](#extra-features-with-the-sidecar),
 which plays every AI.
 
-Two matches come built in, 4v4s of Petra on Mainland and Islands, so this
-is all it takes in `config.toml`:
+Two matches of Petra come built in, a 4v4 on Mainland and a 1v1 on
+Mediterranean Coves, so this is all it takes in `config.toml`:
 
 ```toml
 [showcase]

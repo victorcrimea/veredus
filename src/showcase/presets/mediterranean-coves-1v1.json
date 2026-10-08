@@ -1,0 +1,63 @@
+{
+  "gameSpeed": 1,
+  "map": "maps/skirmishes/mediterranean_cove_2p",
+  "mapType": "skirmish",
+  "matchID": "A7EC82DB6D236C05",
+  "settings": {
+    "AISeed": 1925487667,
+    "AllyView": false,
+    "Ceasefire": 15,
+    "CheatsEnabled": false,
+    "CircularMap": true,
+    "DisableSpies": false,
+    "DisableTreasures": false,
+    "ExploreMap": true,
+    "LastManStanding": false,
+    "LockTeams": false,
+    "PlayerData": [
+      {
+        "AI": "petra",
+        "AIBehavior": "aggressive",
+        "AIDiff": "5",
+        "Civ": "cart",
+        "Color": {
+          "b": 190,
+          "g": 10,
+          "r": 10
+        },
+        "Name": "Himilco Phameas",
+        "Removed": false,
+        "Team": -1
+      },
+      {
+        "AI": "petra",
+        "AIBehavior": "aggressive",
+        "AIDiff": "5",
+        "Civ": "pers",
+        "Color": {
+          "b": 10,
+          "g": 10,
+          "r": 230
+        },
+        "Name": "Artaxshacha III",
+        "Removed": false,
+        "Team": -1
+      }
+    ],
+    "PopulationCap": 10000,
+    "PopulationCapType": "world",
+    "RevealMap": false,
+    "Seed": 98989004,
+    "StartingResources": 50000,
+    "TriggerScripts": [
+      "scripts/TriggerHelper.js",
+      "scripts/ConquestCommon.js",
+      "scripts/ConquestStructures.js"
+    ],
+    "VictoryConditions": [
+      "conquest_structures"
+    ],
+    "mapName": "Mediterranean Coves (2)",
+    "mapPreview": "cropped:0.78125,0.5859375:session/icons/mappreview/mediterranean_coves.png"
+  }
+}
